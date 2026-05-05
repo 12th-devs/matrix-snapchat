@@ -1,0 +1,13 @@
+bin/
+dist/
+node_modules/
+.cache/
+.playwright/
+playwright/.auth/
+data/
+tmp/
+*.log
+*.sqlite
+*.db
+*.yaml.local
+*.yml.local

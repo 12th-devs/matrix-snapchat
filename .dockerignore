@@ -1,0 +1,6 @@
+.git
+.gitignore
+bin
+data
+_reference_snapchat_bridge
+connector/node_modules

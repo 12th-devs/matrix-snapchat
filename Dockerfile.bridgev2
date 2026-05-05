@@ -1,0 +1,22 @@
+FROM golang:1.26.2-bookworm AS builder
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY cmd ./cmd
+COPY internal ./internal
+RUN go build -tags goolm -o /out/mautrix-snapchat-bridgev2 ./cmd/mautrix-snapchat-bridgev2
+
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /data
+COPY --from=builder /out/mautrix-snapchat-bridgev2 /usr/local/bin/mautrix-snapchat-bridgev2
+
+EXPOSE 4000
+ENTRYPOINT ["/usr/local/bin/mautrix-snapchat-bridgev2"]
+CMD ["-c", "/data/config.yaml"]

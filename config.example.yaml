@@ -1,0 +1,18 @@
+bridge:
+  listen: "127.0.0.1:29344"
+  log_level: "debug"
+  data_dir: "./data"
+
+connector:
+  base_url: "http://127.0.0.1:3101"
+  shared_secret: "change-me"
+  request_timeout_seconds: 20
+
+database:
+  uri: "./data/bridge-state.sqlite"
+
+network:
+  browser_profile_dir: "./data/snapchat-profile"
+  headless: false
+  poll_interval_seconds: 8
+  message_fetch_limit: 40
