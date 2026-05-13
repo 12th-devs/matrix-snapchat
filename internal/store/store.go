@@ -42,6 +42,14 @@ type MessageState struct {
 	LastSeenAt   time.Time
 }
 
+type APISyncState struct {
+	UserID            string
+	SyncToken         []byte
+	ConversationState map[string]int64
+	SelfUserID        string
+	UpdatedAt         time.Time
+}
+
 func New(path string) (*Store, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -85,6 +93,13 @@ func (s *Store) init() error {
 			timestamp_raw TEXT,
 			last_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			PRIMARY KEY (portal_key, remote_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS api_sync_state (
+			user_id TEXT PRIMARY KEY,
+			sync_token BLOB,
+			conversation_state_json TEXT,
+			self_user_id TEXT,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_message_state_portal_key ON message_state(portal_key)`,
 		`CREATE INDEX IF NOT EXISTS idx_portal_state_remote_name ON portal_state(remote_name)`,
@@ -141,6 +156,56 @@ func (s *Store) GetLogin(userID string) (*LoginState, error) {
 	}
 	if err != nil {
 		return nil, err
+	}
+	return &state, nil
+}
+
+func (s *Store) UpsertAPISyncState(state APISyncState) error {
+	encodedState, err := json.Marshal(state.ConversationState)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`
+		INSERT INTO api_sync_state (user_id, sync_token, conversation_state_json, self_user_id, updated_at)
+		VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(user_id) DO UPDATE SET
+			sync_token=excluded.sync_token,
+			conversation_state_json=excluded.conversation_state_json,
+			self_user_id=excluded.self_user_id,
+			updated_at=CURRENT_TIMESTAMP
+	`, state.UserID, state.SyncToken, string(encodedState), state.SelfUserID)
+	return err
+}
+
+func (s *Store) GetAPISyncState(userID string) (*APISyncState, error) {
+	row := s.db.QueryRow(`
+		SELECT user_id, sync_token, conversation_state_json, self_user_id, updated_at
+		FROM api_sync_state
+		WHERE user_id = ?
+	`, userID)
+
+	var state APISyncState
+	var stateJSON string
+	err := row.Scan(
+		&state.UserID,
+		&state.SyncToken,
+		&stateJSON,
+		&state.SelfUserID,
+		&state.UpdatedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if stateJSON != "" {
+		if err = json.Unmarshal([]byte(stateJSON), &state.ConversationState); err != nil {
+			return nil, err
+		}
+	}
+	if state.ConversationState == nil {
+		state.ConversationState = make(map[string]int64)
 	}
 	return &state, nil
 }
@@ -294,6 +359,9 @@ func (s *Store) ResetSyncState() error {
 		return err
 	}
 	if _, err = tx.Exec(`DELETE FROM portal_state`); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`DELETE FROM api_sync_state`); err != nil {
 		return err
 	}
 

@@ -1,7 +1,12 @@
 FROM mcr.microsoft.com/playwright:v1.58.2-noble
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends fluxbox x11vnc novnc websockify \
+    && apt-get install -y --no-install-recommends \
+        fluxbox \
+        novnc \
+        tigervnc-scraping-server \
+        websockify \
+        x11-utils \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

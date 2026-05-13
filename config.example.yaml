@@ -14,5 +14,10 @@ database:
 network:
   browser_profile_dir: "./data/snapchat-profile"
   headless: false
-  poll_interval_seconds: 8
+  poll_interval_seconds: 2
   message_fetch_limit: 40
+  api_mode: api_only
+  dom_fallback_enabled: false
+  auto_fetch_messages: false
+  read_receipts_enabled: false
+  snap_media_enabled: false

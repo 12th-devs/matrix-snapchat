@@ -35,6 +35,11 @@ type NetworkConfig struct {
 	Headless            bool   `yaml:"headless"`
 	PollIntervalSeconds int    `yaml:"poll_interval_seconds"`
 	MessageFetchLimit   int    `yaml:"message_fetch_limit"`
+	APIMode             string `yaml:"api_mode"`
+	DOMFallbackEnabled  *bool  `yaml:"dom_fallback_enabled"`
+	AutoFetchMessages   bool   `yaml:"auto_fetch_messages"`
+	ReadReceiptsEnabled bool   `yaml:"read_receipts_enabled"`
+	SnapMediaEnabled    bool   `yaml:"snap_media_enabled"`
 }
 
 func Load(path string) (*Config, error) {
@@ -58,10 +63,17 @@ func Load(path string) (*Config, error) {
 		cfg.Database.URI = "./data/bridge-state.sqlite"
 	}
 	if cfg.Network.PollIntervalSeconds <= 0 {
-		cfg.Network.PollIntervalSeconds = 8
+		cfg.Network.PollIntervalSeconds = 2
 	}
 	if cfg.Network.MessageFetchLimit <= 0 {
 		cfg.Network.MessageFetchLimit = 40
+	}
+	if cfg.Network.APIMode == "" {
+		cfg.Network.APIMode = "api_only"
+	}
+	if cfg.Network.DOMFallbackEnabled == nil {
+		enabled := false
+		cfg.Network.DOMFallbackEnabled = &enabled
 	}
 
 	return &cfg, nil

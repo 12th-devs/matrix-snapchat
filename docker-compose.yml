@@ -10,6 +10,10 @@ services:
       SNAPCHAT_PROFILE_DIR: "/data/snapchat-profile"
       SNAPCHAT_TRACE_DIR: "/data/debug"
       SNAPCHAT_HEADLESS: "${SNAPCHAT_HEADLESS:-false}"
+      SNAPCHAT_DEFAULT_TIMEOUT_MS: "${SNAPCHAT_DEFAULT_TIMEOUT_MS:-30000}"
+      SNAPCHAT_NAVIGATION_TIMEOUT_MS: "${SNAPCHAT_NAVIGATION_TIMEOUT_MS:-45000}"
+      SNAPCHAT_MESSAGE_ATTEMPTS: "${SNAPCHAT_MESSAGE_ATTEMPTS:-2}"
+      SNAPCHAT_SAFE_NO_OPEN: "${SNAPCHAT_SAFE_NO_OPEN:-1}"
     ports:
       - "127.0.0.1:3101:3101"
       - "127.0.0.1:6080:6080"
@@ -19,9 +23,9 @@ services:
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3101/healthz', { headers: { 'X-Bridge-Secret': process.env.SNAPCHAT_SHARED_SECRET || '' } }).then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
       interval: 30s
-      timeout: 10s
+      timeout: 30s
       retries: 5
-      start_period: 45s
+      start_period: 120s
     restart: unless-stopped
 
   bridge:

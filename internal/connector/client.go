@@ -3,6 +3,7 @@ package connector
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -30,6 +31,7 @@ type SessionStatus struct {
 
 type Chat struct {
 	ID          string `json:"id"`
+	OtherUserID string `json:"otherUserId,omitempty"`
 	URL         string `json:"url,omitempty"`
 	Name        string `json:"name"`
 	Preview     string `json:"preview,omitempty"`
@@ -39,10 +41,19 @@ type Chat struct {
 
 type Message struct {
 	ID        string `json:"id"`
+	AuthorID  string `json:"authorId,omitempty"`
 	Author    string `json:"author"`
 	Text      string `json:"text"`
 	Timestamp string `json:"timestamp,omitempty"`
 	Outgoing  bool   `json:"outgoing"`
+	Media     []MediaAttachment `json:"media,omitempty"`
+}
+
+type MediaAttachment struct {
+	ID       string `json:"id,omitempty"`
+	FileName string `json:"fileName,omitempty"`
+	MimeType string `json:"mimeType,omitempty"`
+	Data     []byte `json:"-"`
 }
 
 type SendMessageRequest struct {
@@ -50,6 +61,16 @@ type SendMessageRequest struct {
 	ChatName string `json:"chatName,omitempty"`
 	ChatURL  string `json:"chatUrl,omitempty"`
 	Text     string `json:"text"`
+}
+
+type SendMediaRequest struct {
+	ChatID   string `json:"chatId,omitempty"`
+	ChatName string `json:"chatName,omitempty"`
+	ChatURL  string `json:"chatUrl,omitempty"`
+	FileName string `json:"fileName,omitempty"`
+	MimeType string `json:"mimeType,omitempty"`
+	Data     string `json:"data"`
+	Caption  string `json:"caption,omitempty"`
 }
 
 type SendMessageResponse struct {
@@ -72,6 +93,24 @@ type Diagnostics struct {
 	VisibleTexts  []string          `json:"visibleTexts,omitempty"`
 	Snapshot      map[string]string `json:"snapshot,omitempty"`
 	SelectorHints map[string]string `json:"selectorHints,omitempty"`
+}
+
+type APIAuth struct {
+	State               string `json:"state"`
+	Authenticated       bool   `json:"authenticated"`
+	CookieString        string `json:"cookieString"`
+	SelfUserID          string `json:"selfUserID,omitempty"`
+	Username            string `json:"username,omitempty"`
+	DisplayName         string `json:"displayName,omitempty"`
+	IdentitySource      string `json:"identitySource,omitempty"`
+	BrowserUserAgent    string `json:"browserUserAgent,omitempty"`
+	SnapClientUserAgent string `json:"snapClientUserAgent,omitempty"`
+	SecChUA             string `json:"secChUa,omitempty"`
+	SecChUAPlatform     string `json:"secChUaPlatform,omitempty"`
+	GRPCWebUserAgent    string `json:"grpcWebUserAgent,omitempty"`
+	MCSCOFIDsBin        string `json:"mcsCofIdsBin,omitempty"`
+	WebVersion          string `json:"webVersion,omitempty"`
+	URL                 string `json:"url,omitempty"`
 }
 
 func New(cfg config.ConnectorConfig) *Client {
@@ -119,6 +158,20 @@ func (c *Client) Status(ctx context.Context) (*SessionStatus, error) {
 	}
 
 	return &status, nil
+}
+
+func (c *Client) APIAuth(ctx context.Context) (*APIAuth, error) {
+	req, err := c.newRequest(ctx, http.MethodGet, "/session/api-auth", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var auth APIAuth
+	if err = c.doJSON(req, &auth); err != nil {
+		return nil, err
+	}
+
+	return &auth, nil
 }
 
 func (c *Client) ListChats(ctx context.Context) ([]Chat, error) {
@@ -191,6 +244,41 @@ func (c *Client) SendMessage(ctx context.Context, chatID, chatName, chatURL, tex
 		return fmt.Errorf("connector send did not confirm delivery to chat %q", result.ChatName)
 	}
 
+	return nil
+}
+
+func (c *Client) SendMedia(ctx context.Context, chatID, chatName, chatURL string, media MediaAttachment, caption string) error {
+	if len(media.Data) == 0 {
+		return fmt.Errorf("missing media data")
+	}
+	payload := SendMediaRequest{
+		ChatID:   chatID,
+		ChatName: chatName,
+		ChatURL:  chatURL,
+		FileName: media.FileName,
+		MimeType: media.MimeType,
+		Data:     base64.StdEncoding.EncodeToString(media.Data),
+		Caption:  caption,
+	}
+	req, err := c.newRequest(ctx, http.MethodPost, "/media", payload)
+	if err != nil {
+		return err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("connector media send %s returned %s: %s", req.URL.String(), resp.Status, readResponseSnippet(resp.Body))
+	}
+	var result SendMessageResponse
+	if err = json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("decode connector media send response: %w", err)
+	}
+	if !result.Confirmed {
+		return fmt.Errorf("connector media send did not confirm delivery to chat %q", result.ChatName)
+	}
 	return nil
 }
 

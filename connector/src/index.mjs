@@ -4,7 +4,9 @@ import {
   getDiagnostics,
   getChats,
   getMessages,
+  getAPIAuth,
   getStatus,
+  sendMedia,
   sendMessage,
 } from "./snapchat.mjs";
 
@@ -12,8 +14,9 @@ const app = express();
 const port = Number(process.env.PORT || 3101);
 const sharedSecret = process.env.SNAPCHAT_SHARED_SECRET || "";
 const acceptedSecrets = new Set([sharedSecret].filter(Boolean));
+const safeNoOpen = process.env.SNAPCHAT_SAFE_NO_OPEN !== "0";
 
-app.use(express.json());
+app.use(express.json({ limit: process.env.SNAPCHAT_JSON_LIMIT || "50mb" }));
 app.use((req, res, next) => {
   const startedAt = Date.now();
   res.on("finish", () => {
@@ -46,7 +49,8 @@ function asyncRoute(handler) {
 }
 
 app.get("/healthz", asyncRoute(async (_req, res) => {
-  res.json({ ok: true, status: await getStatus() });
+  // Keep Docker healthchecks cheap so they don't contend with chat polling or sends.
+  res.json({ ok: true });
 }));
 
 app.post("/session/start", asyncRoute(async (_req, res) => {
@@ -58,6 +62,10 @@ app.get("/session/status", asyncRoute(async (_req, res) => {
   res.json(await getStatus());
 }));
 
+app.get("/session/api-auth", asyncRoute(async (_req, res) => {
+  res.json(await getAPIAuth());
+}));
+
 app.get("/debug/diagnostics", asyncRoute(async (_req, res) => {
   res.json(await getDiagnostics());
 }));
@@ -67,6 +75,10 @@ app.get("/chats", asyncRoute(async (_req, res) => {
 }));
 
 app.get("/messages", asyncRoute(async (req, res) => {
+  if (safeNoOpen) {
+    res.status(423).json({ error: "disabled by SNAPCHAT_SAFE_NO_OPEN to avoid opening Snapchat chats/snaps" });
+    return;
+  }
   const chatName = String(req.query.chatName || "");
   const chatId = String(req.query.chatId || "");
   const chatUrl = String(req.query.chatUrl || "");
@@ -79,6 +91,10 @@ app.get("/messages", asyncRoute(async (req, res) => {
 }));
 
 app.post("/messages", asyncRoute(async (req, res) => {
+  if (safeNoOpen) {
+    res.status(423).json({ error: "disabled by SNAPCHAT_SAFE_NO_OPEN to avoid opening Snapchat chats/snaps" });
+    return;
+  }
   const { chatId, chatName, chatUrl, text } = req.body || {};
   if ((!chatId && !chatName && !chatUrl) || !text) {
     res.status(400).json({ error: "chatId, chatUrl, or chatName and text are required" });
@@ -89,10 +105,33 @@ app.post("/messages", asyncRoute(async (req, res) => {
   res.status(202).json(result);
 }));
 
+app.post("/media", asyncRoute(async (req, res) => {
+  if (safeNoOpen) {
+    res.status(423).json({ error: "disabled by SNAPCHAT_SAFE_NO_OPEN to avoid opening Snapchat chats/snaps" });
+    return;
+  }
+  const { chatId, chatName, chatUrl, fileName, mimeType, data, caption } = req.body || {};
+  if ((!chatId && !chatName && !chatUrl) || !data) {
+    res.status(400).json({ error: "chatId, chatUrl, or chatName and media data are required" });
+    return;
+  }
+
+  const result = await sendMedia(
+    chatId || "",
+    chatName || "",
+    chatUrl || "",
+    fileName || "snap-media.bin",
+    mimeType || "application/octet-stream",
+    data,
+    caption || "",
+  );
+  res.status(202).json(result);
+}));
+
 process.on("unhandledRejection", (error) => {
   console.error("unhandled rejection", error);
 });
 
 app.listen(port, () => {
-  console.log(`snapchat connector listening on http://127.0.0.1:${port}`);
+  console.log(`snapchat connector listening on http://127.0.0.1:${port} safeNoOpen=${safeNoOpen}`);
 });

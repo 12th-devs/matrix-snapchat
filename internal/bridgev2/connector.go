@@ -13,6 +13,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/event"
 
+	"github.com/colej/mautrix-snapchat/internal/config"
 	"github.com/colej/mautrix-snapchat/internal/connector"
 	"github.com/colej/mautrix-snapchat/internal/store"
 )
@@ -23,6 +24,11 @@ type ConnectorConfig struct {
 	RequestTimeoutSeconds int    `yaml:"request_timeout_seconds"`
 	PollIntervalSeconds   int    `yaml:"poll_interval_seconds"`
 	MessageFetchLimit     int    `yaml:"message_fetch_limit"`
+	APIMode               string `yaml:"api_mode"`
+	DOMFallbackEnabled    *bool  `yaml:"dom_fallback_enabled"`
+	AutoFetchMessages     bool   `yaml:"auto_fetch_messages"`
+	ReadReceiptsEnabled   bool   `yaml:"read_receipts_enabled"`
+	SnapMediaEnabled      bool   `yaml:"snap_media_enabled"`
 	StateDBPath           string `yaml:"state_db_path"`
 	LoginWaitSeconds      int    `yaml:"login_wait_seconds"`
 }
@@ -45,8 +51,13 @@ const ExampleConfig = `# Snapchat Web sidecar connector
 base_url: "http://127.0.0.1:3101"
 shared_secret: "change-me"
 request_timeout_seconds: 20
-poll_interval_seconds: 8
+poll_interval_seconds: 2
 message_fetch_limit: 40
+api_mode: api_only
+dom_fallback_enabled: false
+auto_fetch_messages: false
+read_receipts_enabled: false
+snap_media_enabled: false
 state_db_path: "./data/bridgev2-state.sqlite"
 login_wait_seconds: 90
 `
@@ -101,6 +112,11 @@ func (sc *SnapchatConnector) GetConfig() (example string, data any, upgrader con
 		helper.Copy(configupgrade.Int, "request_timeout_seconds")
 		helper.Copy(configupgrade.Int, "poll_interval_seconds")
 		helper.Copy(configupgrade.Int, "message_fetch_limit")
+		helper.Copy(configupgrade.Str, "api_mode")
+		helper.Copy(configupgrade.Bool, "dom_fallback_enabled")
+		helper.Copy(configupgrade.Bool, "auto_fetch_messages")
+		helper.Copy(configupgrade.Bool, "read_receipts_enabled")
+		helper.Copy(configupgrade.Bool, "snap_media_enabled")
 		helper.Copy(configupgrade.Str, "state_db_path")
 		helper.Copy(configupgrade.Int, "login_wait_seconds")
 	})
@@ -166,11 +182,7 @@ func (sc *SnapchatConnector) newClient() *connector.Client {
 	if cfg.MessageFetchLimit <= 0 {
 		cfg.MessageFetchLimit = 40
 	}
-	return connector.New(struct {
-		BaseURL               string `yaml:"base_url"`
-		SharedSecret          string `yaml:"shared_secret"`
-		RequestTimeoutSeconds int    `yaml:"request_timeout_seconds"`
-	}{
+	return connector.New(config.ConnectorConfig{
 		BaseURL:               cfg.BaseURL,
 		SharedSecret:          cfg.SharedSecret,
 		RequestTimeoutSeconds: cfg.RequestTimeoutSeconds,
@@ -180,9 +192,32 @@ func (sc *SnapchatConnector) newClient() *connector.Client {
 func (sc *SnapchatConnector) pollInterval() time.Duration {
 	seconds := sc.Config.PollIntervalSeconds
 	if seconds <= 0 {
-		seconds = 8
+		seconds = 2
 	}
 	return time.Duration(seconds) * time.Second
+}
+
+func (sc *SnapchatConnector) apiMode() string {
+	mode := strings.ToLower(strings.TrimSpace(sc.Config.APIMode))
+	switch mode {
+	case "api_only", "dom_only":
+		return mode
+	default:
+		return "auto"
+	}
+}
+
+func (sc *SnapchatConnector) domFallbackEnabled() bool {
+	if sc == nil {
+		return false
+	}
+	if sc.apiMode() == "api_only" {
+		return false
+	}
+	if sc.Config.DOMFallbackEnabled == nil {
+		return false
+	}
+	return *sc.Config.DOMFallbackEnabled
 }
 
 func (sc *SnapchatConnector) loginWaitDuration() time.Duration {

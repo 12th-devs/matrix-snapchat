@@ -82,6 +82,11 @@ func (sl *SnapchatLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create login: %w", err)
 	}
+	if ul.Client != nil && ul.Bridge != nil {
+		connectCtx := ul.Log.WithContext(ul.Bridge.BackgroundCtx)
+		log.Printf("bridgev2 login: starting fresh user login sync id=%s", ul.ID)
+		ul.Client.Connect(connectCtx)
+	}
 
 	return &bridgev2.LoginStep{
 		Type:         bridgev2.LoginStepTypeComplete,

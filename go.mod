@@ -5,8 +5,11 @@ go 1.25.0
 toolchain go1.26.2
 
 require (
+	github.com/0xzer/snapper v0.0.0-20230811194339-d57f26881a58
+	github.com/google/uuid v1.3.0
 	github.com/rs/zerolog v1.35.0
 	go.mau.fi/util v0.9.9-0.20260424160448-fd0d9737ad38
+	google.golang.org/protobuf v1.36.11
 	gopkg.in/yaml.v3 v3.0.1
 	maunium.net/go/mautrix v0.27.1-0.20260429060852-d7aad0e862c7
 	modernc.org/sqlite v1.27.0
@@ -17,7 +20,6 @@ require (
 	github.com/coder/websocket v1.8.14 // indirect
 	github.com/coreos/go-systemd/v22 v22.7.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
-	github.com/google/uuid v1.3.0 // indirect
 	github.com/kballard/go-shellquote v0.0.0-20180428030007-95032a82bc51 // indirect
 	github.com/lib/pq v1.12.3 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect

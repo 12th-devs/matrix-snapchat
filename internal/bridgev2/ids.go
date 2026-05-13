@@ -1,6 +1,8 @@
 package bridgev2
 
 import (
+	"crypto/sha1"
+	"encoding/hex"
 	"regexp"
 	"strings"
 
@@ -17,7 +19,8 @@ func normalizeIDPart(in string) string {
 	normalized := nonIDChars.ReplaceAllString(trimmed, "_")
 	normalized = strings.Trim(normalized, "_")
 	if normalized == "" {
-		return "unknown"
+		sum := sha1.Sum([]byte(trimmed))
+		return "user_" + hex.EncodeToString(sum[:])[:12]
 	}
 	return strings.ToLower(normalized)
 }
@@ -37,4 +40,3 @@ func makeUserLoginID(label string) networkid.UserLoginID {
 func makeMessageID(remoteID string) networkid.MessageID {
 	return networkid.MessageID(normalizeIDPart(remoteID))
 }
-

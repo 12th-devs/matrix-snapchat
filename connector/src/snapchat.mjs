@@ -3,16 +3,32 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 
-const SNAPCHAT_URL = "https://web.snapchat.com";
+const SNAPCHAT_URL = "https://www.snapchat.com/web";
+const SNAPCHAT_VERSION_URL = "https://www.snapchat.com/web/version.json";
 const SNAPCHAT_HOST_PATTERN = /(^|\.)snapchat\.com$/i;
 const profileDir = process.env.SNAPCHAT_PROFILE_DIR || path.resolve("../data/snapchat-profile");
 const headless = process.env.SNAPCHAT_HEADLESS === "true";
 const traceDir = process.env.SNAPCHAT_TRACE_DIR || path.resolve("../data/debug");
+const knownChatsPath = process.env.SNAPCHAT_KNOWN_CHATS_PATH || path.join(path.dirname(profileDir), "known-chats.json");
+const DEFAULT_TIMEOUT_MS = Number(process.env.SNAPCHAT_DEFAULT_TIMEOUT_MS || 30000);
+const NAVIGATION_TIMEOUT_MS = Number(process.env.SNAPCHAT_NAVIGATION_TIMEOUT_MS || 45000);
+const MESSAGE_ATTEMPTS = Math.max(1, Number(process.env.SNAPCHAT_MESSAGE_ATTEMPTS || 1));
+const CHAT_DEEP_REFRESH_MS = Math.max(60000, Number(process.env.SNAPCHAT_CHAT_DEEP_REFRESH_MS || 15 * 60 * 1000));
+const CHAT_LIST_SETTLE_MS = Math.max(0, Number(process.env.SNAPCHAT_CHAT_LIST_SETTLE_MS || 250));
+const CHAT_DEEP_SCAN_MIN_CACHE = Math.max(0, Number(process.env.SNAPCHAT_CHAT_DEEP_SCAN_MIN_CACHE || 25));
+const CHAT_OPEN_NAVIGATION_TIMEOUT_MS = Math.max(3000, Number(process.env.SNAPCHAT_CHAT_OPEN_NAVIGATION_TIMEOUT_MS || 8000));
+const CONVERSATION_OPEN_ATTEMPTS = Math.max(4, Number(process.env.SNAPCHAT_CONVERSATION_OPEN_ATTEMPTS || 10));
 
 let context;
 let page;
 let inflight;
 const pendingTasks = [];
+const knownChatsByKey = new Map();
+let knownChatsLoaded = false;
+let knownChatsDirty = false;
+let lastDeepChatSync = 0;
+let lastSnapAPIRequestHeaders = {};
+let capturedSelfUserID = "";
 
 const loginTextPattern = /log in|login|sign up|continue on phone|scan|qr|use mobile app|use your phone/i;
 const shellTextPattern = /chat|chats|search|conversations|send a chat|new chat/i;
@@ -20,11 +36,13 @@ const ignoreChatPattern = /^(search|camera|stories|spotlight|map|settings|profil
 const composerPattern = /send a chat|message|type a chat|write a chat|send message/i;
 const chatDetailPattern = /(opened|received|sent|replied|reply|say hi!?|typing|new|call|\d+\s*[mhdwy])/i;
 const ignoreMessagePattern = /^(notifications are off|turn on|call|reply|close chat|drag & drop to upload|search|not now|enable notifications|click to install the desktop app|to always have access to your chats!)$/i;
-const dateDividerPattern = /^(today|yesterday|march|april|may|june|july|august|september|october|november|december)(\s+\d{1,2})?$/i;
+const dateDividerPattern = /^(today|yesterday|sun(?:day)?|mon(?:day)?|tue(?:s|sday|day)?|wed(?:nesday)?|thu(?:r|rs|rsday|rday)?|fri(?:day)?|sat(?:urday)?|jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)(?:\s+\d{1,2})?(?:,?\s+\d{4})?$/i;
 const unsupportedMediaLabel = "[Unsupported Snapchat snap/media]";
 const unsupportedEventLabel = "[Unsupported Snapchat event]";
+const snapchatStatusLabel = "[Snapchat status]";
 const snapchatErrorPattern = /oops!? something went wrong|reload the page|error id:/i;
 const ignoreMessageTokenPattern = /^(opened|received|sent|say hi!?|typing|my ai|🔥|·|\d+\s*[mhdwy]|\d+)$/i;
+const snapPreviewPattern = /\b(new snap|snap|video|photo|picture|media|voice note|audio|sticker|sent you|tap to view|screenshot|screen recorded|opened|received|delivered)\b/i;
 
 function normalizeText(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
@@ -43,6 +61,98 @@ function prettifyChatText(value) {
 
 function stableID(parts) {
   return crypto.createHash("sha1").update(parts.join("::")).digest("hex").slice(0, 16);
+}
+
+function readProtoVarint(buffer, offset) {
+  let value = 0;
+  let shift = 0;
+  let cursor = offset;
+  while (cursor < buffer.length && shift < 64) {
+    const byte = buffer[cursor++];
+    value |= (byte & 0x7f) << shift;
+    if ((byte & 0x80) === 0) {
+      return { value, offset: cursor };
+    }
+    shift += 7;
+  }
+  return null;
+}
+
+function readProtoBytesField(buffer, fieldNumber) {
+  let offset = 0;
+  while (offset < buffer.length) {
+    const tag = readProtoVarint(buffer, offset);
+    if (!tag) {
+      return null;
+    }
+    offset = tag.offset;
+    const currentField = tag.value >> 3;
+    const wireType = tag.value & 7;
+    if (wireType === 2) {
+      const length = readProtoVarint(buffer, offset);
+      if (!length) {
+        return null;
+      }
+      offset = length.offset;
+      if (offset + length.value > buffer.length) {
+        return null;
+      }
+      const value = buffer.subarray(offset, offset + length.value);
+      if (currentField === fieldNumber) {
+        return value;
+      }
+      offset += length.value;
+      continue;
+    }
+    if (wireType === 0) {
+      const skipped = readProtoVarint(buffer, offset);
+      if (!skipped) {
+        return null;
+      }
+      offset = skipped.offset;
+      continue;
+    }
+    if (wireType === 1) {
+      offset += 8;
+      continue;
+    }
+    if (wireType === 5) {
+      offset += 4;
+      continue;
+    }
+    return null;
+  }
+  return null;
+}
+
+function uuidFromBytes(bytes) {
+  if (!bytes || bytes.length !== 16) {
+    return "";
+  }
+  const hex = Buffer.from(bytes).toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function extractEncodedUUIDField(payload, fieldNumber) {
+  const uuidMessage = readProtoBytesField(payload, fieldNumber);
+  if (!uuidMessage) {
+    return "";
+  }
+  return uuidFromBytes(readProtoBytesField(uuidMessage, 1));
+}
+
+function extractSelfUserIDFromMessagingRequest(requestURL, postData) {
+  if (!postData || postData.length < 6) {
+    return "";
+  }
+  const payload = postData.subarray(5);
+  if (/\/(?:GetGroups|SyncConversations|QueryConversations)$/i.test(requestURL)) {
+    return extractEncodedUUIDField(payload, 1);
+  }
+  if (/\/(?:DeltaSync|QueryMessages|UpdateContentMessage)$/i.test(requestURL)) {
+    return extractEncodedUUIDField(payload, 4);
+  }
+  return "";
 }
 
 function makeChatID(name) {
@@ -190,13 +300,50 @@ async function ensureSession() {
     ],
   });
 
+  context.on("request", (request) => {
+    try {
+      const requestURL = request.url();
+      if (!/messagingcoreservice|snapchat\.notification|fidelius/i.test(requestURL)) {
+        return;
+      }
+      const headers = request.headers();
+      const safeHeaders = {};
+      for (const [name, value] of Object.entries(headers)) {
+        if (/authorization|cookie/i.test(name)) {
+          continue;
+        }
+        safeHeaders[name] = value;
+      }
+      const postData = request.postDataBuffer?.();
+      const selfUserID = extractSelfUserIDFromMessagingRequest(requestURL, postData);
+      if (selfUserID) {
+        capturedSelfUserID = selfUserID;
+      }
+      lastSnapAPIRequestHeaders = {
+        url: requestURL,
+        userAgent: headers["user-agent"] || "",
+        snapClientUserAgent: headers["x-snap-client-user-agent"] || "",
+        secChUa: headers["sec-ch-ua"] || "",
+        secChUaPlatform: headers["sec-ch-ua-platform"] || "",
+        origin: headers.origin || "",
+        referer: headers.referer || "",
+        capturedSelfUserID,
+        headers: safeHeaders,
+      };
+    } catch {
+      // Best-effort diagnostics only.
+    }
+  });
+
   context.on("page", (newPage) => {
     page = newPage;
-    page.setDefaultTimeout(15000);
+    page.setDefaultTimeout(DEFAULT_TIMEOUT_MS);
+    page.setDefaultNavigationTimeout(NAVIGATION_TIMEOUT_MS);
   });
 
   page = pickBestPage(context.pages()) || (await context.newPage());
-  page.setDefaultTimeout(15000);
+  page.setDefaultTimeout(DEFAULT_TIMEOUT_MS);
+  page.setDefaultNavigationTimeout(NAVIGATION_TIMEOUT_MS);
   page.on("dialog", async (dialog) => {
     try {
       await dialog.dismiss();
@@ -493,12 +640,16 @@ async function getConversationState(currentPage, chatName = "") {
 }
 
 async function waitForConversationOpen(currentPage, chatName, previousURL = "", chatID = "") {
-  for (let attempt = 0; attempt < 16; attempt += 1) {
-    await currentPage.waitForTimeout(250);
+  for (let attempt = 0; attempt < CONVERSATION_OPEN_ATTEMPTS; attempt += 1) {
+    await currentPage.waitForTimeout(500);
+    if (attempt > 0 && attempt % 10 === 0) {
+      await dismissInterferingOverlays(currentPage);
+    }
     const state = await getConversationState(currentPage, chatName);
     const urlChanged = state.url !== previousURL && isConversationPath(state.url);
     const openedCorrectID = Boolean(chatID && state.url.includes(`/${chatID}`));
-    if ((state.hasTargetHeader || urlChanged) && state.hasComposer) {
+    const openedByURL = openedCorrectID || (urlChanged && !chatID);
+    if ((state.hasTargetHeader || openedByURL) && state.hasComposer) {
       if (!chatID || openedCorrectID) {
         return state;
       }
@@ -514,7 +665,36 @@ async function waitForConversationOpen(currentPage, chatName, previousURL = "", 
   );
 }
 
-async function openChat(chatName = "", chatID = "", chatURL = "") {
+async function tryOpenFromSidebar(currentPage, chatName, previousURL = "", chatID = "") {
+  if (!chatName) {
+    return false;
+  }
+
+  const target = await findSidebarChatTarget(currentPage, chatName);
+  if (!target) {
+    return false;
+  }
+
+  await currentPage.locator("[data-codex-chat-target='1']").first().click({ force: true });
+  await waitForConversationOpen(currentPage, chatName, previousURL, chatID);
+  return true;
+}
+
+async function returnToChatList(currentPage) {
+  try {
+    await currentPage.goto(SNAPCHAT_URL, { waitUntil: "domcontentloaded", timeout: CHAT_OPEN_NAVIGATION_TIMEOUT_MS });
+  } catch (error) {
+    if (!isSnapchatURL(currentPage.url())) {
+      throw error;
+    }
+  }
+
+  await currentPage.waitForTimeout(500);
+  await dismissInterferingOverlays(currentPage);
+  await clearSearchBox(currentPage);
+}
+
+async function openChat(chatName = "", chatID = "", chatURL = "", { searchFallback = true } = {}) {
   const currentPage = await gotoSnapchat();
   if (!(await isLoggedIn(currentPage))) {
     throw new Error("snapchat session is not logged in");
@@ -522,22 +702,54 @@ async function openChat(chatName = "", chatID = "", chatURL = "") {
 
   await dismissInterferingOverlays(currentPage);
   await clearSearchBox(currentPage);
-  const previousURL = currentPage.url();
+  let previousURL = currentPage.url();
+  let target;
+  let lastOpenError;
+
+  try {
+    if (await tryOpenFromSidebar(currentPage, chatName, previousURL, chatID)) {
+      return currentPage;
+    }
+  } catch (error) {
+    lastOpenError = error;
+    console.error(`openChat: sidebar open failed chatName=${JSON.stringify(chatName)} chatId=${chatID} error=${String(error)}`);
+  }
 
   if (chatURL && isSnapchatURL(chatURL)) {
-    await currentPage.goto(chatURL, { waitUntil: "domcontentloaded" });
-    const activeID = getConversationIDFromURL(chatURL) || chatID;
-    await waitForConversationOpen(currentPage, chatName, previousURL, activeID);
-    return currentPage;
+    try {
+      await currentPage.goto(chatURL, { waitUntil: "domcontentloaded", timeout: CHAT_OPEN_NAVIGATION_TIMEOUT_MS });
+      const activeID = getConversationIDFromURL(chatURL) || chatID;
+      await waitForConversationOpen(currentPage, chatName, previousURL, activeID);
+      return currentPage;
+    } catch (error) {
+      lastOpenError = error;
+      console.error(`openChat: direct URL open failed chatName=${JSON.stringify(chatName)} chatId=${chatID} chatUrl=${JSON.stringify(chatURL)} error=${String(error)}`);
+      await returnToChatList(currentPage);
+      previousURL = currentPage.url();
+      if (await tryOpenFromSidebar(currentPage, chatName, previousURL, chatID || getConversationIDFromURL(chatURL))) {
+        return currentPage;
+      }
+    }
   }
 
   if (looksLikeConversationID(chatID)) {
-    await currentPage.goto(conversationURL(chatID), { waitUntil: "domcontentloaded" });
-    await waitForConversationOpen(currentPage, chatName, previousURL, chatID);
-    return currentPage;
+    try {
+      await currentPage.goto(conversationURL(chatID), { waitUntil: "domcontentloaded", timeout: CHAT_OPEN_NAVIGATION_TIMEOUT_MS });
+      await waitForConversationOpen(currentPage, chatName, previousURL, chatID);
+      return currentPage;
+    } catch (error) {
+      lastOpenError = error;
+      console.error(`openChat: conversation ID open failed chatName=${JSON.stringify(chatName)} chatId=${chatID} error=${String(error)}`);
+      await returnToChatList(currentPage);
+      previousURL = currentPage.url();
+    }
   }
 
-  let target = await findSidebarChatTarget(currentPage, chatName);
+  if (!searchFallback) {
+    throw lastOpenError || new Error(`could not open Snapchat chat "${chatName || chatID}" without search fallback`);
+  }
+
+  target = await findSidebarChatTarget(currentPage, chatName);
   if (target) {
     await currentPage.locator("[data-codex-chat-target='1']").first().click({ force: true });
     await waitForConversationOpen(currentPage, chatName, previousURL, chatID);
@@ -624,7 +836,129 @@ function parseChatRows(rows) {
   return deduped.slice(0, 100);
 }
 
-async function extractChats(currentPage) {
+function chatCacheKey(chat) {
+  return chat?.id || normalizeText(chat?.name).toLowerCase();
+}
+
+function normalizeChatIdentity(value) {
+  return normalizeText(value).toLowerCase();
+}
+
+function chatIdentityKey(chat) {
+  return normalizeChatIdentity(chat?.name) || chatCacheKey(chat);
+}
+
+function mergeChatIdentity(existing = {}, incoming = {}) {
+  return {
+    ...existing,
+    ...incoming,
+    id: incoming.id || existing.id || "",
+    url: incoming.url || existing.url || (incoming.id ? conversationURL(incoming.id) : ""),
+    name: incoming.name || existing.name || "",
+    preview: incoming.preview || existing.preview || "",
+    lastMessage: incoming.lastMessage || existing.lastMessage || "",
+    unread: Boolean(incoming.unread || existing.unread),
+  };
+}
+
+async function ensureKnownChatsLoaded() {
+  if (knownChatsLoaded) {
+    return;
+  }
+  knownChatsLoaded = true;
+  try {
+    const raw = JSON.parse(await fs.readFile(knownChatsPath, "utf8"));
+    const chats = Array.isArray(raw?.chats) ? raw.chats : Array.isArray(raw) ? raw : [];
+    for (const chat of chats) {
+      const key = chatCacheKey(chat);
+      if (key) {
+        knownChatsByKey.set(key, chat);
+      }
+    }
+    if (knownChatsByKey.size >= CHAT_DEEP_SCAN_MIN_CACHE) {
+      lastDeepChatSync = Date.now();
+    }
+    console.error(`knownChats: loaded ${knownChatsByKey.size} chats from ${knownChatsPath}`);
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      console.error(`knownChats: failed to load cache: ${String(error)}`);
+    }
+  }
+}
+
+async function saveKnownChats() {
+  if (!knownChatsDirty) {
+    return;
+  }
+  knownChatsDirty = false;
+  try {
+    await fs.mkdir(path.dirname(knownChatsPath), { recursive: true });
+    const chats = Array.from(knownChatsByKey.values()).slice(0, 200);
+    await fs.writeFile(knownChatsPath, JSON.stringify({ chats }, null, 2), "utf8");
+  } catch (error) {
+    knownChatsDirty = true;
+    console.error(`knownChats: failed to save cache: ${String(error)}`);
+  }
+}
+
+function mergeKnownChats(chats) {
+  for (const chat of chats) {
+    const key = chatCacheKey(chat);
+    if (!key) {
+      continue;
+    }
+    const previous = knownChatsByKey.get(key) || {};
+    knownChatsByKey.set(key, {
+      ...previous,
+      ...chat,
+      preview: chat.preview || previous.preview || "",
+      lastMessage: chat.lastMessage || previous.lastMessage || "",
+      unread: Boolean(chat.unread || previous.unread),
+    });
+    knownChatsDirty = true;
+  }
+}
+
+function orderKnownChats(primaryChats) {
+  const ordered = [];
+  const seen = new Set();
+  const byIdentity = new Map();
+
+  const addChat = (chat, preferIncoming = false) => {
+    const identity = chatIdentityKey(chat);
+    if (!identity || seen.has(identity)) {
+      return;
+    }
+    if (preferIncoming || !byIdentity.has(identity)) {
+      byIdentity.set(identity, mergeChatIdentity(byIdentity.get(identity), chat));
+    }
+    ordered.push(byIdentity.get(identity));
+    seen.add(identity);
+  };
+
+  for (const chat of primaryChats) {
+    addChat(chat, true);
+  }
+  for (const chat of knownChatsByKey.values()) {
+    addChat(chat, false);
+  }
+  return ordered.slice(0, 100);
+}
+
+function findKnownChat(chatID, chatName) {
+  if (chatID && knownChatsByKey.has(chatID)) {
+    return knownChatsByKey.get(chatID);
+  }
+  const normalizedName = normalizeText(chatName).toLowerCase();
+  for (const chat of knownChatsByKey.values()) {
+    if ((chat.id && chat.id === chatID) || normalizeText(chat.name).toLowerCase() === normalizedName) {
+      return chat;
+    }
+  }
+  return null;
+}
+
+async function readSidebarChatRows(currentPage) {
   if ((await detectState(currentPage)) === "error") {
     currentPage = await gotoSnapchat({ reload: true });
   }
@@ -644,7 +978,7 @@ async function extractChats(currentPage) {
       const status = rowID ? (row.querySelector(`#status-${rowID}`)?.textContent || "") : "";
       const time = row.querySelector("time")?.textContent || "";
       const text = (row.textContent || "").replace(/\s+/g, " ").trim();
-      const preview = [status, time].map((value) => value.replace(/\s+/g, " ").trim()).filter(Boolean).join(" · ");
+      const preview = [status, time].map((value) => value.replace(/\s+/g, " ").trim()).filter(Boolean).join(" - ");
       const aria = row.getAttribute("aria-label") || "";
       const className = typeof row.className === "string" ? row.className : "";
 
@@ -665,7 +999,140 @@ async function extractChats(currentPage) {
     return results;
   });
 
-  return parseChatRows(rows);
+  return rows;
+}
+
+async function scrollSidebarChatList(currentPage, direction) {
+  const before = await currentPage.evaluate((scrollDirection) => {
+    const widthLimit = Math.max(window.innerWidth * 0.45, 420);
+    const rows = Array.from(document.querySelectorAll("[role='button'][aria-labelledby*='title-'], [role='link'][aria-labelledby*='title-']"))
+      .filter((row) => {
+        const rect = row.getBoundingClientRect();
+        return rect.width && rect.height && rect.left < widthLimit;
+      });
+    const firstRow = rows[0];
+    const signature = rows
+      .map((row) => row.querySelector("span[id^='title-']")?.id || row.textContent || "")
+      .join("|");
+
+    const candidates = Array.from(document.querySelectorAll("div, main, section, aside, nav"))
+      .map((element) => {
+        const rect = element.getBoundingClientRect();
+        const overflow = window.getComputedStyle(element).overflowY;
+        const rowCount = rows.filter((row) => element.contains(row)).length;
+        const scrollable = element.scrollHeight - element.clientHeight;
+        return { element, rect, overflow, rowCount, scrollable };
+      })
+      .filter(({ rect, rowCount, scrollable }) =>
+        rect.width &&
+        rect.height &&
+        rect.left < widthLimit &&
+        rowCount > 0 &&
+        scrollable > 20
+      )
+      .sort((a, b) => (b.rowCount - a.rowCount) || (b.scrollable - a.scrollable));
+    const styled = candidates.find(({ overflow }) => /auto|scroll|overlay/i.test(overflow));
+    const scroller = styled?.element || candidates[0]?.element || document.scrollingElement || document.documentElement;
+    const rect = (firstRow || scroller).getBoundingClientRect();
+    const scrollTop = scroller.scrollTop;
+    const amount = scrollDirection === "top" ? -scroller.scrollHeight : Math.max(700, scroller.clientHeight * 0.9);
+    try {
+      if (scrollDirection === "top") {
+        scroller.scrollTop = 0;
+      } else {
+        scroller.scrollTop += amount;
+      }
+      scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+    } catch {}
+
+    return {
+      signature,
+      scrollTop,
+      scrollHeight: scroller.scrollHeight,
+      clientHeight: scroller.clientHeight,
+      x: Math.max(30, Math.min(widthLimit - 20, rect.left + Math.min(80, rect.width / 2))),
+      y: Math.max(80, Math.min(window.innerHeight - 80, rect.top + Math.min(60, rect.height / 2))),
+    };
+  }, direction);
+
+  await currentPage.mouse.move(before.x, before.y);
+  await currentPage.mouse.wheel(0, direction === "top" ? -5000 : Math.max(700, before.clientHeight * 0.9));
+  await currentPage.waitForTimeout(500);
+
+  return currentPage.evaluate((previous) => {
+    const widthLimit = Math.max(window.innerWidth * 0.45, 420);
+    const rows = Array.from(document.querySelectorAll("[role='button'][aria-labelledby*='title-'], [role='link'][aria-labelledby*='title-']"))
+      .filter((row) => {
+        const rect = row.getBoundingClientRect();
+        return rect.width && rect.height && rect.left < widthLimit;
+      });
+    const signature = rows
+      .map((row) => row.querySelector("span[id^='title-']")?.id || row.textContent || "")
+      .join("|");
+
+    const candidates = Array.from(document.querySelectorAll("div, main, section, aside, nav"))
+      .map((element) => {
+        const rect = element.getBoundingClientRect();
+        const overflow = window.getComputedStyle(element).overflowY;
+        const rowCount = rows.filter((row) => element.contains(row)).length;
+        const scrollable = element.scrollHeight - element.clientHeight;
+        return { element, rect, overflow, rowCount, scrollable };
+      })
+      .filter(({ rect, rowCount, scrollable }) =>
+        rect.width &&
+        rect.height &&
+        rect.left < widthLimit &&
+        rowCount > 0 &&
+        scrollable > 20
+      )
+      .sort((a, b) => (b.rowCount - a.rowCount) || (b.scrollable - a.scrollable));
+    const styled = candidates.find(({ overflow }) => /auto|scroll|overlay/i.test(overflow));
+    const scroller = styled?.element || candidates[0]?.element || document.scrollingElement || document.documentElement;
+    const scrollMoved = Math.abs(scroller.scrollTop - previous.scrollTop) > 4;
+    const contentChanged = signature !== previous.signature;
+
+    return {
+      moved: scrollMoved || contentChanged,
+      atBottom: scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 8,
+      scrollTop: scroller.scrollTop,
+      scrollHeight: scroller.scrollHeight,
+      clientHeight: scroller.clientHeight,
+    };
+  }, before);
+}
+
+async function extractChats(currentPage, { deep = false } = {}) {
+  if (!deep) {
+    return parseChatRows(await readSidebarChatRows(currentPage));
+  }
+
+  const byKey = new Map();
+  const mergeRows = (rows) => {
+    for (const chat of parseChatRows(rows)) {
+      const key = chatCacheKey(chat);
+      if (key && !byKey.has(key)) {
+        byKey.set(key, chat);
+      }
+    }
+  };
+
+  await scrollSidebarChatList(currentPage, "top");
+  await currentPage.waitForTimeout(250);
+
+  let idlePasses = 0;
+  for (let pass = 0; pass < 36; pass += 1) {
+    const before = byKey.size;
+    mergeRows(await readSidebarChatRows(currentPage));
+    idlePasses = byKey.size === before ? idlePasses + 1 : 0;
+
+    const scroll = await scrollSidebarChatList(currentPage, "down");
+    await currentPage.waitForTimeout(250);
+    if (scroll.atBottom || (!scroll.moved && idlePasses >= 2)) {
+      break;
+    }
+  }
+
+  return Array.from(byKey.values()).slice(0, 100);
 }
 
 async function extractMessages(currentPage, activeChatName, activeChatID = "") {
@@ -674,9 +1141,11 @@ async function extractMessages(currentPage, activeChatName, activeChatID = "") {
     return [];
   }
 
-  const messages = await currentPage.evaluate(({ activeName, activeID, unsupportedLabel, unsupportedEvent, dateDividerSource }) => {
+  const messages = await currentPage.evaluate(({ activeName, activeID, unsupportedLabel, unsupportedEvent, statusLabel, dateDividerSource, snapPreviewSource }) => {
     const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+    const escapeRegExp = (value) => String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const dateDivider = new RegExp(dateDividerSource, "i");
+    const snapPreview = new RegExp(snapPreviewSource, "i");
     const conversationRoot =
       (activeID && document.getElementById(`cv-${activeID}`)) ||
       document.querySelector("ul[id^='cv-']");
@@ -690,6 +1159,16 @@ async function extractMessages(currentPage, activeChatName, activeChatID = "") {
     const seen = new Set();
     let currentTimestamp = "";
 
+    const timeOnly = /^(?:\d{1,2}:\d{2}|\d{1,2})(?:\s?[ap]\.?m\.?)$/i;
+    const combineTimestamp = (explicit, current) => {
+      const timeHint = normalize(explicit);
+      const dateHint = normalize(current);
+      if (timeHint && dateHint && timeOnly.test(timeHint) && !timeOnly.test(dateHint)) {
+        return `${dateHint} ${timeHint}`;
+      }
+      return timeHint || dateHint;
+    };
+
     for (const item of conversationRoot.querySelectorAll(":scope > li")) {
       const rect = item.getBoundingClientRect();
       if (!rect.width || !rect.height) {
@@ -697,18 +1176,28 @@ async function extractMessages(currentPage, activeChatName, activeChatID = "") {
       }
 
       const timeElement = item.querySelector("time");
+      const explicitTimestamp = normalize(
+        timeElement?.getAttribute("datetime") ||
+        timeElement?.getAttribute("title") ||
+        timeElement?.textContent ||
+        ""
+      );
       if (timeElement && !item.querySelector(".KB4Aq, [dir='auto'], .ogn1z, .ijyxU")) {
-        currentTimestamp = normalize(
-          timeElement.getAttribute("datetime") ||
-          timeElement.getAttribute("title") ||
-          timeElement.textContent
-        );
+        currentTimestamp = explicitTimestamp;
         continue;
       }
 
       const headerText = normalize(item.querySelector("header")?.textContent || "");
       const outgoing = /^me$/i.test(headerText);
       const author = outgoing ? "You" : (headerText || activeName || "");
+      const fullText = normalize(item.textContent || "");
+      const activePrefix = activeName ? new RegExp(`^\\s*${escapeRegExp(activeName)}\\s*`, "i") : null;
+      const statusText = normalize(
+        fullText
+          .replace(/^me\b/i, "")
+          .replace(activePrefix || /^$/, "")
+          .replace(/Close Chat/gi, "")
+      );
       const textNodes = Array.from(item.querySelectorAll("[dir='auto'], .ogn1z, .ijyxU, .mZgqh"))
         .map((node) => normalize(node.textContent))
         .filter(Boolean);
@@ -717,8 +1206,9 @@ async function extractMessages(currentPage, activeChatName, activeChatID = "") {
       const hasMedia = item.querySelectorAll("img, video, canvas, input[type='file']").length > 0;
       const hasBubble = Boolean(item.querySelector(".KB4Aq"));
       const isStatusOnly = Boolean(item.querySelector(".mZgqh")) && !item.querySelector("[dir='auto'], .ogn1z");
+      const isSnapStatus = snapPreview.test(statusText) && !/send a chat|search|reply|call|typing/i.test(statusText);
 
-      if (!text && !hasMedia && !hasBubble) {
+      if (!text && !hasMedia && !hasBubble && !isSnapStatus) {
         continue;
       }
       if (/^(drag & drop to upload|reply|call)$/i.test(text)) {
@@ -729,10 +1219,12 @@ async function extractMessages(currentPage, activeChatName, activeChatID = "") {
       }
       if (/started a snapstreak|tried to call you/i.test(text)) {
         text = `${unsupportedEvent} ${text}`;
+      } else if (isStatusOnly && isSnapStatus) {
+        text = `${statusLabel}: ${statusText}`;
       } else if (isStatusOnly) {
         continue;
-      } else if (!text && hasMedia) {
-        text = unsupportedLabel;
+      } else if (!text && (hasMedia || isSnapStatus)) {
+        text = isSnapStatus ? `${unsupportedLabel}: ${statusText}` : unsupportedLabel;
       } else if (!text) {
         continue;
       }
@@ -742,12 +1234,15 @@ async function extractMessages(currentPage, activeChatName, activeChatID = "") {
         continue;
       }
 
-      const key = `${outgoing ? "out" : "in"}:${Math.round(rect.top / 6)}:${text}`;
+      const isSyntheticStatus = text.startsWith(statusLabel) || text.startsWith(unsupportedLabel);
+      const key = isSyntheticStatus
+        ? `${outgoing ? "out" : "in"}:${explicitTimestamp || currentTimestamp}:${text}`
+        : `${outgoing ? "out" : "in"}:${Math.round(rect.top / 6)}:${text}`;
       if (seen.has(key)) {
         continue;
       }
       seen.add(key);
-      items.push({ author, text, top: rect.top, outgoing, timestamp: currentTimestamp });
+      items.push({ author, text, top: rect.top, outgoing, timestamp: combineTimestamp(explicitTimestamp, currentTimestamp) });
     }
 
     return items.sort((a, b) => a.top - b.top).slice(-80);
@@ -756,7 +1251,9 @@ async function extractMessages(currentPage, activeChatName, activeChatID = "") {
     activeID: activeChatID,
     unsupportedLabel: unsupportedMediaLabel,
     unsupportedEvent: unsupportedEventLabel,
+    statusLabel: snapchatStatusLabel,
     dateDividerSource: dateDividerPattern.source,
+    snapPreviewSource: snapPreviewPattern.source,
   });
 
   return messages.map((message, index) => ({
@@ -769,41 +1266,85 @@ async function extractMessages(currentPage, activeChatName, activeChatID = "") {
 }
 
 async function resolveChat(currentPage, chatID, chatName, chatURL = "") {
+  await ensureKnownChatsLoaded();
+  const knownChat = findKnownChat(chatID, chatName);
   if (chatURL && isSnapchatURL(chatURL)) {
     const urlID = getConversationIDFromURL(chatURL);
     return {
       id: urlID || chatID || "",
-      name: chatName || "",
+      name: chatName || knownChat?.name || "",
       url: chatURL,
+      preview: knownChat?.preview || "",
+      lastMessage: knownChat?.lastMessage || "",
+      unread: Boolean(knownChat?.unread),
     };
   }
 
   if (looksLikeConversationID(chatID)) {
     return {
       id: chatID,
-      name: chatName || "",
-      url: conversationURL(chatID),
+      name: chatName || knownChat?.name || "",
+      url: knownChat?.url || conversationURL(chatID),
+      preview: knownChat?.preview || "",
+      lastMessage: knownChat?.lastMessage || "",
+      unread: Boolean(knownChat?.unread),
     };
   }
 
   const chats = await extractChats(currentPage);
+  mergeKnownChats(chats);
+  await saveKnownChats();
   if (chatName) {
-    const match = chats.find((chat) => chat.name === chatName);
+    const match = chats.find((chat) => chat.name === chatName) || knownChat;
     return {
       id: match?.id || "",
       name: chatName,
       url: match?.url || (match?.id ? conversationURL(match.id) : ""),
+      preview: match?.preview || "",
+      lastMessage: match?.lastMessage || "",
+      unread: Boolean(match?.unread),
     };
   }
   if (!chatID) {
     throw new Error("chatId or chatName is required");
   }
 
-  const match = chats.find((chat) => chat.id === chatID);
+  const match = chats.find((chat) => chat.id === chatID) || knownChat;
   if (!match) {
     throw new Error(`could not resolve chatId "${chatID}"`);
   }
-  return { id: match.id, name: match.name, url: match.url || conversationURL(match.id) };
+  return {
+    id: match.id,
+    name: match.name,
+    url: match.url || conversationURL(match.id),
+    preview: match.preview || "",
+    lastMessage: match.lastMessage || "",
+    unread: Boolean(match.unread),
+  };
+}
+
+function extractTimestampHint(value) {
+  const text = normalizeText(value);
+  const match = text.match(/\b(today|yesterday|sun(?:day)?|mon(?:day)?|tue(?:s|sday|day)?|wed(?:nesday)?|thu(?:r|rs|rsday|rday)?|fri(?:day)?|sat(?:urday)?|\d+\s*[mhdwy]|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{1,2})\b/i);
+  return match ? match[1] : "";
+}
+
+function makeSidebarStatusMessage(chat, activeChat = {}) {
+  const preview = normalizeText(chat?.lastMessage || chat?.preview || "");
+  if (!preview || !snapPreviewPattern.test(preview)) {
+    return null;
+  }
+
+  const isMedia = /\b(new snap|snap|video|photo|picture|media|voice note|audio|sticker|tap to view|received|opened|delivered|sent)\b/i.test(preview);
+  const label = isMedia ? unsupportedMediaLabel : snapchatStatusLabel;
+  const outgoing = /^(sent|delivered|opened)/i.test(preview) && !/sent you/i.test(preview);
+  return {
+    id: stableID(["sidebar-status", chat?.id || activeChat?.id || chat?.name || "", preview]),
+    author: outgoing ? "You" : (activeChat?.name || chat?.name || "Snapchat"),
+    text: `${label}: ${preview}`,
+    timestamp: extractTimestampHint(preview),
+    outgoing,
+  };
 }
 
 async function getComposer(currentPage) {
@@ -949,8 +1490,84 @@ async function captureDebugSnapshot(currentPage) {
   return { htmlPath, screenshotPath };
 }
 
+async function findSendButton(currentPage) {
+  const found = await currentPage.evaluate(() => {
+    document.querySelectorAll("[data-codex-send-button]").forEach((element) => {
+      element.removeAttribute("data-codex-send-button");
+    });
+
+    const rightPaneLeft = Math.max(window.innerWidth * 0.28, 300);
+    const candidates = Array.from(document.querySelectorAll("button, [role='button'], [aria-label*='send' i]"))
+      .map((element) => {
+        const rect = element.getBoundingClientRect();
+        const label = [
+          element.getAttribute("aria-label") || "",
+          element.getAttribute("title") || "",
+          element.textContent || "",
+        ].join(" ");
+        const disabled = element.disabled || element.getAttribute("aria-disabled") === "true";
+        return { element, rect, label, disabled };
+      })
+      .filter(({ rect, label, disabled }) =>
+        !disabled &&
+        rect.width &&
+        rect.height &&
+        rect.left >= rightPaneLeft &&
+        rect.bottom >= window.innerHeight * 0.55 &&
+        /send/i.test(label)
+      )
+      .sort((a, b) => b.rect.bottom - a.rect.bottom || a.rect.left - b.rect.left);
+
+    const match = candidates[0];
+    if (!match) {
+      return false;
+    }
+    match.element.setAttribute("data-codex-send-button", "1");
+    return true;
+  });
+
+  return found ? currentPage.locator("[data-codex-send-button='1']").first() : null;
+}
+
+async function findUploadInput(currentPage) {
+  const input = currentPage.locator("input[type='file']").last();
+  try {
+    if (await input.count()) {
+      return input;
+    }
+  } catch {
+  }
+
+  const uploadButton = await firstVisibleLocator([
+    currentPage.getByRole("button", { name: /upload|attach|camera roll|photo|picture|media/i }),
+    currentPage.locator("[aria-label*='upload' i], [aria-label*='attach' i], [aria-label*='camera' i], [title*='upload' i], [title*='attach' i]"),
+  ]);
+  if (uploadButton) {
+    await uploadButton.click({ force: true });
+    await currentPage.waitForTimeout(500);
+  }
+
+  const postClickInput = currentPage.locator("input[type='file']").last();
+  if (await postClickInput.count()) {
+    return postClickInput;
+  }
+  throw new Error("could not find Snapchat media upload input");
+}
+
+function sanitizeUploadFileName(value) {
+  const base = normalizeText(value) || "snap-media.bin";
+  return base.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "snap-media.bin";
+}
+
+async function attachMediaFile(currentPage, filePath) {
+  const input = await findUploadInput(currentPage);
+  await input.setInputFiles(filePath);
+  await currentPage.waitForTimeout(2000);
+}
+
 export async function createSession() {
   return withLock(async () => {
+    await ensureKnownChatsLoaded();
     const currentPage = await gotoSnapchat();
     const state = await detectState(currentPage);
     return {
@@ -964,40 +1581,394 @@ export async function createSession() {
 
 export async function getStatus() {
   return withLock(async () => {
+    await ensureKnownChatsLoaded();
     const currentPage = await gotoSnapchat();
     const state = await detectState(currentPage);
-    const chats = state === "ready" ? await extractChats(currentPage) : [];
 
     return {
       state,
       authenticated: state === "ready",
       activeChatName: await currentPage.title(),
       url: currentPage.url(),
-      visibleChatCount: chats.length,
+      visibleChatCount: state === "ready" ? knownChatsByKey.size : 0,
+    };
+  }, { priority: 0 });
+}
+
+async function readSnapchatAPIIdentity(currentPage) {
+  if (!currentPage || currentPage.isClosed()) {
+    return { selfUserID: "", username: "", displayName: "", source: "", debug: {} };
+  }
+
+  try {
+    const frames = typeof currentPage.frames === "function" ? currentPage.frames() : [currentPage.mainFrame()];
+    const frameDebug = [];
+    for (const frame of frames) {
+      try {
+        const identity = await frame.evaluate(() => {
+      const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+      function bytesToUUID(bytes) {
+        if (!bytes || bytes.length !== 16) {
+          return "";
+        }
+        const hex = Array.from(bytes, (byte) => Number(byte).toString(16).padStart(2, "0")).join("");
+        return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`.toLowerCase();
+      }
+
+      function uuidFromValue(value) {
+        if (!value) {
+          return "";
+        }
+        if (typeof value === "string") {
+          return uuidPattern.test(value) ? value.toLowerCase() : "";
+        }
+        if (typeof value !== "object") {
+          return "";
+        }
+        if (typeof value.str === "string" && uuidPattern.test(value.str)) {
+          return value.str.toLowerCase();
+        }
+        if (value.id instanceof Uint8Array) {
+          return bytesToUUID(value.id);
+        }
+        if (Array.isArray(value.id)) {
+          return bytesToUUID(value.id);
+        }
+        if (ArrayBuffer.isView(value.id)) {
+          return bytesToUUID(new Uint8Array(value.id.buffer, value.id.byteOffset, value.id.byteLength));
+        }
+        if (value.encodedId instanceof Uint8Array) {
+          return bytesToUUID(value.encodedId);
+        }
+        if (Array.isArray(value.encodedId)) {
+          return bytesToUUID(value.encodedId);
+        }
+        return "";
+      }
+
+      function identityFromState(state, source) {
+        const auth = state?.auth;
+        if (!auth || typeof auth !== "object") {
+          return null;
+        }
+        const me = auth.currentUserOverride || auth.me || {};
+        const selfUserID =
+          uuidFromValue(auth.userId) ||
+          uuidFromValue(me.userId) ||
+          uuidFromValue(me.id) ||
+          uuidFromValue(me);
+        if (!selfUserID) {
+          return null;
+        }
+        return {
+          selfUserID,
+          username: me.mutableUsername || me.username || auth.username || "",
+          displayName: me.displayName || me.display_name || auth.displayName || "",
+          source,
+        };
+      }
+
+      function findWebpackRequire() {
+        for (const key of Object.keys(globalThis)) {
+          if (!/^webpackChunk/.test(key)) {
+            continue;
+          }
+          const chunk = globalThis[key];
+          if (!Array.isArray(chunk) || typeof chunk.push !== "function") {
+            continue;
+          }
+          let webpackRequire;
+          try {
+            chunk.push([[`codex-api-auth-${Date.now()}`], {}, (req) => {
+              webpackRequire = req;
+            }]);
+          } catch {
+            continue;
+          }
+          if (webpackRequire?.c) {
+            return webpackRequire;
+          }
+        }
+        return undefined;
+      }
+
+      function scanExports(exports, source, debug, seen = new Set(), depth = 0) {
+        if (!exports || (typeof exports !== "object" && typeof exports !== "function") || seen.has(exports) || depth > 3) {
+          return null;
+        }
+        seen.add(exports);
+        if (typeof exports.getState === "function") {
+          const candidate = source;
+          if (debug.storeCandidates.length < 20) {
+            debug.storeCandidates.push(candidate);
+          }
+          try {
+            const identity = identityFromState(exports.getState(), source);
+            if (identity) {
+              return identity;
+            }
+          } catch {
+          }
+        }
+        if (typeof exports !== "object") {
+          return null;
+        }
+        for (const [key, value] of Object.entries(exports)) {
+          if (!value || (typeof value !== "object" && typeof value !== "function")) {
+            continue;
+          }
+          const identity = scanExports(value, `${source}.${key}`, debug, seen, depth + 1);
+          if (identity) {
+            return identity;
+          }
+        }
+        return null;
+      }
+
+      const debug = {
+        webpackChunkKeys: Object.keys(globalThis).filter((key) => /^webpackChunk/.test(key)).slice(0, 10),
+        requireKeys: [],
+        moduleCount: 0,
+        moduleDefinitionCount: 0,
+        definitionCandidates: [],
+        storeCandidates: [],
+      };
+      const webpackRequire = findWebpackRequire();
+      if (webpackRequire) {
+        debug.requireKeys = Object.keys(webpackRequire).slice(0, 30);
+      }
+      if (webpackRequire?.c) {
+        debug.moduleCount = Object.keys(webpackRequire.c).length;
+        for (const [moduleID, module] of Object.entries(webpackRequire.c)) {
+          const identity = scanExports(module?.exports, `webpack-cache:${moduleID}`, debug);
+          if (identity) {
+            identity.debug = debug;
+            return identity;
+          }
+        }
+      }
+      if (webpackRequire?.m) {
+        const definitions = Object.entries(webpackRequire.m);
+        debug.moduleDefinitionCount = definitions.length;
+        for (const [moduleID, factory] of definitions) {
+          let source = "";
+          try {
+            source = Function.prototype.toString.call(factory);
+          } catch {
+          }
+          if (!/auth\.userId|auth:\{|currentUserOverride|getState\(\)\.auth/.test(source)) {
+            continue;
+          }
+          if (debug.definitionCandidates.length < 20) {
+            debug.definitionCandidates.push(moduleID);
+          }
+          try {
+            const exports = webpackRequire(moduleID);
+            const identity = scanExports(exports, `webpack-module:${moduleID}`, debug);
+            if (identity) {
+              identity.debug = debug;
+              return identity;
+            }
+          } catch {
+          }
+        }
+      }
+
+          return { selfUserID: "", username: "", displayName: "", source: "", debug };
+        });
+        identity.debug = { ...identity.debug, frameURL: frame.url() };
+        frameDebug.push(identity.debug);
+        if (identity.selfUserID) {
+          return identity;
+        }
+      } catch (error) {
+        frameDebug.push({
+          frameURL: frame.url(),
+          error: String(error).slice(0, 160),
+        });
+      }
+    }
+    return { selfUserID: "", username: "", displayName: "", source: "", debug: { frames: frameDebug } };
+  } catch {
+    return { selfUserID: "", username: "", displayName: "", source: "", debug: { error: "page-evaluate-failed" } };
+  }
+}
+
+async function readSnapchatAPIUserAgents(currentPage) {
+  const fallbackBrowserUserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+  let browserUserAgent = fallbackBrowserUserAgent;
+  try {
+    if (currentPage && !currentPage.isClosed()) {
+      browserUserAgent = await currentPage.evaluate(() => navigator.userAgent || "");
+    }
+  } catch {
+    browserUserAgent = fallbackBrowserUserAgent;
+  }
+  if (!browserUserAgent) {
+    browserUserAgent = fallbackBrowserUserAgent;
+  }
+
+  let webVersion = "";
+  try {
+    const response = await fetch(SNAPCHAT_VERSION_URL, { cache: "no-store" });
+    if (response.ok) {
+      const version = await response.json();
+      webVersion = String(version.version || "");
+    }
+  } catch {
+    webVersion = "";
+  }
+  if (!webVersion) {
+    webVersion = "13.79.0";
+  }
+
+  const chromeVersionMatch = browserUserAgent.match(/(?:Chrome|Chromium|HeadlessChrome)\/([0-9.]+)/i);
+  const chromeVersion = chromeVersionMatch?.[1] || "120.0.0.0";
+  const captured = lastSnapAPIRequestHeaders || {};
+  const capturedHeaders = captured.headers || {};
+  return {
+    browserUserAgent: captured.userAgent || browserUserAgent,
+    snapClientUserAgent: captured.snapClientUserAgent || `SnapchatWeb/${webVersion} PROD (linux 0.0.0; chrome ${chromeVersion})`,
+    secChUa: captured.secChUa || "",
+    secChUaPlatform: captured.secChUaPlatform || "",
+    grpcWebUserAgent: capturedHeaders["x-user-agent"] || "grpc-web-javascript/0.1",
+    mcsCofIdsBin: capturedHeaders["mcs-cof-ids-bin"] || "",
+    webVersion,
+  };
+}
+
+export async function getAPIAuth() {
+  return withLock(async () => {
+    let { context: currentContext, page: currentPage } = await ensureSession();
+    if (!lastSnapAPIRequestHeaders?.headers?.["mcs-cof-ids-bin"]) {
+      try {
+        currentPage = await gotoSnapchat();
+        currentContext = context || currentContext;
+        await currentPage.waitForTimeout(1500);
+      } catch {
+        // Auth can still succeed from cookies; this only warms API header capture.
+      }
+    }
+    const cookies = await currentContext.cookies([
+      "https://www.snapchat.com",
+      "https://web.snapchat.com",
+      "https://accounts.snapchat.com",
+    ]);
+    const wanted = new Set([
+      "__Host-sc-a-nonce",
+      "__Host-sc-a-session",
+      "__Host-sc-a-auth-session",
+      "__Host-X-Snap-Client-Cookie",
+      "sc-a-nonce",
+    ]);
+    const selected = cookies
+      .filter((cookie) => wanted.has(cookie.name))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    const byName = new Map(selected.map((cookie) => [cookie.name, cookie.value]));
+    const cookieString = selected
+      .map((cookie) => `${cookie.name}=${cookie.value}`)
+      .join("; ");
+    const hasNonce = Boolean(byName.get("__Host-sc-a-nonce") || byName.get("sc-a-nonce"));
+    const hasSession = Boolean(byName.get("__Host-sc-a-session") || byName.get("__Host-sc-a-auth-session"));
+    const hasClient = Boolean(byName.get("__Host-X-Snap-Client-Cookie"));
+    const identity = await readSnapchatAPIIdentity(currentPage);
+    const userAgents = await readSnapchatAPIUserAgents(currentPage);
+
+    return {
+      state: hasNonce && hasSession && hasClient ? "ready" : "missing_cookies",
+      authenticated: hasNonce && hasSession && hasClient,
+      cookieString,
+      selfUserID: identity.selfUserID || capturedSelfUserID,
+      username: identity.username,
+      displayName: identity.displayName,
+      identitySource: identity.source,
+      identityDebug: identity.debug,
+      browserUserAgent: userAgents.browserUserAgent,
+      snapClientUserAgent: userAgents.snapClientUserAgent,
+      secChUa: userAgents.secChUa,
+      secChUaPlatform: userAgents.secChUaPlatform,
+      grpcWebUserAgent: userAgents.grpcWebUserAgent,
+      mcsCofIdsBin: userAgents.mcsCofIdsBin,
+      webVersion: userAgents.webVersion,
+      apiRequestHeaders: lastSnapAPIRequestHeaders,
+      cookies: selected.map((cookie) => ({
+        name: cookie.name,
+        domain: cookie.domain,
+        expires: cookie.expires,
+      })),
+      url: page && !page.isClosed() ? page.url() : "",
     };
   }, { priority: 0 });
 }
 
 export async function getChats() {
   return withLock(async () => {
+    await ensureKnownChatsLoaded();
     const currentPage = await gotoSnapchat();
     if (!(await isLoggedIn(currentPage))) {
       throw new Error("snapchat session is not logged in");
     }
 
-    await clearSearchBox(currentPage);
-    await currentPage.waitForTimeout(1200);
-    return extractChats(currentPage);
+    let currentChats = [];
+    try {
+      await clearSearchBox(currentPage);
+      await currentPage.waitForTimeout(CHAT_LIST_SETTLE_MS);
+      currentChats = await extractChats(currentPage);
+      if (currentChats.length === 0) {
+        await returnToChatList(currentPage);
+        currentChats = await extractChats(currentPage);
+      }
+    } catch (error) {
+      if (knownChatsByKey.size > 0) {
+        console.error(`getChats: quick scan failed, returning ${knownChatsByKey.size} cached chats: ${String(error)}`);
+        return orderKnownChats([]);
+      }
+      throw error;
+    }
+    mergeKnownChats(currentChats);
+
+    const hasWarmCache = knownChatsByKey.size >= CHAT_DEEP_SCAN_MIN_CACHE;
+    const shouldDeepScan = !hasWarmCache && (lastDeepChatSync === 0 || Date.now() - lastDeepChatSync > CHAT_DEEP_REFRESH_MS);
+    if (shouldDeepScan) {
+      try {
+        const deepChats = await extractChats(currentPage, { deep: true });
+        mergeKnownChats(deepChats);
+        lastDeepChatSync = Date.now();
+        currentChats = deepChats.length > 0 ? deepChats : currentChats;
+        console.error(`getChats: deep scan found ${deepChats.length} chats, cache=${knownChatsByKey.size}`);
+      } catch (error) {
+        lastDeepChatSync = Date.now();
+        console.error(`getChats: deep scan failed: ${String(error)}`);
+      }
+    }
+
+    await saveKnownChats();
+    return orderKnownChats(currentChats);
   }, { priority: 2 });
 }
 
 export async function getMessages(chatID, chatName, chatURL = "") {
   return withLock(async () => {
-    const currentPage = await gotoSnapchat();
-    const resolvedChat = await resolveChat(currentPage, chatID, chatName, chatURL);
-    const openedPage = await openChat(resolvedChat.name, resolvedChat.id, resolvedChat.url);
-    const activeChat = await getActiveConversation(openedPage, resolvedChat.name, resolvedChat.id);
-    return extractMessages(openedPage, activeChat.name || resolvedChat.name, activeChat.id || resolvedChat.id);
+    let lastError;
+    for (let attempt = 1; attempt <= MESSAGE_ATTEMPTS; attempt += 1) {
+      try {
+        const currentPage = await gotoSnapchat({ reload: attempt > 1 });
+        const resolvedChat = await resolveChat(currentPage, chatID, chatName, chatURL);
+        const openedPage = await openChat(resolvedChat.name, resolvedChat.id, resolvedChat.url, { searchFallback: false });
+        const activeChat = await getActiveConversation(openedPage, resolvedChat.name, resolvedChat.id);
+        const messages = await extractMessages(openedPage, activeChat.name || resolvedChat.name, activeChat.id || resolvedChat.id);
+        const sidebarStatus = makeSidebarStatusMessage(resolvedChat, activeChat);
+        if (sidebarStatus && !messages.some((message) => message.id === sidebarStatus.id || normalizeText(message.text) === normalizeText(sidebarStatus.text))) {
+          return [...messages, sidebarStatus].slice(-80);
+        }
+        return messages;
+      } catch (error) {
+        lastError = error;
+        console.error(`getMessages: attempt=${attempt} failed chatId=${chatID} chatName=${JSON.stringify(chatName)} chatUrl=${JSON.stringify(chatURL)} error=${String(error)}`);
+      }
+    }
+    throw lastError;
   }, { priority: 3 });
 }
 
@@ -1040,10 +2011,7 @@ export async function sendMessage(chatID, chatName, chatURL = "", text) {
       return { postSendChat, confirmed: false };
     };
 
-    const sendButton = await firstVisibleLocator([
-      openedPage.getByRole("button", { name: /send/i }),
-      openedPage.locator("[aria-label*='send' i]"),
-    ]);
+    const sendButton = await findSendButton(openedPage);
 
     let result;
     if (sendButton) {
@@ -1079,6 +2047,75 @@ export async function sendMessage(chatID, chatName, chatURL = "", text) {
   }, { priority: 0 });
 }
 
+export async function sendMedia(chatID, chatName, chatURL = "", fileName = "snap-media.bin", mimeType = "application/octet-stream", dataBase64, caption = "") {
+  return withLock(async () => {
+    console.error(`sendMedia: begin chatId=${chatID} chatName=${JSON.stringify(chatName)} chatUrl=${JSON.stringify(chatURL)} fileName=${JSON.stringify(fileName)} mimeType=${JSON.stringify(mimeType)}`);
+    const data = Buffer.from(String(dataBase64 || ""), "base64");
+    if (!data.length) {
+      throw new Error("media payload was empty");
+    }
+
+    await fs.mkdir(traceDir, { recursive: true });
+    const safeName = sanitizeUploadFileName(fileName);
+    const tempPath = path.join(traceDir, `upload-${Date.now()}-${stableID([safeName, String(data.length)])}-${safeName}`);
+    await fs.writeFile(tempPath, data);
+
+    try {
+      const currentPage = await gotoSnapchat();
+      const resolvedChat = await resolveChat(currentPage, chatID, chatName, chatURL);
+      console.error(`sendMedia: resolved chat => id=${resolvedChat.id} name=${JSON.stringify(resolvedChat.name)} url=${JSON.stringify(resolvedChat.url)}`);
+      const openedPage = await openChat(resolvedChat.name, resolvedChat.id, resolvedChat.url);
+      const activeChat = await getActiveConversation(openedPage, resolvedChat.name, resolvedChat.id);
+      console.error(`sendMedia: active conversation => id=${activeChat.id} name=${JSON.stringify(activeChat.name)} url=${JSON.stringify(activeChat.url)} headers=${JSON.stringify(activeChat.headers)}`);
+
+      await attachMediaFile(openedPage, tempPath);
+      console.error("sendMedia: attached media file");
+
+      const cleanCaption = normalizeText(caption);
+      if (cleanCaption) {
+        try {
+          const composer = await getComposer(openedPage);
+          await setComposerText(openedPage, composer, cleanCaption);
+          console.error("sendMedia: populated caption");
+        } catch (error) {
+          console.error(`sendMedia: caption skipped: ${String(error)}`);
+        }
+      }
+
+      const sendButton = await findSendButton(openedPage);
+      if (sendButton) {
+        console.error("sendMedia: clicking send button");
+        await sendButton.click();
+      } else {
+        console.error("sendMedia: send button not found, pressing Enter");
+        await openedPage.keyboard.press("Enter");
+      }
+      await openedPage.waitForTimeout(3500);
+      const postSendChat = await getActiveConversation(openedPage, activeChat.name || resolvedChat.name, activeChat.id || resolvedChat.id);
+      const expectedID = activeChat.id || resolvedChat.id;
+      const confirmed = !expectedID || sameConversationID(postSendChat.id, expectedID);
+      if (!confirmed) {
+        const snapshot = await captureDebugSnapshot(openedPage);
+        throw new Error(`media send did not stay in expected chat "${activeChat.name || resolvedChat.name}" (snapshot=${snapshot.screenshotPath})`);
+      }
+      console.error("sendMedia: queued");
+      return {
+        queued: true,
+        confirmed: true,
+        chatID: postSendChat.id || activeChat.id || resolvedChat.id || chatID || makeChatID(resolvedChat.name),
+        chatName: postSendChat.name || activeChat.name || resolvedChat.name,
+        chatURL: (postSendChat.id && conversationURL(postSendChat.id)) || resolvedChat.url || "",
+        text: cleanCaption || safeName,
+      };
+    } finally {
+      try {
+        await fs.unlink(tempPath);
+      } catch {
+      }
+    }
+  }, { priority: 0 });
+}
+
 export async function getDiagnostics() {
   return withLock(async () => {
     const currentPage = await gotoSnapchat();
@@ -1098,6 +2135,36 @@ export async function getDiagnostics() {
       return Array.from(new Set(values)).slice(0, 150);
     });
 
+    const scrollCandidates = await currentPage.evaluate(() => {
+      const widthLimit = Math.max(window.innerWidth * 0.45, 420);
+      const rows = Array.from(document.querySelectorAll("[role='button'][aria-labelledby*='title-'], [role='link'][aria-labelledby*='title-']"));
+      return Array.from(document.querySelectorAll("div, main, section, aside, nav"))
+        .map((element) => {
+          const rect = element.getBoundingClientRect();
+          const rowCount = rows.filter((row) => element.contains(row)).length;
+          const text = (element.textContent || "").replace(/\s+/g, " ").trim();
+          return {
+            tag: element.tagName.toLowerCase(),
+            role: element.getAttribute("role") || "",
+            className: typeof element.className === "string" ? element.className.slice(0, 120) : "",
+            left: Math.round(rect.left),
+            top: Math.round(rect.top),
+            width: Math.round(rect.width),
+            height: Math.round(rect.height),
+            scrollTop: Math.round(element.scrollTop),
+            clientHeight: Math.round(element.clientHeight),
+            scrollHeight: Math.round(element.scrollHeight),
+            overflowY: window.getComputedStyle(element).overflowY,
+            rowCount,
+            text: text.slice(0, 160),
+            inSidebar: rect.left < widthLimit,
+          };
+        })
+        .filter((candidate) => candidate.inSidebar && (candidate.rowCount > 0 || candidate.scrollHeight > candidate.clientHeight + 20))
+        .sort((a, b) => (b.rowCount - a.rowCount) || ((b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight)))
+        .slice(0, 20);
+    });
+
     const chatNames = state === "ready" ? (await extractChats(currentPage)).map((chat) => chat.name) : [];
 
     return {
@@ -1109,6 +2176,7 @@ export async function getDiagnostics() {
       headless,
       chatNames: chatNames.slice(0, 30),
       visibleTexts,
+      scrollCandidates,
       snapshot,
       selectorHints: {
         loginTextPattern: loginTextPattern.source,
