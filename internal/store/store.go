@@ -26,6 +26,7 @@ type PortalState struct {
 	PortalKey    string
 	RemoteID     string
 	RemoteName   string
+	OtherUserID  string
 	Preview      string
 	LastMessage  string
 	Unread       bool
@@ -39,6 +40,9 @@ type MessageState struct {
 	Text         string
 	Outgoing     bool
 	TimestampRaw string
+	Kind         string
+	HasMedia     bool
+	HydratedAt   *time.Time
 	LastSeenAt   time.Time
 }
 
@@ -79,6 +83,7 @@ func (s *Store) init() error {
 			portal_key TEXT PRIMARY KEY,
 			remote_id TEXT,
 			remote_name TEXT,
+			other_user_id TEXT,
 			preview TEXT,
 			last_message TEXT,
 			unread BOOLEAN DEFAULT FALSE,
@@ -91,6 +96,9 @@ func (s *Store) init() error {
 			text TEXT,
 			outgoing BOOLEAN DEFAULT FALSE,
 			timestamp_raw TEXT,
+			kind TEXT,
+			has_media BOOLEAN DEFAULT FALSE,
+			hydrated_at DATETIME,
 			last_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			PRIMARY KEY (portal_key, remote_id)
 		)`,
@@ -110,7 +118,47 @@ func (s *Store) init() error {
 			return fmt.Errorf("init sqlite schema: %w", err)
 		}
 	}
+	if err := s.ensureColumn("message_state", "kind", "kind TEXT"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("message_state", "has_media", "has_media BOOLEAN DEFAULT FALSE"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("message_state", "hydrated_at", "hydrated_at DATETIME"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("portal_state", "other_user_id", "other_user_id TEXT"); err != nil {
+		return err
+	}
 
+	return nil
+}
+
+func (s *Store) ensureColumn(table, column, definition string) error {
+	rows, err := s.db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return fmt.Errorf("inspect sqlite table %s: %w", table, err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull, pk int
+		var defaultValue any
+		if err = rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			return err
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err = rows.Err(); err != nil {
+		return err
+	}
+	if _, err = s.db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s", table, definition)); err != nil {
+		return fmt.Errorf("migrate sqlite table %s add %s: %w", table, column, err)
+	}
 	return nil
 }
 
@@ -212,22 +260,23 @@ func (s *Store) GetAPISyncState(userID string) (*APISyncState, error) {
 
 func (s *Store) UpsertPortal(state PortalState) error {
 	_, err := s.db.Exec(`
-		INSERT INTO portal_state (portal_key, remote_id, remote_name, preview, last_message, unread, last_synced_at)
-		VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+		INSERT INTO portal_state (portal_key, remote_id, remote_name, other_user_id, preview, last_message, unread, last_synced_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 		ON CONFLICT(portal_key) DO UPDATE SET
 			remote_id=excluded.remote_id,
 			remote_name=excluded.remote_name,
+			other_user_id=excluded.other_user_id,
 			preview=excluded.preview,
 			last_message=excluded.last_message,
 			unread=excluded.unread,
 			last_synced_at=CURRENT_TIMESTAMP
-	`, state.PortalKey, state.RemoteID, state.RemoteName, state.Preview, state.LastMessage, state.Unread)
+	`, state.PortalKey, state.RemoteID, state.RemoteName, state.OtherUserID, state.Preview, state.LastMessage, state.Unread)
 	return err
 }
 
 func (s *Store) GetPortalByKey(portalKey string) (*PortalState, error) {
 	row := s.db.QueryRow(`
-		SELECT portal_key, remote_id, remote_name, preview, last_message, unread, last_synced_at
+		SELECT portal_key, remote_id, remote_name, COALESCE(other_user_id, ''), preview, last_message, unread, last_synced_at
 		FROM portal_state
 		WHERE portal_key = ?
 	`, portalKey)
@@ -237,6 +286,7 @@ func (s *Store) GetPortalByKey(portalKey string) (*PortalState, error) {
 		&state.PortalKey,
 		&state.RemoteID,
 		&state.RemoteName,
+		&state.OtherUserID,
 		&state.Preview,
 		&state.LastMessage,
 		&state.Unread,
@@ -253,7 +303,7 @@ func (s *Store) GetPortalByKey(portalKey string) (*PortalState, error) {
 
 func (s *Store) GetPortalByRemoteID(remoteID string) (*PortalState, error) {
 	row := s.db.QueryRow(`
-		SELECT portal_key, remote_id, remote_name, preview, last_message, unread, last_synced_at
+		SELECT portal_key, remote_id, remote_name, COALESCE(other_user_id, ''), preview, last_message, unread, last_synced_at
 		FROM portal_state
 		WHERE remote_id = ?
 	`, remoteID)
@@ -263,6 +313,7 @@ func (s *Store) GetPortalByRemoteID(remoteID string) (*PortalState, error) {
 		&state.PortalKey,
 		&state.RemoteID,
 		&state.RemoteName,
+		&state.OtherUserID,
 		&state.Preview,
 		&state.LastMessage,
 		&state.Unread,
@@ -279,7 +330,7 @@ func (s *Store) GetPortalByRemoteID(remoteID string) (*PortalState, error) {
 
 func (s *Store) ListPortals() ([]PortalState, error) {
 	rows, err := s.db.Query(`
-		SELECT portal_key, remote_id, remote_name, preview, last_message, unread, last_synced_at
+		SELECT portal_key, remote_id, remote_name, COALESCE(other_user_id, ''), preview, last_message, unread, last_synced_at
 		FROM portal_state
 		ORDER BY last_synced_at DESC
 	`)
@@ -295,6 +346,7 @@ func (s *Store) ListPortals() ([]PortalState, error) {
 			&state.PortalKey,
 			&state.RemoteID,
 			&state.RemoteName,
+			&state.OtherUserID,
 			&state.Preview,
 			&state.LastMessage,
 			&state.Unread,
@@ -321,13 +373,16 @@ func (s *Store) UpsertMessages(states []MessageState) error {
 	}()
 
 	stmt, err := tx.Prepare(`
-		INSERT INTO message_state (portal_key, remote_id, author, text, outgoing, timestamp_raw, last_seen_at)
-		VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+		INSERT INTO message_state (portal_key, remote_id, author, text, outgoing, timestamp_raw, kind, has_media, hydrated_at, last_seen_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 		ON CONFLICT(portal_key, remote_id) DO UPDATE SET
 			author=excluded.author,
 			text=excluded.text,
 			outgoing=excluded.outgoing,
 			timestamp_raw=excluded.timestamp_raw,
+			kind=excluded.kind,
+			has_media=excluded.has_media,
+			hydrated_at=COALESCE(excluded.hydrated_at, message_state.hydrated_at),
 			last_seen_at=CURRENT_TIMESTAMP
 	`)
 	if err != nil {
@@ -336,12 +391,63 @@ func (s *Store) UpsertMessages(states []MessageState) error {
 	defer stmt.Close()
 
 	for _, state := range states {
-		if _, err = stmt.Exec(state.PortalKey, state.RemoteID, state.Author, state.Text, state.Outgoing, state.TimestampRaw); err != nil {
+		var hydratedAt any
+		if state.HydratedAt != nil {
+			hydratedAt = *state.HydratedAt
+		}
+		if _, err = stmt.Exec(state.PortalKey, state.RemoteID, state.Author, state.Text, state.Outgoing, state.TimestampRaw, state.Kind, state.HasMedia, hydratedAt); err != nil {
 			return err
 		}
 	}
 
 	return tx.Commit()
+}
+
+func (s *Store) GetMessage(portalKey, remoteID string) (*MessageState, error) {
+	row := s.db.QueryRow(`
+		SELECT portal_key, remote_id, author, text, outgoing, timestamp_raw, kind, has_media, hydrated_at, last_seen_at
+		FROM message_state
+		WHERE portal_key = ? AND remote_id = ?
+	`, portalKey, remoteID)
+
+	var state MessageState
+	var hydratedAt sql.NullTime
+	var author, text, timestampRaw, kind sql.NullString
+	err := row.Scan(
+		&state.PortalKey,
+		&state.RemoteID,
+		&author,
+		&text,
+		&state.Outgoing,
+		&timestampRaw,
+		&kind,
+		&state.HasMedia,
+		&hydratedAt,
+		&state.LastSeenAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	state.Author = author.String
+	state.Text = text.String
+	state.TimestampRaw = timestampRaw.String
+	state.Kind = kind.String
+	if hydratedAt.Valid {
+		state.HydratedAt = &hydratedAt.Time
+	}
+	return &state, nil
+}
+
+func (s *Store) MarkMessageHydrated(portalKey, remoteID string) error {
+	_, err := s.db.Exec(`
+		UPDATE message_state
+		SET hydrated_at=CURRENT_TIMESTAMP
+		WHERE portal_key = ? AND remote_id = ?
+	`, portalKey, remoteID)
+	return err
 }
 
 func (s *Store) ResetSyncState() error {

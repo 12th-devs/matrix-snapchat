@@ -1,9 +1,11 @@
 package main
 
 import (
+	"os"
+
 	"maunium.net/go/mautrix/bridgev2/matrix/mxmain"
 
-	"github.com/colej/mautrix-snapchat/internal/bridgev2"
+	snapconnector "github.com/colej/mautrix-snapchat/pkg/connector"
 )
 
 var (
@@ -13,7 +15,8 @@ var (
 )
 
 func main() {
-	conn := bridgev2.NewConnector()
+	normalizeConfigFlagAlias()
+	conn := snapconnector.NewConnector()
 	m := mxmain.BridgeMain{
 		Name:        "mautrix-snapchat",
 		Description: "Bridgev2 Snapchat Web bridge",
@@ -25,3 +28,10 @@ func main() {
 	m.Run()
 }
 
+func normalizeConfigFlagAlias() {
+	for i, arg := range os.Args {
+		if arg == "-c" {
+			os.Args[i] = "--config"
+		}
+	}
+}

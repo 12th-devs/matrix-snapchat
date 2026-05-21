@@ -18,6 +18,8 @@ network:
   message_fetch_limit: 40
   api_mode: api_only
   dom_fallback_enabled: false
-  auto_fetch_messages: false
+  auto_fetch_messages: true
   read_receipts_enabled: false
-  snap_media_enabled: false
+  snap_media_enabled: true
+  snap_media_on_read: true
+  send_media_enabled: true

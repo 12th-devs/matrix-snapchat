@@ -17,6 +17,9 @@ services:
     ports:
       - "127.0.0.1:3101:3101"
       - "127.0.0.1:6080:6080"
+    dns:
+      - "1.1.1.1"
+      - "8.8.8.8"
     shm_size: "512mb"
     volumes:
       - ./data:/data
@@ -31,13 +34,16 @@ services:
   bridge:
     build:
       context: .
-      dockerfile: Dockerfile.bridgev2
+      dockerfile: docker/bridgev2-runtime.Dockerfile
     depends_on:
       connector:
         condition: service_healthy
     command: ["-c", "/config/bridgev2-config.yaml"]
     ports:
       - "127.0.0.1:29344:4000"
+    dns:
+      - "1.1.1.1"
+      - "8.8.8.8"
     volumes:
       - ./data:/data
       - ./docker:/config

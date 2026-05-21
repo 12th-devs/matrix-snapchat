@@ -4,13 +4,15 @@ network:
     base_url: "http://connector:3101"
     shared_secret: "1225"
     request_timeout_seconds: 120
-    poll_interval_seconds: 2
-    message_fetch_limit: 10
+    poll_interval_seconds: 10
+    message_fetch_limit: 5
     api_mode: api_only
     dom_fallback_enabled: false
-    auto_fetch_messages: false
+    auto_fetch_messages: true
     read_receipts_enabled: false
-    snap_media_enabled: false
+    snap_media_enabled: true
+    snap_media_on_read: true
+    send_media_enabled: true
     state_db_path: "/data/bridgev2-state.sqlite"
     login_wait_seconds: 300
 
@@ -407,7 +409,7 @@ double_puppet:
     # Shared secrets for automatic double puppeting.
     # See https://docs.mau.fi/bridges/general/double-puppeting.html for instructions.
     secrets:
-        beeper.com: "as_token:hua_rQLWhXIdbIJGTDt5Lnrct5McluSj1b9GnmFHhk4t2T9H8eAcL5cLW_8Rir81"
+        beeper.com: "as_token:hua_dmvDqsu4ua0nKPB1WY3MlZoWBLttGLK4N4t8qX0tYXckCvBanqjBQ_qruLI3"
 
 # End-to-bridge encryption support options.
 #

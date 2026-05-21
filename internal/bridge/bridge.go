@@ -186,13 +186,15 @@ func (a *App) handleChats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleMessages(w http.ResponseWriter, r *http.Request) {
+	chatID := r.URL.Query().Get("chatId")
 	chatName := r.URL.Query().Get("chatName")
+	chatURL := r.URL.Query().Get("chatUrl")
 	if chatName == "" {
 		http.Error(w, "chatName is required", http.StatusBadRequest)
 		return
 	}
 
-	messages, err := a.connector.Messages(r.Context(), "", chatName)
+	messages, err := a.connector.Messages(r.Context(), chatID, chatName, chatURL)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("get messages: %v", err), http.StatusBadGateway)
 		return
@@ -232,7 +234,7 @@ func (a *App) handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := a.connector.SendMessage(r.Context(), payload.ChatID, payload.ChatName, payload.Text); err != nil {
+	if err := a.connector.SendMessage(r.Context(), payload.ChatID, payload.ChatName, payload.ChatURL, payload.Text); err != nil {
 		http.Error(w, fmt.Sprintf("send message: %v", err), http.StatusBadGateway)
 		return
 	}

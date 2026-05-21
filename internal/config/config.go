@@ -40,6 +40,8 @@ type NetworkConfig struct {
 	AutoFetchMessages   bool   `yaml:"auto_fetch_messages"`
 	ReadReceiptsEnabled bool   `yaml:"read_receipts_enabled"`
 	SnapMediaEnabled    bool   `yaml:"snap_media_enabled"`
+	SnapMediaOnRead     bool   `yaml:"snap_media_on_read"`
+	SendMediaEnabled    bool   `yaml:"send_media_enabled"`
 }
 
 func Load(path string) (*Config, error) {

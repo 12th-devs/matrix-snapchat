@@ -7,10 +7,11 @@ This document tracks the Beeper-facing `bridgev2` implementation that wraps the 
 The new `bridgev2` code lives in:
 
 - `cmd/mautrix-snapchat-bridgev2/main.go`
-- `internal/bridgev2/connector.go`
-- `internal/bridgev2/login.go`
-- `internal/bridgev2/api.go`
-- `internal/bridgev2/ids.go`
+- `pkg/connector/connector.go`
+- `pkg/connector/login.go`
+- `pkg/connector/api.go`
+- `pkg/connector/ids.go`
+- `pkg/connector/example-config.yaml`
 
 ## What this new bridgev2 path can do
 

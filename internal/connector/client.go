@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -30,23 +31,28 @@ type SessionStatus struct {
 }
 
 type Chat struct {
-	ID          string `json:"id"`
-	OtherUserID string `json:"otherUserId,omitempty"`
-	URL         string `json:"url,omitempty"`
-	Name        string `json:"name"`
-	Preview     string `json:"preview,omitempty"`
-	Unread      bool   `json:"unread"`
-	LastMessage string `json:"lastMessage,omitempty"`
+	ID                    string `json:"id"`
+	OtherUserID           string `json:"otherUserId,omitempty"`
+	URL                   string `json:"url,omitempty"`
+	Name                  string `json:"name"`
+	Preview               string `json:"preview,omitempty"`
+	Unread                bool   `json:"unread"`
+	LastMessage           string `json:"lastMessage,omitempty"`
+	DisappearAfterSeconds int64  `json:"disappearAfterSeconds,omitempty"`
 }
 
 type Message struct {
-	ID        string `json:"id"`
-	AuthorID  string `json:"authorId,omitempty"`
-	Author    string `json:"author"`
-	Text      string `json:"text"`
-	Timestamp string `json:"timestamp,omitempty"`
-	Outgoing  bool   `json:"outgoing"`
-	Media     []MediaAttachment `json:"media,omitempty"`
+	ID                    string            `json:"id"`
+	AuthorID              string            `json:"authorId,omitempty"`
+	Author                string            `json:"author"`
+	Text                  string            `json:"text"`
+	Timestamp             string            `json:"timestamp,omitempty"`
+	Outgoing              bool              `json:"outgoing"`
+	IsSnap                bool              `json:"isSnap,omitempty"`
+	ContentType           string            `json:"contentType,omitempty"`
+	Media                 []MediaAttachment `json:"media,omitempty"`
+	Saved                 bool              `json:"saved,omitempty"`
+	DisappearAfterSeconds int64             `json:"disappearAfterSeconds,omitempty"`
 }
 
 type MediaAttachment struct {
@@ -113,6 +119,24 @@ type APIAuth struct {
 	URL                 string `json:"url,omitempty"`
 }
 
+type EELDecryptRequest struct {
+	ConversationID        string `json:"conversationId,omitempty"`
+	MessageID             string `json:"messageId,omitempty"`
+	ContentBase64         string `json:"contentBase64"`
+	CEKBase64             string `json:"cekBase64,omitempty"`
+	CEKIVBase64           string `json:"cekIvBase64,omitempty"`
+	NonceBase64           string `json:"nonceBase64,omitempty"`
+	SenderPublicKeyBase64 string `json:"senderPublicKeyBase64,omitempty"`
+	SenderVersion         int32  `json:"senderVersion,omitempty"`
+}
+
+type EELDecryptResponse struct {
+	OK                     bool   `json:"ok"`
+	DecryptedContentBase64 string `json:"decryptedContentBase64,omitempty"`
+	Error                  string `json:"error,omitempty"`
+	Retryable              bool   `json:"retryable,omitempty"`
+}
+
 func New(cfg config.ConnectorConfig) *Client {
 	return &Client{
 		baseURL: cfg.BaseURL,
@@ -172,6 +196,35 @@ func (c *Client) APIAuth(ctx context.Context) (*APIAuth, error) {
 	}
 
 	return &auth, nil
+}
+
+func (c *Client) DecryptEEL(ctx context.Context, payload EELDecryptRequest) ([]byte, error) {
+	if strings.TrimSpace(payload.ContentBase64) == "" {
+		return nil, fmt.Errorf("missing EEL content")
+	}
+	req, err := c.newRequest(ctx, http.MethodPost, "/session/eel-decrypt", payload)
+	if err != nil {
+		return nil, err
+	}
+
+	var response EELDecryptResponse
+	if err = c.doJSON(req, &response); err != nil {
+		return nil, err
+	}
+	if !response.OK {
+		if response.Error == "" {
+			response.Error = "EEL decrypt failed"
+		}
+		return nil, errors.New(response.Error)
+	}
+	if response.DecryptedContentBase64 == "" {
+		return nil, fmt.Errorf("connector returned empty EEL plaintext")
+	}
+	decrypted, err := base64.StdEncoding.DecodeString(response.DecryptedContentBase64)
+	if err != nil {
+		return nil, fmt.Errorf("decode connector EEL plaintext: %w", err)
+	}
+	return decrypted, nil
 }
 
 func (c *Client) ListChats(ctx context.Context) ([]Chat, error) {

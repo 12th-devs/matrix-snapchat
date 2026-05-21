@@ -1,0 +1,17 @@
+# Snapchat Web sidecar connector
+base_url: "http://127.0.0.1:3101"
+shared_secret: "change-me"
+request_timeout_seconds: 20
+poll_interval_seconds: 2
+message_fetch_limit: 5
+api_mode: api_only
+dom_fallback_enabled: false
+auto_fetch_messages: true
+read_receipts_enabled: false
+snap_media_enabled: true
+snap_media_on_read: true
+send_media_enabled: true
+# Optional mxc:// URI for the Snapchat network icon in bridge metadata.
+network_icon_mxc: ""
+state_db_path: "./data/bridgev2-state.sqlite"
+login_wait_seconds: 90

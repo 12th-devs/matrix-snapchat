@@ -9,9 +9,9 @@ This repo now gives you:
 - a Go bridge service with config loading, health endpoints, polling, and a connector client
 - a Playwright Snapchat Web sidecar with persistent login, chat scraping, message scraping, message sending, and diagnostics capture
 - a WSL-first local run flow that matches Beeper's current self-hosting requirements
-- a new compileable `bridgev2` binary scaffold for Beeper-oriented integration
+- a `bridgev2` connector package shaped like modern mautrix bridges for Beeper-oriented integration
 
-What it does **not** give you yet is a production-complete `mautrix-go/bridgev2` implementation. That means you can start it, log into Snapchat Web, list chats, fetch messages, send test messages, and debug selectors locally, but you should treat Beeper hookup as the next integration layer rather than something already finished end-to-end.
+The Beeper path is now the main integration target. The Snapchat API path handles normal sync/send work, while the Playwright sidecar is kept for login, API auth material, diagnostics, and explicitly disabled safe fallbacks.
 
 That limitation is real, and I do not want to pretend otherwise.
 
@@ -20,7 +20,8 @@ That limitation is real, and I do not want to pretend otherwise.
 - `cmd/mautrix-snapchat/main.go`: bridge entrypoint
 - `cmd/mautrix-snapchat-bridgev2/main.go`: new `bridgev2` entrypoint
 - `internal/bridge/bridge.go`: bridge runtime + debug HTTP endpoints
-- `internal/bridgev2/`: `bridgev2` connector/login/API scaffolding
+- `pkg/connector/`: `bridgev2` network connector, login flow, portal/message conversion, polling, and config
+- `pkg/connector/example-config.yaml`: embedded network config snippet used by the bridgev2 config upgrader
 - `internal/connector/client.go`: Go client for the Playwright sidecar
 - `connector/src/index.mjs`: sidecar HTTP server
 - `connector/src/snapchat.mjs`: hardened Snapchat Web Playwright logic

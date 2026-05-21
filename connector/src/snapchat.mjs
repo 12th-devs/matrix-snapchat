@@ -1,7 +1,19 @@
 import { chromium } from "playwright";
-import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { createDebugTools } from "./debug-tools.mjs";
+import {
+  conversationURL,
+  extractSelfUserIDFromMessagingRequest,
+  getConversationIDFromURL,
+  inferAuthorFromEventText,
+  inferEventAuthor,
+  looksLikeConversationID,
+  makeChatID,
+  normalizeText,
+  prettifyChatText,
+  stableID,
+} from "./utils.mjs";
 
 const SNAPCHAT_URL = "https://www.snapchat.com/web";
 const SNAPCHAT_VERSION_URL = "https://www.snapchat.com/web/version.json";
@@ -43,167 +55,6 @@ const snapchatStatusLabel = "[Snapchat status]";
 const snapchatErrorPattern = /oops!? something went wrong|reload the page|error id:/i;
 const ignoreMessageTokenPattern = /^(opened|received|sent|say hi!?|typing|my ai|🔥|·|\d+\s*[mhdwy]|\d+)$/i;
 const snapPreviewPattern = /\b(new snap|snap|video|photo|picture|media|voice note|audio|sticker|sent you|tap to view|screenshot|screen recorded|opened|received|delivered)\b/i;
-
-function normalizeText(value) {
-  return String(value || "").replace(/\s+/g, " ").trim();
-}
-
-function prettifyChatText(value) {
-  return normalizeText(
-    value
-      .replace(/Close Chat/gi, "")
-      .replace(/·/g, " · ")
-      .replace(/(Opened|Received|Sent|Replied|Reply|Say Hi!?|Typing)/g, " $1 ")
-      .replace(/(\d+\s*[mhdwy])/gi, " $1 ")
-      .replace(/(🔥)/g, " $1 ")
-  );
-}
-
-function stableID(parts) {
-  return crypto.createHash("sha1").update(parts.join("::")).digest("hex").slice(0, 16);
-}
-
-function readProtoVarint(buffer, offset) {
-  let value = 0;
-  let shift = 0;
-  let cursor = offset;
-  while (cursor < buffer.length && shift < 64) {
-    const byte = buffer[cursor++];
-    value |= (byte & 0x7f) << shift;
-    if ((byte & 0x80) === 0) {
-      return { value, offset: cursor };
-    }
-    shift += 7;
-  }
-  return null;
-}
-
-function readProtoBytesField(buffer, fieldNumber) {
-  let offset = 0;
-  while (offset < buffer.length) {
-    const tag = readProtoVarint(buffer, offset);
-    if (!tag) {
-      return null;
-    }
-    offset = tag.offset;
-    const currentField = tag.value >> 3;
-    const wireType = tag.value & 7;
-    if (wireType === 2) {
-      const length = readProtoVarint(buffer, offset);
-      if (!length) {
-        return null;
-      }
-      offset = length.offset;
-      if (offset + length.value > buffer.length) {
-        return null;
-      }
-      const value = buffer.subarray(offset, offset + length.value);
-      if (currentField === fieldNumber) {
-        return value;
-      }
-      offset += length.value;
-      continue;
-    }
-    if (wireType === 0) {
-      const skipped = readProtoVarint(buffer, offset);
-      if (!skipped) {
-        return null;
-      }
-      offset = skipped.offset;
-      continue;
-    }
-    if (wireType === 1) {
-      offset += 8;
-      continue;
-    }
-    if (wireType === 5) {
-      offset += 4;
-      continue;
-    }
-    return null;
-  }
-  return null;
-}
-
-function uuidFromBytes(bytes) {
-  if (!bytes || bytes.length !== 16) {
-    return "";
-  }
-  const hex = Buffer.from(bytes).toString("hex");
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
-}
-
-function extractEncodedUUIDField(payload, fieldNumber) {
-  const uuidMessage = readProtoBytesField(payload, fieldNumber);
-  if (!uuidMessage) {
-    return "";
-  }
-  return uuidFromBytes(readProtoBytesField(uuidMessage, 1));
-}
-
-function extractSelfUserIDFromMessagingRequest(requestURL, postData) {
-  if (!postData || postData.length < 6) {
-    return "";
-  }
-  const payload = postData.subarray(5);
-  if (/\/(?:GetGroups|SyncConversations|QueryConversations)$/i.test(requestURL)) {
-    return extractEncodedUUIDField(payload, 1);
-  }
-  if (/\/(?:DeltaSync|QueryMessages|UpdateContentMessage)$/i.test(requestURL)) {
-    return extractEncodedUUIDField(payload, 4);
-  }
-  return "";
-}
-
-function makeChatID(name) {
-  return stableID([normalizeText(name)]);
-}
-
-function looksLikeConversationID(value) {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(value || "").trim());
-}
-
-function conversationURL(chatID) {
-  return `${SNAPCHAT_URL}/${chatID}`;
-}
-
-function getConversationIDFromURL(value) {
-  try {
-    const url = new URL(value);
-    const match = url.pathname.match(/^\/web\/([0-9a-f-]+)$/i);
-    return match ? match[1] : "";
-  } catch {
-    return "";
-  }
-}
-
-function inferAuthorFromEventText(text, fallbackName = "") {
-  const normalized = normalizeText(text);
-  if (!normalized) {
-    return fallbackName;
-  }
-  const noPrefix = normalized.replace(/^\[Unsupported Snapchat event\]\s*/i, "");
-  const youAndMatch = noPrefix.match(/^YOU AND (.+?) STARTED A SNAPSTREAK/i);
-  if (youAndMatch) {
-    return normalizeText(youAndMatch[1]) || fallbackName;
-  }
-  const triedCallMatch = noPrefix.match(/^(.+?) TRIED TO CALL YOU/i);
-  if (triedCallMatch) {
-    return normalizeText(triedCallMatch[1]) || fallbackName;
-  }
-  return fallbackName;
-}
-
-function inferEventAuthor(text, fallbackName = "") {
-  const normalized = normalizeText(text);
-  if (!normalized.startsWith(unsupportedEventLabel)) {
-    return "";
-  }
-  if (/started a snapstreak|tried to call you/i.test(normalized)) {
-    return "System";
-  }
-  return inferAuthorFromEventText(text, fallbackName);
-}
 
 function runNextTask() {
   if (inflight || pendingTasks.length === 0) {
@@ -1901,6 +1752,271 @@ export async function getAPIAuth() {
     };
   }, { priority: 0 });
 }
+
+export async function decryptEELMessage(input = {}) {
+  const messageId = String(input.messageId || "");
+  const conversationId = String(input.conversationId || "");
+  const contentBase64 = String(input.contentBase64 || "");
+  if (!contentBase64) {
+    return { ok: false, error: "missing_content", retryable: false };
+  }
+  return withLock(async () => {
+    const { page: currentPage } = await ensureSession();
+    if (!currentPage || currentPage.isClosed()) {
+      return { ok: false, error: "no_active_page", retryable: true };
+    }
+    const result = await currentPage.evaluate(async (payload) => {
+      function fromBase64(value) {
+        if (!value) {
+          return new Uint8Array();
+        }
+        const binary = atob(value);
+        const bytes = new Uint8Array(binary.length);
+        for (let index = 0; index < binary.length; index += 1) {
+          bytes[index] = binary.charCodeAt(index);
+        }
+        return bytes;
+      }
+
+      function toBase64(value) {
+        const bytes = ArrayBuffer.isView(value)
+          ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
+          : value instanceof ArrayBuffer
+            ? new Uint8Array(value)
+            : Array.isArray(value)
+              ? Uint8Array.from(value)
+              : undefined;
+        if (!bytes) {
+          return "";
+        }
+        let binary = "";
+        for (const byte of bytes) {
+          binary += String.fromCharCode(byte);
+        }
+        return btoa(binary);
+      }
+
+      async function decryptAESGCM(keyBytes, nonceBytes, dataBytes) {
+        if (![16, 24, 32].includes(keyBytes.byteLength) || nonceBytes.byteLength === 0) {
+          return undefined;
+        }
+        const key = await crypto.subtle.importKey("raw", keyBytes, { name: "AES-GCM" }, false, ["decrypt"]);
+        return new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv: nonceBytes }, key, dataBytes));
+      }
+
+      function findWebpackRequire() {
+        for (const key of Object.keys(globalThis)) {
+          if (!/^webpackChunk/.test(key)) {
+            continue;
+          }
+          const chunk = globalThis[key];
+          if (!Array.isArray(chunk) || typeof chunk.push !== "function") {
+            continue;
+          }
+          let webpackRequire;
+          try {
+            chunk.push([[`codex-eel-decrypt-${Date.now()}`], {}, (req) => {
+              webpackRequire = req;
+            }]);
+          } catch {
+            continue;
+          }
+          if (webpackRequire?.m) {
+            return webpackRequire;
+          }
+        }
+        return undefined;
+      }
+
+      function resultBytes(value) {
+        if (!value) {
+          return undefined;
+        }
+        if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer || Array.isArray(value)) {
+          return value;
+        }
+        for (const key of ["content", "contents", "plaintext", "plainText", "decrypted", "cek", "key", "data"]) {
+          const nested = value[key];
+          if (nested && (ArrayBuffer.isView(nested) || nested instanceof ArrayBuffer || Array.isArray(nested))) {
+            return nested;
+          }
+        }
+        return undefined;
+      }
+
+      function serverHexFromMessageId(messageId) {
+        const numeric = Number(messageId || 0);
+        if (!Number.isFinite(numeric) || numeric <= 0) {
+          return "";
+        }
+        return numeric.toString(16).toUpperCase().padStart(4, "0");
+      }
+
+      function analyticsMatchesMessageId(analyticsMessageId, targetMessageId) {
+        const analytics = String(analyticsMessageId || "").toUpperCase();
+        const target = String(targetMessageId || "");
+        if (!analytics || !target) {
+          return false;
+        }
+        if (analytics === target) {
+          return true;
+        }
+        const targetHex = serverHexFromMessageId(target);
+        return Boolean(targetHex && analytics.includes(`-${targetHex}-`));
+      }
+
+      function decryptedContentFromFetchedMessages(result, targetMessageId) {
+        const messages = Array.isArray(result?.messages) ? result.messages : [];
+        const match = messages.find((message) => (
+          String(message?.descriptor?.messageId || "") === String(targetMessageId || "")
+          || analyticsMatchesMessageId(message?.messageAnalytics?.analyticsMessageId, targetMessageId)
+        ));
+        const content = match?.messageContent?.content;
+        if (!content || !ArrayBuffer.isView(content)) {
+          return undefined;
+        }
+        return {
+          content,
+          webMessageId: String(match?.descriptor?.messageId || ""),
+          analyticsMessageId: String(match?.messageAnalytics?.analyticsMessageId || ""),
+        };
+      }
+
+      async function resolveDecryptedContentViaMessaging(webpackRequire, targetConversationId, targetMessageId) {
+        if (!targetConversationId || !targetMessageId) {
+          return undefined;
+        }
+        const appState = webpackRequire?.(97003)?.M?.getState?.();
+        const messaging = webpackRequire?.(56639);
+        const messagingClient = appState?.messaging?.client;
+        const feedItem = appState?.messaging?.feed?.[targetConversationId];
+        if (!messagingClient || !feedItem?.conversationId || !messaging?.uk) {
+          return undefined;
+        }
+        const attempts = [
+          () => messaging.uk(messagingClient, feedItem.conversationId),
+        ];
+        if (messaging.Gq) {
+          attempts.push(() => messaging.Gq(messagingClient, feedItem.conversationId, undefined));
+        }
+        for (const fetchPage of attempts) {
+          const result = await Promise.race([
+            fetchPage(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error("messaging_fetch_timeout")), 25000)),
+          ]);
+          const match = decryptedContentFromFetchedMessages(result, targetMessageId);
+          if (match) {
+            return match;
+          }
+        }
+        return undefined;
+      }
+
+      const content = fromBase64(payload.contentBase64);
+      const cek = fromBase64(payload.cekBase64);
+      const cekIv = fromBase64(payload.cekIvBase64);
+      const nonce = fromBase64(payload.nonceBase64);
+      const senderPublicKey = fromBase64(payload.senderPublicKeyBase64);
+
+      if (cek.byteLength > 0) {
+        try {
+          const decrypted = await decryptAESGCM(cek, cekIv, content);
+          if (decrypted) {
+            return { ok: true, decryptedContentBase64: toBase64(decrypted), method: "inline_cek" };
+          }
+        } catch {
+          return { ok: false, error: "inline_cek_decrypt_failed", retryable: false };
+        }
+      }
+
+      const webpackRequire = findWebpackRequire();
+      const appState = webpackRequire?.(97003)?.M?.getState?.();
+      const keyManager = webpackRequire?.(54897)?.gZ?.(appState)?.e2ee_E2EEKeyManager;
+      if (!keyManager) {
+        return { ok: false, error: "eel_key_manager_unavailable", retryable: true };
+      }
+
+      try {
+        const messagingContent = await resolveDecryptedContentViaMessaging(webpackRequire, payload.conversationId, payload.messageId);
+        if (messagingContent?.content) {
+          return {
+            ok: true,
+            decryptedContentBase64: toBase64(messagingContent.content),
+            method: "messaging_fetch",
+            webMessageId: messagingContent.webMessageId,
+            analyticsMessageId: messagingContent.analyticsMessageId,
+          };
+        }
+      } catch (error) {
+        // Fall through to direct key-manager probing. The bridge will log only the failure class.
+      }
+
+      const attempts = [];
+      const methodNames = Object.keys(keyManager).filter((name) => /decrypt|unwrap|shared|secret|cek/i.test(name));
+      for (const methodName of methodNames) {
+        const method = keyManager[methodName];
+        if (typeof method !== "function") {
+          continue;
+        }
+        for (const args of [
+          [content, cekIv, nonce, senderPublicKey, payload.senderVersion],
+          [senderPublicKey, payload.senderVersion, cekIv, nonce, content],
+          [{ content, cekIv, nonce, senderPublicKey, senderVersion: payload.senderVersion }],
+          [senderPublicKey, payload.senderVersion],
+        ]) {
+          try {
+            const rawResult = await method.apply(keyManager, args);
+            const bytesLike = resultBytes(rawResult);
+            if (!bytesLike) {
+              attempts.push(`${methodName}:no_bytes`);
+              continue;
+            }
+            const bytes = ArrayBuffer.isView(bytesLike)
+              ? new Uint8Array(bytesLike.buffer, bytesLike.byteOffset, bytesLike.byteLength)
+              : bytesLike instanceof ArrayBuffer
+                ? new Uint8Array(bytesLike)
+                : Uint8Array.from(bytesLike);
+            if (bytes.byteLength === content.byteLength) {
+              return { ok: true, decryptedContentBase64: toBase64(bytes), method: methodName };
+            }
+            if ([16, 24, 32].includes(bytes.byteLength)) {
+              const decrypted = await decryptAESGCM(bytes, cekIv, content);
+              if (decrypted) {
+                return { ok: true, decryptedContentBase64: toBase64(decrypted), method: `${methodName}:derived_cek` };
+              }
+            }
+            attempts.push(`${methodName}:bytes_${bytes.byteLength}`);
+          } catch (error) {
+            attempts.push(`${methodName}:${String(error).replace(/\s+/g, " ").slice(0, 80)}`);
+          }
+        }
+      }
+      return { ok: false, error: "eel_decrypt_unavailable", retryable: true, failureClass: attempts.length > 0 ? "attempts_exhausted" : "no_candidate_methods" };
+    }, {
+      messageId,
+      conversationId,
+      contentBase64,
+      cekBase64: String(input.cekBase64 || ""),
+      cekIvBase64: String(input.cekIvBase64 || ""),
+      nonceBase64: String(input.nonceBase64 || ""),
+      senderPublicKeyBase64: String(input.senderPublicKeyBase64 || ""),
+      senderVersion: Number(input.senderVersion || 0),
+    });
+    if (!result.ok) {
+      console.error(`eel-decrypt: failed messageId=${messageId} conversationId=${conversationId} error=${result.error || "unknown"}`);
+    } else {
+      console.error(`eel-decrypt: ok messageId=${messageId} conversationId=${conversationId} method=${result.method || "unknown"}`);
+    }
+    return result;
+  }, { priority: 0 });
+}
+
+const debugTools = createDebugTools({ withLock, ensureSession });
+export const getBrowserStorageSummary = debugTools.getBrowserStorageSummary;
+export const searchBrowserBundle = debugTools.searchBrowserBundle;
+export const getBrowserBundleModule = debugTools.getBrowserBundleModule;
+export const getBrowserE2EESummary = debugTools.getBrowserE2EESummary;
+export const deriveBrowserE2EESharedSecret = debugTools.deriveBrowserE2EESharedSecret;
 
 export async function getChats() {
   return withLock(async () => {

@@ -1,6 +1,8 @@
 .git
 .gitignore
-bin
+bin/*
+!bin/mautrix-snapchat-bridgev2
 data
 _reference_snapchat_bridge
 connector/node_modules
+.codex-backups

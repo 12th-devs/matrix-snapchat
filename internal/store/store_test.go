@@ -1,0 +1,81 @@
+package store
+
+import (
+	"path/filepath"
+	"testing"
+)
+
+func TestMessageStateMetadataPersists(t *testing.T) {
+	db, err := New(filepath.Join(t.TempDir(), "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	err = db.UpsertMessages([]MessageState{{
+		PortalKey:    "chat-1",
+		RemoteID:     "123",
+		Author:       "Emerson",
+		Text:         "New Snap",
+		Kind:         "snap",
+		HasMedia:     true,
+		TimestampRaw: "2026-05-17T12:00:00Z",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	state, err := db.GetMessage("chat-1", "123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state == nil {
+		t.Fatal("message state was not persisted")
+	}
+	if state.Kind != "snap" || !state.HasMedia || state.HydratedAt != nil {
+		t.Fatalf("unexpected state: kind=%q has_media=%t hydrated=%v", state.Kind, state.HasMedia, state.HydratedAt)
+	}
+
+	if err = db.MarkMessageHydrated("chat-1", "123"); err != nil {
+		t.Fatal(err)
+	}
+	state, err = db.GetMessage("chat-1", "123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state == nil || state.HydratedAt == nil {
+		t.Fatalf("hydrated state was not marked: %#v", state)
+	}
+}
+
+func TestPortalOtherUserIDPersists(t *testing.T) {
+	db, err := New(filepath.Join(t.TempDir(), "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	err = db.UpsertPortal(PortalState{
+		PortalKey:   "chat-1",
+		RemoteID:    "chat-1",
+		RemoteName:  "Loreleiii",
+		OtherUserID: "33432eb1-9099-4bda-8b85-e75cc899c2a2",
+		Preview:     "hey",
+		LastMessage: "hey",
+		Unread:      true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	state, err := db.GetPortalByKey("chat-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state == nil {
+		t.Fatal("portal state was not persisted")
+	}
+	if state.OtherUserID != "33432eb1-9099-4bda-8b85-e75cc899c2a2" {
+		t.Fatalf("unexpected other user id: %q", state.OtherUserID)
+	}
+}
