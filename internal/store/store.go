@@ -54,6 +54,13 @@ type APISyncState struct {
 	UpdatedAt         time.Time
 }
 
+type ReadWatermark struct {
+	PortalKey string
+	MessageID int64
+	Version   int64
+	UpdatedAt time.Time
+}
+
 func New(path string) (*Store, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -107,6 +114,12 @@ func (s *Store) init() error {
 			sync_token BLOB,
 			conversation_state_json TEXT,
 			self_user_id TEXT,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE TABLE IF NOT EXISTS read_watermark (
+			portal_key TEXT PRIMARY KEY,
+			message_id INTEGER DEFAULT 0,
+			version INTEGER DEFAULT 0,
 			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_message_state_portal_key ON message_state(portal_key)`,
@@ -206,6 +219,36 @@ func (s *Store) GetLogin(userID string) (*LoginState, error) {
 		return nil, err
 	}
 	return &state, nil
+}
+
+func (s *Store) GetReadWatermark(portalKey string) (*ReadWatermark, error) {
+	row := s.db.QueryRow(`
+		SELECT portal_key, message_id, version, updated_at
+		FROM read_watermark
+		WHERE portal_key = ?
+	`, portalKey)
+
+	var state ReadWatermark
+	err := row.Scan(&state.PortalKey, &state.MessageID, &state.Version, &state.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &state, nil
+}
+
+func (s *Store) UpsertReadWatermark(state ReadWatermark) error {
+	_, err := s.db.Exec(`
+		INSERT INTO read_watermark (portal_key, message_id, version, updated_at)
+		VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(portal_key) DO UPDATE SET
+			message_id=excluded.message_id,
+			version=excluded.version,
+			updated_at=CURRENT_TIMESTAMP
+	`, state.PortalKey, state.MessageID, state.Version)
+	return err
 }
 
 func (s *Store) UpsertAPISyncState(state APISyncState) error {

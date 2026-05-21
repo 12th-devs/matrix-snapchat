@@ -1,11 +1,14 @@
 package connector
 
 import (
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	sidecar "github.com/colej/mautrix-snapchat/internal/connector"
 	"github.com/colej/mautrix-snapchat/internal/snapapi"
+	"github.com/colej/mautrix-snapchat/internal/store"
 )
 
 func TestBaseSnapchatMessageID(t *testing.T) {
@@ -151,5 +154,82 @@ func TestDisappearingSettingForMessageSkipsSavedMessages(t *testing.T) {
 	})
 	if got.Timer != 10*time.Second {
 		t.Fatalf("chat disappearing timer = %s, want 10s", got.Timer)
+	}
+}
+
+func TestSnapchatCookieStringAcceptsAuthSession(t *testing.T) {
+	got, err := snapchatCookieString(map[string]string{
+		"__Host-sc-a-nonce":           "nonce",
+		"__Host-sc-a-auth-session":    "session",
+		"__Host-X-Snap-Client-Cookie": "client",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "__Host-sc-a-nonce=nonce; __Host-sc-a-auth-session=session; __Host-X-Snap-Client-Cookie=client" {
+		t.Fatalf("cookie string = %q", got)
+	}
+}
+
+func TestSnapchatCookieStringRejectsMissingSecretsWithoutLeakingValues(t *testing.T) {
+	_, err := snapchatCookieString(map[string]string{
+		"__Host-sc-a-nonce": "super-secret-nonce",
+	})
+	if err == nil {
+		t.Fatal("expected missing cookie error")
+	}
+	if strings.Contains(err.Error(), "super-secret-nonce") {
+		t.Fatal("error leaked cookie value")
+	}
+}
+
+func TestShouldSendReadReceiptDedupesDurably(t *testing.T) {
+	db, err := store.New(filepath.Join(t.TempDir(), "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	sa := &SnapchatAPI{Connector: &SnapchatConnector{store: db}}
+	if !sa.shouldSendReadReceipt("chat-1", 100) {
+		t.Fatal("first read receipt should be allowed")
+	}
+	sa.markReadReceiptSent("chat-1", 100, 5)
+	if sa.shouldSendReadReceipt("chat-1", 100) {
+		t.Fatal("duplicate read receipt should be skipped")
+	}
+	if !sa.shouldSendReadReceipt("chat-1", 101) {
+		t.Fatal("newer read receipt should be allowed")
+	}
+}
+
+func TestShouldSendReadReceiptSkipsStoredSnap(t *testing.T) {
+	db, err := store.New(filepath.Join(t.TempDir(), "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.UpsertMessages([]store.MessageState{{
+		PortalKey: "chat-1",
+		RemoteID:  "200",
+		Kind:      "snap",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	sa := &SnapchatAPI{Connector: &SnapchatConnector{store: db}}
+	if sa.shouldSendReadReceipt("chat-1", 200) {
+		t.Fatal("snap placeholder should not be marked read")
+	}
+}
+
+func TestShouldSendTypingDebounces(t *testing.T) {
+	sa := &SnapchatAPI{
+		Connector:      &SnapchatConnector{Config: ConnectorConfig{TypingDebounceSeconds: 60}},
+		lastTypingSent: make(map[string]time.Time),
+	}
+	if !sa.shouldSendTyping("chat-1") {
+		t.Fatal("first typing notification should be allowed")
+	}
+	if sa.shouldSendTyping("chat-1") {
+		t.Fatal("second typing notification inside debounce should be skipped")
 	}
 }

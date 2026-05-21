@@ -169,7 +169,9 @@ func (c *Client) hydrateConversations(ctx context.Context, entries []*protos.Con
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, item := range resp.GetDeltaSyncResponses() {
-		conv := item.GetSuccessResponse().GetConversation()
+		success := item.GetSuccessResponse()
+		status := ExtractConversationStatusFromDelta(success)
+		conv := success.GetConversation()
 		if conv == nil {
 			continue
 		}
@@ -179,6 +181,9 @@ func (c *Client) hydrateConversations(ctx context.Context, entries []*protos.Con
 		}
 		c.conversations[id] = conv
 		c.conversationIDs[id] = conv.GetConversationId()
+		if status.ConversationID == "" {
+			status.ConversationID = id
+		}
 	}
 	return nil
 }
@@ -301,6 +306,7 @@ func (c *Client) chatFromEntry(entry *protos.ConversationEntry) Chat {
 		Version:        entry.GetVersionInfo().GetConversationVersion(),
 		LastActivityAt: lastAt,
 		DisappearAfter: c.retentionDurationForChat(id),
+		Status:         ExtractConversationStatusFromEntry(entry),
 	}
 }
 

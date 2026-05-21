@@ -231,3 +231,48 @@ func TestMessageFromProtoExternalMediaIsNotSnap(t *testing.T) {
 		t.Fatalf("external media body = %q, want Media", msg.Text)
 	}
 }
+
+func TestExtractMessageStatus(t *testing.T) {
+	msg := &protos.ContentMessage{
+		MessageId: 123,
+		MetaData: &protos.MessageMetadata{
+			ReadTimestamp:       456,
+			ConversationVersion: 789,
+			ReadBy: []*protos.UUID{{
+				EncodedId: []byte{0x33, 0x43, 0x2e, 0xb1, 0x90, 0x99, 0x4b, 0xda, 0x8b, 0x85, 0xe7, 0x5c, 0xc8, 0x99, 0xc2, 0xa2},
+			}},
+		},
+	}
+	status := ExtractMessageStatus(msg)
+	if status.ReadTimestamp != 456 || status.ConversationVersion != 789 {
+		t.Fatalf("status timestamps = %d/%d, want 456/789", status.ReadTimestamp, status.ConversationVersion)
+	}
+	if len(status.ReadBy) != 1 || status.ReadBy[0] == "" {
+		t.Fatalf("read-by status not extracted: %#v", status.ReadBy)
+	}
+}
+
+func TestExtractConversationStatusFromDelta(t *testing.T) {
+	resp := &protos.DeltaSyncResponse{
+		Metadata: &protos.DeltaSyncResponse_Conversation{
+			Conversation: &protos.Conversation{
+				ConversationId: &protos.UUID{EncodedId: []byte{0x92, 0x63, 0x9b, 0x1c, 0xc6, 0xb9, 0x5d, 0x4a, 0xb8, 0x94, 0xa6, 0x29, 0x51, 0x70, 0x8f, 0x3b}},
+				Participants: []*protos.Participant{{
+					UserId:            &protos.UUID{EncodedId: []byte{0x33, 0x43, 0x2e, 0xb1, 0x90, 0x99, 0x4b, 0xda, 0x8b, 0x85, 0xe7, 0x5c, 0xc8, 0x99, 0xc2, 0xa2}},
+					ReadHighWatermark: 12,
+				}},
+			},
+		},
+		FeedInfo: &protos.DeltaSyncResponse_FeedOpenedMessageDisplayTimestamp{FeedOpenedMessageDisplayTimestamp: 345},
+	}
+	status := ExtractConversationStatusFromDelta(resp)
+	if status.ConversationID == "" {
+		t.Fatal("conversation id was not extracted")
+	}
+	if status.FeedOpenedMessageDisplayTimestamp != 345 {
+		t.Fatalf("feed opened timestamp = %d, want 345", status.FeedOpenedMessageDisplayTimestamp)
+	}
+	if len(status.Participants) != 1 || status.Participants[0].ReadHighWatermark != 12 {
+		t.Fatalf("participant status not extracted: %#v", status.Participants)
+	}
+}

@@ -31,17 +31,19 @@ type DatabaseConfig struct {
 }
 
 type NetworkConfig struct {
-	BrowserProfileDir   string `yaml:"browser_profile_dir"`
-	Headless            bool   `yaml:"headless"`
-	PollIntervalSeconds int    `yaml:"poll_interval_seconds"`
-	MessageFetchLimit   int    `yaml:"message_fetch_limit"`
-	APIMode             string `yaml:"api_mode"`
-	DOMFallbackEnabled  *bool  `yaml:"dom_fallback_enabled"`
-	AutoFetchMessages   bool   `yaml:"auto_fetch_messages"`
-	ReadReceiptsEnabled bool   `yaml:"read_receipts_enabled"`
-	SnapMediaEnabled    bool   `yaml:"snap_media_enabled"`
-	SnapMediaOnRead     bool   `yaml:"snap_media_on_read"`
-	SendMediaEnabled    bool   `yaml:"send_media_enabled"`
+	BrowserProfileDir     string `yaml:"browser_profile_dir"`
+	Headless              bool   `yaml:"headless"`
+	PollIntervalSeconds   int    `yaml:"poll_interval_seconds"`
+	MessageFetchLimit     int    `yaml:"message_fetch_limit"`
+	APIMode               string `yaml:"api_mode"`
+	DOMFallbackEnabled    *bool  `yaml:"dom_fallback_enabled"`
+	AutoFetchMessages     bool   `yaml:"auto_fetch_messages"`
+	ReadReceiptsEnabled   bool   `yaml:"read_receipts_enabled"`
+	TypingIndicators      bool   `yaml:"typing_indicators_enabled"`
+	TypingDebounceSeconds int    `yaml:"typing_debounce_seconds"`
+	SnapMediaEnabled      bool   `yaml:"snap_media_enabled"`
+	SnapMediaOnRead       bool   `yaml:"snap_media_on_read"`
+	SendMediaEnabled      bool   `yaml:"send_media_enabled"`
 }
 
 func Load(path string) (*Config, error) {

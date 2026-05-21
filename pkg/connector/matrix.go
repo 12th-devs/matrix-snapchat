@@ -101,6 +101,10 @@ func (sa *SnapchatAPI) HandleMatrixReadReceipt(ctx context.Context, receipt *bri
 		log.Printf("bridgev2 receipts: no API message id available chat_id=%s read_up_to=%s", chatID, receipt.ReadUpTo.Format(time.RFC3339))
 		return nil
 	}
+	if !sa.shouldSendReadReceipt(chatID, messageID) {
+		log.Printf("bridgev2 receipts: skipping duplicate or unsupported read update chat_id=%s message_id=%d", chatID, messageID)
+		return nil
+	}
 	client, err := sa.ensureSnapClient(ctx)
 	if err != nil {
 		log.Printf("bridgev2 receipts: API client unavailable chat_id=%s message_id=%d: %v", chatID, messageID, err)
@@ -111,7 +115,37 @@ func (sa *SnapchatAPI) HandleMatrixReadReceipt(ctx context.Context, receipt *bri
 		log.Printf("bridgev2 receipts: API read update failed chat_id=%s message_id=%d version=%d: %v", chatID, messageID, version, err)
 		return nil
 	}
+	sa.markReadReceiptSent(chatID, messageID, version)
 	log.Printf("bridgev2 receipts: marked Snapchat read via API chat_id=%s message_id=%d version=%d", chatID, messageID, version)
+	return nil
+}
+
+func (sa *SnapchatAPI) HandleMatrixTyping(ctx context.Context, msg *bridgev2.MatrixTyping) error {
+	if msg == nil || msg.Portal == nil || !msg.IsTyping {
+		return nil
+	}
+	if msg.Type != bridgev2.TypingTypeText {
+		return nil
+	}
+	if !sa.typingIndicatorsEnabled() || !sa.useAPI() {
+		return nil
+	}
+	chatID := string(msg.Portal.ID)
+	if chatID == "" || !sa.shouldSendTyping(chatID) {
+		return nil
+	}
+	lastMessageID, _ := sa.readReceiptTarget(chatID, nil)
+	client, err := sa.ensureSnapClient(ctx)
+	if err != nil {
+		log.Printf("bridgev2 typing: API client unavailable chat_id=%s: %v", chatID, err)
+		return nil
+	}
+	if err = client.SendTyping(ctx, chatID, lastMessageID); err != nil {
+		sa.invalidateSnapClient()
+		log.Printf("bridgev2 typing: Snapchat typing update failed chat_id=%s last_message_id=%d: %v", chatID, lastMessageID, err)
+		return nil
+	}
+	log.Printf("bridgev2 typing: sent Snapchat typing update chat_id=%s last_message_id=%d", chatID, lastMessageID)
 	return nil
 }
 

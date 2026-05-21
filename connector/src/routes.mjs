@@ -63,6 +63,11 @@ export function createApp({
     res.json(await bridge.getAPIAuth());
   }));
 
+  app.post("/session/import-auth", asyncRoute(async (req, res) => {
+    const { cookieString = "", selfUserID = "" } = req.body || {};
+    res.json(await bridge.importAPIAuth({ cookieString, selfUserID }));
+  }));
+
   app.get("/debug/diagnostics", asyncRoute(async (_req, res) => {
     res.json(await bridge.getDiagnostics());
   }));

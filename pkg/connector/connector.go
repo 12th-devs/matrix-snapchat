@@ -159,20 +159,28 @@ func (sc *SnapchatConnector) LoadUserLogin(ctx context.Context, login *bridgev2.
 }
 
 func (sc *SnapchatConnector) GetLoginFlows() []bridgev2.LoginFlow {
-	return []bridgev2.LoginFlow{{
-		Name:        "Browser Session",
-		Description: "Open Snapchat Web login in the bridge browser sidecar",
-		ID:          "browser-session",
-	}}
+	return []bridgev2.LoginFlow{
+		{
+			Name:        "Snapchat Web Login",
+			Description: "Log in on this device and submit Snapchat Web session cookies",
+			ID:          "snapchat-web",
+		},
+		{
+			Name:        "Server Browser Session",
+			Description: "Fallback/admin login using the bridge server browser sidecar",
+			ID:          "browser-session",
+		},
+	}
 }
 
 func (sc *SnapchatConnector) CreateLogin(ctx context.Context, user *bridgev2.User, flowID string) (bridgev2.LoginProcess, error) {
-	if flowID != "browser-session" {
+	if flowID != "browser-session" && flowID != "snapchat-web" {
 		return nil, fmt.Errorf("unknown login flow: %s", flowID)
 	}
 	return &SnapchatLogin{
 		User:      user,
 		Connector: sc,
+		FlowID:    flowID,
 	}, nil
 }
 
@@ -242,11 +250,12 @@ func (sc *SnapchatConnector) resetSyncState() error {
 
 func (sc *SnapchatConnector) chatCapabilities() *event.RoomFeatures {
 	features := &event.RoomFeatures{
-		ID:            "fi.mau.snapchat.capabilities.2026_05_21",
-		MaxTextLength: 5000,
-		Edit:          event.CapLevelRejected,
-		Delete:        event.CapLevelRejected,
-		ReadReceipts:  sc != nil && sc.Config.ReadReceiptsEnabled,
+		ID:                  "fi.mau.snapchat.capabilities.2026_05_21",
+		MaxTextLength:       5000,
+		Edit:                event.CapLevelRejected,
+		Delete:              event.CapLevelRejected,
+		ReadReceipts:        sc != nil && sc.Config.ReadReceiptsEnabled,
+		TypingNotifications: sc != nil && sc.Config.TypingIndicators,
 		DisappearingTimer: &event.DisappearingTimerCapability{
 			Types:          []event.DisappearingType{event.DisappearingTypeAfterSend},
 			OmitEmptyTimer: true,

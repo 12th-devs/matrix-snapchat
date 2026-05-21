@@ -79,3 +79,25 @@ func TestPortalOtherUserIDPersists(t *testing.T) {
 		t.Fatalf("unexpected other user id: %q", state.OtherUserID)
 	}
 }
+
+func TestReadWatermarkPersists(t *testing.T) {
+	db, err := New(filepath.Join(t.TempDir(), "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err = db.UpsertReadWatermark(ReadWatermark{PortalKey: "chat-1", MessageID: 123, Version: 77}); err != nil {
+		t.Fatal(err)
+	}
+	state, err := db.GetReadWatermark("chat-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state == nil {
+		t.Fatal("read watermark was not persisted")
+	}
+	if state.MessageID != 123 || state.Version != 77 {
+		t.Fatalf("watermark = message %d version %d, want 123/77", state.MessageID, state.Version)
+	}
+}

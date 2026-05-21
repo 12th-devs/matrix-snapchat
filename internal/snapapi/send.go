@@ -190,6 +190,26 @@ func (c *Client) MarkRead(ctx context.Context, chatID string, messageID int64, v
 	return nil
 }
 
+func (c *Client) SendTyping(ctx context.Context, chatID string, lastCreatedMessageID int64) error {
+	if err := c.ensureAuthenticated(ctx); err != nil {
+		return err
+	}
+	conv, err := c.conversation(ctx, chatID)
+	if err != nil {
+		return err
+	}
+	req := &protos.SendTypingNotificationRequest{
+		SelfUserId:           c.selfUUID(),
+		ConversationId:       conv.GetConversationId(),
+		LastCreatedMessageId: lastCreatedMessageID,
+	}
+	var resp protos.SendTypingNotificationResponse
+	if err = c.doGRPC(ctx, paths.SEND_TYPING_NOTIFICATION, req, &resp); err != nil {
+		return err
+	}
+	return nil
+}
+
 func outgoingRemoteMediaType(mimeType string, data []byte) (protos.ContentEnvelope_RemoteMediaInfo_MediaType, bool, error) {
 	mimeType = strings.ToLower(strings.TrimSpace(strings.Split(mimeType, ";")[0]))
 	if mimeType == "" || mimeType == "application/octet-stream" {

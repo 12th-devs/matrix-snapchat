@@ -1689,8 +1689,7 @@ async function readSnapchatAPIUserAgents(currentPage) {
   };
 }
 
-export async function getAPIAuth() {
-  return withLock(async () => {
+async function collectAPIAuth() {
     let { context: currentContext, page: currentPage } = await ensureSession();
     if (!lastSnapAPIRequestHeaders?.headers?.["mcs-cof-ids-bin"]) {
       try {
@@ -1750,6 +1749,75 @@ export async function getAPIAuth() {
       })),
       url: page && !page.isClosed() ? page.url() : "",
     };
+}
+
+export async function getAPIAuth() {
+  return withLock(collectAPIAuth, { priority: 0 });
+}
+
+function parseCookieString(cookieString = "") {
+  const result = new Map();
+  for (const part of String(cookieString).split(";")) {
+    const trimmed = part.trim();
+    if (!trimmed) {
+      continue;
+    }
+    const eq = trimmed.indexOf("=");
+    if (eq <= 0) {
+      continue;
+    }
+    result.set(trimmed.slice(0, eq), trimmed.slice(eq + 1));
+  }
+  return result;
+}
+
+export async function importAPIAuth({ cookieString = "", selfUserID = "" } = {}) {
+  return withLock(async () => {
+    const parsed = parseCookieString(cookieString);
+    const required = [
+      "__Host-X-Snap-Client-Cookie",
+    ];
+    const hasNonce = parsed.has("__Host-sc-a-nonce") || parsed.has("sc-a-nonce");
+    const hasSession = parsed.has("__Host-sc-a-session") || parsed.has("__Host-sc-a-auth-session");
+    const missing = required.filter((name) => !parsed.has(name));
+    if (!hasNonce) {
+      missing.push("__Host-sc-a-nonce or sc-a-nonce");
+    }
+    if (!hasSession) {
+      missing.push("__Host-sc-a-session or __Host-sc-a-auth-session");
+    }
+    if (missing.length > 0) {
+      throw new Error(`missing required Snapchat cookies: ${missing.join(", ")}`);
+    }
+
+    const { context: currentContext } = await ensureSession();
+    const cookies = [];
+    for (const [name, value] of parsed.entries()) {
+      if (!/^(__Host-sc-a-nonce|__Host-sc-a-session|__Host-sc-a-auth-session|__Host-X-Snap-Client-Cookie|sc-a-nonce)$/.test(name)) {
+        continue;
+      }
+      cookies.push({
+        name,
+        value,
+        url: "https://www.snapchat.com",
+        path: "/",
+        secure: true,
+        httpOnly: true,
+        sameSite: "Lax",
+      });
+    }
+    await currentContext.addCookies(cookies);
+    if (selfUserID) {
+      capturedSelfUserID = String(selfUserID);
+    }
+    lastSnapAPIRequestHeaders = {};
+    try {
+      const currentPage = await gotoSnapchat({ reload: true });
+      await currentPage.waitForTimeout(1500);
+    } catch {
+      // Cookie import is still useful for API auth even if the UI does not warm immediately.
+    }
+    return collectAPIAuth();
   }, { priority: 0 });
 }
 

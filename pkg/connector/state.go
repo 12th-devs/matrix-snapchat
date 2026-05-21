@@ -301,6 +301,64 @@ func (sa *SnapchatAPI) shouldSyncFromReadReceipt(chatID string) bool {
 	return true
 }
 
+func (sa *SnapchatAPI) shouldSendReadReceipt(chatID string, messageID int64) bool {
+	if sa == nil || chatID == "" || messageID <= 0 {
+		return false
+	}
+	if state := sa.lookupStoredMessage(chatID, fmt.Sprintf("%d", messageID)); state != nil {
+		if state.Outgoing || (state.Kind != "" && state.Kind != "chat" && state.Kind != "text") {
+			return false
+		}
+	}
+	if sa.Connector == nil || sa.Connector.store == nil {
+		return true
+	}
+	watermark, err := sa.Connector.store.GetReadWatermark(chatID)
+	if err != nil {
+		return true
+	}
+	return watermark == nil || messageID > watermark.MessageID
+}
+
+func (sa *SnapchatAPI) markReadReceiptSent(chatID string, messageID, version int64) {
+	if sa == nil || sa.Connector == nil || sa.Connector.store == nil || chatID == "" || messageID <= 0 {
+		return
+	}
+	if err := sa.Connector.store.UpsertReadWatermark(store.ReadWatermark{
+		PortalKey: chatID,
+		MessageID: messageID,
+		Version:   version,
+	}); err != nil {
+		log.Printf("bridgev2 receipts: failed to persist read watermark chat_id=%s message_id=%d: %v", chatID, messageID, err)
+	}
+}
+
+func (sa *SnapchatAPI) shouldSendTyping(chatID string) bool {
+	if sa == nil || chatID == "" {
+		return false
+	}
+	now := time.Now()
+	debounce := sa.typingDebounce()
+	sa.mu.Lock()
+	defer sa.mu.Unlock()
+	if sa.lastTypingSent == nil {
+		sa.lastTypingSent = make(map[string]time.Time)
+	}
+	if last, ok := sa.lastTypingSent[chatID]; ok && now.Sub(last) < debounce {
+		return false
+	}
+	sa.lastTypingSent[chatID] = now
+	return true
+}
+
+func (sa *SnapchatAPI) typingDebounce() time.Duration {
+	seconds := 8
+	if sa != nil && sa.Connector != nil && sa.Connector.Config.TypingDebounceSeconds > 0 {
+		seconds = sa.Connector.Config.TypingDebounceSeconds
+	}
+	return time.Duration(seconds) * time.Second
+}
+
 func (sa *SnapchatAPI) isSidebarBaselineReady() bool {
 	sa.mu.Lock()
 	defer sa.mu.Unlock()
@@ -350,6 +408,10 @@ func (sa *SnapchatAPI) autoFetchMessagesEnabled() bool {
 
 func (sa *SnapchatAPI) readReceiptsEnabled() bool {
 	return sa != nil && sa.Connector != nil && sa.Connector.Config.ReadReceiptsEnabled
+}
+
+func (sa *SnapchatAPI) typingIndicatorsEnabled() bool {
+	return sa != nil && sa.Connector != nil && sa.Connector.Config.TypingIndicators
 }
 
 func (sa *SnapchatAPI) snapMediaEnabled() bool {
@@ -540,6 +602,7 @@ func (sa *SnapchatAPI) resetSyncState() {
 	sa.messageFailures = make(map[string]int)
 	sa.messageRetryAfter = make(map[string]time.Time)
 	sa.lastReadReceiptSync = make(map[string]time.Time)
+	sa.lastTypingSent = make(map[string]time.Time)
 	sa.ghostAvatarCheckedAt = make(map[string]time.Time)
 	sa.queuedPortalResyncs = make(map[string]struct{})
 	sa.sidebarBaselineReady = false

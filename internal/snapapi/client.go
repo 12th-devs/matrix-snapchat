@@ -58,6 +58,7 @@ type Chat struct {
 	Version        int64
 	LastActivityAt time.Time
 	DisappearAfter time.Duration
+	Status         ConversationStatus
 }
 
 type MediaKind string
@@ -95,6 +96,33 @@ type Message struct {
 	// DisappearAfter mirrors Snapchat's per-conversation retention timer for
 	// unsaved messages. Saved messages intentionally leave this unset.
 	DisappearAfter time.Duration
+	Status         MessageStatus
+}
+
+type ParticipantStatus struct {
+	UserID                    string
+	ReadHighWatermark         int64
+	ReleaseHighWatermark      int64
+	SnapReleaseHighWatermark  int64
+	ReactionReadHighWatermark int64
+	ReleaseWatermark          int64
+}
+
+type ConversationStatus struct {
+	ConversationID                    string
+	Participants                      []ParticipantStatus
+	FeedOpenedMessageDisplayTimestamp int64
+}
+
+type MessageStatus struct {
+	ReadTimestamp       int64
+	ReadBy              []string
+	ReleasedBy          []string
+	SavedBy             []string
+	ScreenshottedBy     []string
+	ScreenRecordedBy    []string
+	ReplayedBy          []string
+	ConversationVersion int64
 }
 
 type SyncResult struct {

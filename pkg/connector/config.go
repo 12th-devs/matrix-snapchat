@@ -16,6 +16,8 @@ type ConnectorConfig struct {
 	DOMFallbackEnabled    *bool  `yaml:"dom_fallback_enabled"`
 	AutoFetchMessages     bool   `yaml:"auto_fetch_messages"`
 	ReadReceiptsEnabled   bool   `yaml:"read_receipts_enabled"`
+	TypingIndicators      bool   `yaml:"typing_indicators_enabled"`
+	TypingDebounceSeconds int    `yaml:"typing_debounce_seconds"`
 	SnapMediaEnabled      bool   `yaml:"snap_media_enabled"`
 	SnapMediaOnRead       bool   `yaml:"snap_media_on_read"`
 	SendMediaEnabled      bool   `yaml:"send_media_enabled"`
@@ -37,6 +39,8 @@ func upgradeConfig(helper configupgrade.Helper) {
 	helper.Copy(configupgrade.Bool, "dom_fallback_enabled")
 	helper.Copy(configupgrade.Bool, "auto_fetch_messages")
 	helper.Copy(configupgrade.Bool, "read_receipts_enabled")
+	helper.Copy(configupgrade.Bool, "typing_indicators_enabled")
+	helper.Copy(configupgrade.Int, "typing_debounce_seconds")
 	helper.Copy(configupgrade.Bool, "snap_media_enabled")
 	helper.Copy(configupgrade.Bool, "snap_media_on_read")
 	helper.Copy(configupgrade.Bool, "send_media_enabled")

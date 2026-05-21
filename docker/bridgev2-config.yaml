@@ -9,7 +9,9 @@ network:
     api_mode: api_only
     dom_fallback_enabled: false
     auto_fetch_messages: true
-    read_receipts_enabled: false
+    read_receipts_enabled: true
+    typing_indicators_enabled: true
+    typing_debounce_seconds: 8
     snap_media_enabled: true
     snap_media_on_read: true
     send_media_enabled: true

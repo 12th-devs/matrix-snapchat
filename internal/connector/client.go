@@ -119,6 +119,11 @@ type APIAuth struct {
 	URL                 string `json:"url,omitempty"`
 }
 
+type ImportAuthRequest struct {
+	CookieString string `json:"cookieString"`
+	SelfUserID   string `json:"selfUserID,omitempty"`
+}
+
 type EELDecryptRequest struct {
 	ConversationID        string `json:"conversationId,omitempty"`
 	MessageID             string `json:"messageId,omitempty"`
@@ -195,6 +200,22 @@ func (c *Client) APIAuth(ctx context.Context) (*APIAuth, error) {
 		return nil, err
 	}
 
+	return &auth, nil
+}
+
+func (c *Client) ImportAuth(ctx context.Context, payload ImportAuthRequest) (*APIAuth, error) {
+	if strings.TrimSpace(payload.CookieString) == "" {
+		return nil, fmt.Errorf("missing Snapchat cookie string")
+	}
+	req, err := c.newRequest(ctx, http.MethodPost, "/session/import-auth", payload)
+	if err != nil {
+		return nil, err
+	}
+
+	var auth APIAuth
+	if err = c.doJSON(req, &auth); err != nil {
+		return nil, err
+	}
 	return &auth, nil
 }
 

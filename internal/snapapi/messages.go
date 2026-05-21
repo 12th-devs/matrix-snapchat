@@ -122,6 +122,7 @@ func (c *Client) messageFromProto(ctx context.Context, chatID string, msg *proto
 		Version:        msg.GetMetaData().GetConversationVersion(),
 		Saved:          saved,
 		DisappearAfter: disappearAfter,
+		Status:         ExtractMessageStatus(msg),
 	}
 }
 

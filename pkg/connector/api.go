@@ -56,6 +56,7 @@ type SnapchatAPI struct {
 	messageFailures      map[string]int
 	messageRetryAfter    map[string]time.Time
 	lastReadReceiptSync  map[string]time.Time
+	lastTypingSent       map[string]time.Time
 	ghostAvatarCheckedAt map[string]time.Time
 	avatarURLBySnapID    map[string]string
 	queuedPortalResyncs  map[string]struct{}
@@ -89,6 +90,7 @@ func (d connectorEELDecrypter) DecryptEEL(ctx context.Context, req snapapi.EELDe
 
 var _ bridgev2.NetworkAPI = (*SnapchatAPI)(nil)
 var _ bridgev2.ReadReceiptHandlingNetworkAPI = (*SnapchatAPI)(nil)
+var _ bridgev2.TypingHandlingNetworkAPI = (*SnapchatAPI)(nil)
 
 var relativeTimestampPattern = regexp.MustCompile(`(?i)^(\d+)\s*([mhdwy])$`)
 var snapUUIDPattern = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
@@ -113,6 +115,7 @@ func NewSnapchatAPI(sc *SnapchatConnector, login *bridgev2.UserLogin, label stri
 		messageFailures:      make(map[string]int),
 		messageRetryAfter:    make(map[string]time.Time),
 		lastReadReceiptSync:  make(map[string]time.Time),
+		lastTypingSent:       make(map[string]time.Time),
 		ghostAvatarCheckedAt: make(map[string]time.Time),
 		avatarURLBySnapID:    make(map[string]string),
 		queuedPortalResyncs:  make(map[string]struct{}),
