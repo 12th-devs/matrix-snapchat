@@ -5,7 +5,7 @@ bridge:
 
 connector:
   base_url: "http://127.0.0.1:3101"
-  shared_secret: "1225"
+  shared_secret: "change-me"
   request_timeout_seconds: 20
 
 network:
