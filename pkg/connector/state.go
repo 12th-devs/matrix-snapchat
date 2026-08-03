@@ -584,7 +584,66 @@ func (sa *SnapchatAPI) updateLoginState(status *sidecar.SessionStatus) {
 	}
 }
 
+func (sa *SnapchatAPI) currentSelfUserID() string {
+	if sa == nil {
+		return ""
+	}
+	sa.apiMu.Lock()
+	client := sa.apiClient
+	sa.apiMu.Unlock()
+	if client != nil {
+		if self := strings.TrimSpace(client.SelfUserID()); self != "" {
+			return self
+		}
+	}
+	return strings.TrimSpace(sa.loadAPISyncState().SelfUserID)
+}
+
+func (sa *SnapchatAPI) isSelfAuthor(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" || sa == nil {
+		return false
+	}
+	if strings.EqualFold(value, "you") || strings.EqualFold(value, "me") {
+		return true
+	}
+	if strings.EqualFold(value, sa.Label) ||
+		strings.EqualFold(normalizeIDPart(value), string(makeUserLoginID(sa.Label))) {
+		return true
+	}
+	if selfUserID := sa.currentSelfUserID(); selfUserID != "" {
+		return strings.EqualFold(value, selfUserID) ||
+			strings.EqualFold(normalizeIDPart(value), normalizeIDPart(selfUserID))
+	}
+	return false
+}
+
+func (sa *SnapchatAPI) normalizeRemoteMessageDirection(chatID string, message sidecar.Message) sidecar.Message {
+	if !message.Outgoing && (sa.isSelfAuthor(message.AuthorID) || sa.isSelfAuthor(message.Author)) {
+		log.Printf("bridgev2 sender_resolve: normalizing self-authored message as outgoing chat_id=%s message_id=%s author_id=%s author=%q",
+			chatID, message.ID, message.AuthorID, message.Author)
+		message.Outgoing = true
+		if strings.TrimSpace(message.Author) == "" || sa.isSelfAuthor(message.Author) {
+			message.Author = "You"
+		}
+	}
+	return message
+}
+
+func (sa *SnapchatAPI) normalizeAPIMessageDirection(chatID string, message snapapi.Message) snapapi.Message {
+	if !message.Outgoing && (sa.isSelfAuthor(message.AuthorID) || sa.isSelfAuthor(message.Author)) {
+		log.Printf("bridgev2 sender_resolve: normalizing self-authored API message as outgoing chat_id=%s message_id=%s author_id=%s author=%q content_type=%s",
+			chatID, message.ID, message.AuthorID, message.Author, message.ContentType)
+		message.Outgoing = true
+		if strings.TrimSpace(message.Author) == "" || sa.isSelfAuthor(message.Author) {
+			message.Author = "You"
+		}
+	}
+	return message
+}
+
 func (sa *SnapchatAPI) messageSenderID(chat sidecar.Chat, message sidecar.Message) networkid.UserID {
+	message = sa.normalizeRemoteMessageDirection(chat.ID, message)
 	if message.Outgoing {
 		return makeUserID(sa.Label)
 	}

@@ -160,7 +160,11 @@ func (sa *SnapchatAPI) GetCapabilities(ctx context.Context, portal *bridgev2.Por
 }
 
 func (sa *SnapchatAPI) IsThisUser(ctx context.Context, userID networkid.UserID) bool {
-	return userID == makeUserID(sa.Label)
+	if userID == makeUserID(sa.Label) {
+		return true
+	}
+	selfUserID := sa.currentSelfUserID()
+	return selfUserID != "" && strings.EqualFold(normalizeIDPart(string(userID)), normalizeIDPart(selfUserID))
 }
 
 func (sa *SnapchatAPI) UserLoginMetadata() (*UserLoginMetadata, bool) {

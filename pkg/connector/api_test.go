@@ -1,11 +1,13 @@
 package connector
 
 import (
+	"path/filepath"
 	"testing"
 	"time"
 
 	sidecar "github.com/colej/mautrix-snapchat/internal/connector"
 	"github.com/colej/mautrix-snapchat/internal/snapapi"
+	"github.com/colej/mautrix-snapchat/internal/store"
 )
 
 func TestBaseSnapchatMessageID(t *testing.T) {
@@ -124,6 +126,72 @@ func TestShouldSuppressOutgoingEchoMatchesRecentBody(t *testing.T) {
 		Outgoing: true,
 	}) {
 		t.Fatal("unexpected suppression for non-matching body")
+	}
+}
+
+func TestNormalizeRemoteMessageDirectionTreatsLoginLabelAsSelf(t *testing.T) {
+	sa := &SnapchatAPI{Label: "browser-session"}
+	msg := sa.normalizeRemoteMessageDirection("chat-1", sidecar.Message{
+		ID:       "m1",
+		AuthorID: "browser-session",
+		Author:   "browser-session",
+		Text:     "sent from Snapchat Web",
+	})
+	if !msg.Outgoing {
+		t.Fatal("browser-session-authored message should be treated as outgoing")
+	}
+	if msg.Author != "You" {
+		t.Fatalf("author = %q, want You", msg.Author)
+	}
+}
+
+func TestNormalizeAPIMessageDirectionTreatsSavedSelfIDAsSelf(t *testing.T) {
+	db, err := store.New(filepath.Join(t.TempDir(), "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.UpsertAPISyncState(store.APISyncState{
+		UserID:            "browser-session",
+		SelfUserID:        "7c4091a5-5231-441c-9c41-a80dfb6e805f",
+		ConversationState: map[string]int64{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sa := &SnapchatAPI{
+		Label:     "browser-session",
+		Connector: &SnapchatConnector{store: db},
+	}
+	msg := sa.normalizeAPIMessageDirection("chat-1", snapapi.Message{
+		ID:       "m2",
+		AuthorID: "7c4091a5-5231-441c-9c41-a80dfb6e805f",
+		Author:   "Cole",
+		Text:     "sent from Snapchat mobile",
+	})
+	if !msg.Outgoing {
+		t.Fatal("saved-self authored API message should be treated as outgoing")
+	}
+}
+
+func TestIsThisUserRecognizesSavedSelfID(t *testing.T) {
+	db, err := store.New(filepath.Join(t.TempDir(), "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.UpsertAPISyncState(store.APISyncState{
+		UserID:            "browser-session",
+		SelfUserID:        "7c4091a5-5231-441c-9c41-a80dfb6e805f",
+		ConversationState: map[string]int64{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sa := &SnapchatAPI{
+		Label:     "browser-session",
+		Connector: &SnapchatConnector{store: db},
+	}
+	if !sa.IsThisUser(nil, makeUserID("7c4091a5-5231-441c-9c41-a80dfb6e805f")) {
+		t.Fatal("saved Snapchat self ID should be recognized as this user")
 	}
 }
 

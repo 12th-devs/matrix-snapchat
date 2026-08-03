@@ -84,7 +84,9 @@ func (sa *SnapchatAPI) syncChatMessagesAPI(ctx context.Context, chat sidecar.Cha
 	log.Printf("bridgev2 sync: API fetched %d messages for chat=%q id=%s reason=%s", len(messages), chat.Name, chat.ID, reason)
 	states := make([]store.MessageState, 0, len(messages))
 	for _, apiMessage := range messages {
+		apiMessage = sa.normalizeAPIMessageDirection(chat.ID, apiMessage)
 		message := connectorMessageFromAPI(apiMessage)
+		message = sa.normalizeRemoteMessageDirection(chat.ID, message)
 		if message.ID == "" {
 			continue
 		}
@@ -128,6 +130,7 @@ func (sa *SnapchatAPI) queueRemoteMessage(chat sidecar.Chat, message sidecar.Mes
 	if sa.UserLogin == nil || sa.UserLogin.Bridge == nil || chat.ID == "" || message.ID == "" {
 		return
 	}
+	message = sa.normalizeRemoteMessageDirection(chat.ID, message)
 	sa.rememberChatDisappear(chat.ID, chat.DisappearAfterSeconds)
 	if sa.shouldSuppressOutgoingEcho(chat.ID, message) {
 		sa.markSeen(chat.ID, message.ID)
@@ -153,6 +156,14 @@ func (sa *SnapchatAPI) queueRemoteMessage(chat sidecar.Chat, message sidecar.Mes
 	sender := bridgev2.EventSender{
 		IsFromMe: message.Outgoing,
 		Sender:   senderID,
+	}
+	if message.Outgoing {
+		// Leave Sender empty for from-me events. If Sender is set to
+		// browser-session, bridgev2 creates/uses a ghost before checking
+		// IsFromMe, which makes Snapchat UI sends appear as received messages
+		// from @sh-snapchat_browser-session in Beeper.
+		sender.Sender = ""
+		sender.SenderLogin = makeUserLoginID(sa.Label)
 	}
 	if strings.HasPrefix(message.ID, "sidebar-") {
 		// Sidebar notices are bridge-generated indicators, not real remote chat
@@ -187,6 +198,7 @@ func (sa *SnapchatAPI) queueRemoteMessageEdit(chat sidecar.Chat, targetMessageID
 	if sa.UserLogin == nil || sa.UserLogin.Bridge == nil || chat.ID == "" || targetMessageID == "" || message.ID == "" {
 		return
 	}
+	message = sa.normalizeRemoteMessageDirection(chat.ID, message)
 	copyMsg := message
 	sa.rememberChat(chat.ID, chat.URL, chat.Name, chat.OtherUserID)
 	sa.rememberChatDisappear(chat.ID, chat.DisappearAfterSeconds)
@@ -201,6 +213,10 @@ func (sa *SnapchatAPI) queueRemoteMessageEdit(chat sidecar.Chat, targetMessageID
 	sender := bridgev2.EventSender{
 		IsFromMe: message.Outgoing,
 		Sender:   sa.messageSenderID(chat, message),
+	}
+	if message.Outgoing {
+		sender.Sender = ""
+		sender.SenderLogin = makeUserLoginID(sa.Label)
 	}
 	portalKey := networkid.PortalKey{
 		ID:       networkid.PortalID(chat.ID),
