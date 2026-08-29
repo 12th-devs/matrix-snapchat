@@ -79,3 +79,50 @@ func TestPortalOtherUserIDPersists(t *testing.T) {
 		t.Fatalf("unexpected other user id: %q", state.OtherUserID)
 	}
 }
+
+func TestPortalOtherUserIDSurvivesEmptySidebarRefresh(t *testing.T) {
+	db, err := New(filepath.Join(t.TempDir(), "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	const participantID = "33432eb1-9099-4bda-8b85-e75cc899c2a2"
+	if err = db.UpsertPortal(PortalState{
+		PortalKey:   "chat-1",
+		RemoteID:    "chat-1",
+		RemoteName:  "Loreleiii",
+		OtherUserID: participantID,
+		Preview:     "hey",
+		LastMessage: "hey",
+		Unread:      true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err = db.UpsertPortal(PortalState{
+		PortalKey:   "chat-1",
+		RemoteID:    "chat-1",
+		RemoteName:  "Loreleiii",
+		OtherUserID: "",
+		Preview:     "new preview",
+		LastMessage: "new preview",
+		Unread:      false,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	state, err := db.GetPortalByKey("chat-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state == nil {
+		t.Fatal("portal state was not persisted")
+	}
+	if state.OtherUserID != participantID {
+		t.Fatalf("empty refresh clobbered participant id: %q", state.OtherUserID)
+	}
+	if state.Preview != "new preview" || state.LastMessage != "new preview" || state.Unread {
+		t.Fatalf("non-identity fields were not refreshed: preview=%q last=%q unread=%t", state.Preview, state.LastMessage, state.Unread)
+	}
+}

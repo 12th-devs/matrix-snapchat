@@ -36,12 +36,26 @@ func (sa *SnapchatAPI) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (
 	if name == "" {
 		name = string(ghost.ID)
 	}
+	identifier := fmt.Sprintf("snapchat:%s", ghost.ID)
+	if username := sa.lookupGhostUsername(ghost.ID); username != "" {
+		identifier = fmt.Sprintf("snapchat:%s", username)
+		if name == string(ghost.ID) || snapUUIDPattern.MatchString(name) {
+			name = username
+		}
+	}
 	info := &bridgev2.UserInfo{
 		Name:        &name,
 		Avatar:      sa.avatarForGhost(ctx, ghost.ID),
-		Identifiers: []string{fmt.Sprintf("snapchat:%s", ghost.ID)},
+		Identifiers: []string{identifier},
 	}
 	return info, nil
+}
+
+func (sa *SnapchatAPI) snapchatIdentifier(userID networkid.UserID) string {
+	if username := sa.lookupGhostUsername(userID); username != "" {
+		return fmt.Sprintf("snapchat:%s", username)
+	}
+	return fmt.Sprintf("snapchat:%s", userID)
 }
 
 func (sa *SnapchatAPI) lookupGhostNameFromStore(userID networkid.UserID) string {
@@ -82,8 +96,22 @@ func (sa *SnapchatAPI) remoteUserIDForChat(chatID, chatName string) networkid.Us
 		log.Printf("bridgev2 map: remote user for chat_id=%s resolved from participant user_id=%s", chatID, otherUserID)
 		return makeUserID(otherUserID)
 	}
+	if sa.Connector != nil && sa.Connector.store != nil && chatID != "" {
+		if portal, err := sa.Connector.store.GetPortalByRemoteID(chatID); err == nil && portal != nil {
+			otherUserID = strings.TrimSpace(portal.OtherUserID)
+			if otherUserID != "" {
+				log.Printf("bridgev2 map: remote user for chat_id=%s resolved from stored participant user_id=%s", chatID, otherUserID)
+				return makeUserID(otherUserID)
+			}
+		}
+	}
 	if chatID != "" {
-		log.Printf("bridgev2 map: remote user for chat_id=%s using stable conversation id fallback", chatID)
+		chatName = strings.TrimSpace(chatName)
+		if chatName != "" {
+			log.Printf("bridgev2 map: remote user for chat_id=%s missing participant id; using sanitized display name fallback=%q", chatID, chatName)
+			return makeUserID(chatName)
+		}
+		log.Printf("bridgev2 map: remote user for chat_id=%s missing participant id and display name; using conversation id fallback", chatID)
 		return makeUserID(chatID)
 	}
 	chatName = strings.TrimSpace(chatName)
@@ -100,20 +128,75 @@ func (sa *SnapchatAPI) chatInfoForWithAvatar(ctx context.Context, chatID, chatNa
 	if name == "" {
 		name = "Snapchat"
 	}
-	remoteUserID := sa.remoteUserIDForChat(chatID, name)
-	sa.rememberGhostName(remoteUserID, name)
-	avatar := sa.cachedAvatarForGhost(remoteUserID)
-	if avatar == nil && fetchAvatar {
-		avatar = sa.avatarForGhost(ctx, remoteUserID)
-	}
+	ref := sa.lookupChatRef(chatID)
 	ownUserID := makeUserID(sa.Label)
 	roomType := database.RoomTypeDM
-	remoteUserInfo := &bridgev2.UserInfo{
-		Name:   &name,
-		Avatar: avatar,
-		Identifiers: []string{
-			fmt.Sprintf("snapchat:%s", remoteUserID),
+	if ref.IsGroup || len(ref.ParticipantIDs) > 1 {
+		roomType = database.RoomTypeGroupDM
+	}
+	var avatar *bridgev2.Avatar
+	memberMap := bridgev2.ChatMemberMap{
+		ownUserID: {
+			EventSender: bridgev2.EventSender{
+				IsFromMe:    true,
+				Sender:      ownUserID,
+				SenderLogin: makeUserLoginID(sa.Label),
+			},
 		},
+	}
+	memberCount := 1
+	otherUserID := networkid.UserID("")
+	if roomType == database.RoomTypeDM {
+		remoteUserID := sa.remoteUserIDForChat(chatID, name)
+		otherUserID = remoteUserID
+		sa.rememberGhostName(remoteUserID, name)
+		if ref.Username != "" {
+			sa.rememberGhostUsername(remoteUserID, ref.Username)
+		}
+		avatar = sa.cachedAvatarForGhost(remoteUserID)
+		if avatar == nil && fetchAvatar {
+			avatar = sa.avatarForGhost(ctx, remoteUserID)
+		}
+		remoteUserInfo := &bridgev2.UserInfo{
+			Name:   &name,
+			Avatar: avatar,
+			Identifiers: []string{
+				sa.snapchatIdentifier(remoteUserID),
+			},
+		}
+		memberMap[remoteUserID] = bridgev2.ChatMember{
+			EventSender: bridgev2.EventSender{
+				Sender: remoteUserID,
+			},
+			UserInfo: remoteUserInfo,
+		}
+		memberCount = 2
+	} else {
+		for _, participantID := range ref.ParticipantIDs {
+			participantID = strings.TrimSpace(participantID)
+			if participantID == "" {
+				continue
+			}
+			userID := makeUserID(participantID)
+			display := sa.lookupGhostName(userID)
+			if display == "" {
+				display = sa.lookupGhostNameFromStore(userID)
+			}
+			if display == "" {
+				display = string(userID)
+			}
+			memberMap[userID] = bridgev2.ChatMember{
+				EventSender: bridgev2.EventSender{
+					Sender: userID,
+				},
+				UserInfo: &bridgev2.UserInfo{
+					Name:        &display,
+					Avatar:      sa.cachedAvatarForGhost(userID),
+					Identifiers: []string{sa.snapchatIdentifier(userID)},
+				},
+			}
+		}
+		memberCount = len(memberMap)
 	}
 	info := &bridgev2.ChatInfo{
 		Name:   &name,
@@ -121,29 +204,15 @@ func (sa *SnapchatAPI) chatInfoForWithAvatar(ctx context.Context, chatID, chatNa
 		Type:   &roomType,
 		Members: &bridgev2.ChatMemberList{
 			IsFull:           true,
-			TotalMemberCount: 2,
-			OtherUserID:      remoteUserID,
-			MemberMap: bridgev2.ChatMemberMap{
-				ownUserID: {
-					EventSender: bridgev2.EventSender{
-						IsFromMe:    true,
-						Sender:      ownUserID,
-						SenderLogin: makeUserLoginID(sa.Label),
-					},
-				},
-				remoteUserID: {
-					EventSender: bridgev2.EventSender{
-						Sender: remoteUserID,
-					},
-					UserInfo: remoteUserInfo,
-				},
-			},
+			TotalMemberCount: memberCount,
+			OtherUserID:      otherUserID,
+			MemberMap:        memberMap,
 		},
 	}
 	if disappear := sa.disappearingSettingForChat(chatID); disappear != nil {
 		info.Disappear = disappear
 	}
-	log.Printf("bridgev2 map: chat info chat_id=%s name=%q remote_user_id=%s avatar=%t disappear=%t", chatID, name, remoteUserID, avatar != nil, info.Disappear != nil)
+	log.Printf("bridgev2 map: chat info chat_id=%s name=%q room_type=%s other_user_id=%s members=%d avatar=%t disappear=%t", chatID, name, roomType, otherUserID, memberCount, avatar != nil, info.Disappear != nil)
 	return info
 }
 
@@ -212,7 +281,14 @@ func (sa *SnapchatAPI) queueStoredPortalResyncs(ctx context.Context) {
 		if chatName == "" {
 			chatName = chatID
 		}
-		sa.rememberChat(chatID, "", chatName, portal.OtherUserID)
+		sa.rememberChatDetails(sidecar.Chat{
+			ID:             chatID,
+			Name:           chatName,
+			OtherUserID:    portal.OtherUserID,
+			ParticipantIDs: append([]string{}, portal.ParticipantIDs...),
+			IsGroup:        portal.RoomType == "group_dm",
+			Username:       portal.Username,
+		})
 		if sa.queueChatResyncWithAvatar(ctx, chatID, chatName, false) {
 			queued++
 		}
@@ -339,7 +415,7 @@ func (sa *SnapchatAPI) syncStoredPortalMessages(ctx context.Context) {
 		log.Printf("bridgev2 sync: failed to load stored portals for startup message backfill: %v", err)
 		return
 	}
-	const maxStartupBackfillChats = 3
+	maxStartupBackfillChats := sa.messageSyncLimitPerPoll(true)
 	synced := 0
 	for _, portal := range portals {
 		if synced >= maxStartupBackfillChats || ctx.Err() != nil {
@@ -357,13 +433,16 @@ func (sa *SnapchatAPI) syncStoredPortalMessages(ctx context.Context) {
 			chatName = chatID
 		}
 		chat := sidecar.Chat{
-			ID:          chatID,
-			URL:         snapchatConversationURL(chatID),
-			Name:        chatName,
-			Preview:     portal.Preview,
-			LastMessage: portal.LastMessage,
-			Unread:      portal.Unread,
-			OtherUserID: portal.OtherUserID,
+			ID:             chatID,
+			URL:            snapchatConversationURL(chatID),
+			Name:           chatName,
+			Preview:        portal.Preview,
+			LastMessage:    portal.LastMessage,
+			Unread:         portal.Unread,
+			OtherUserID:    portal.OtherUserID,
+			ParticipantIDs: append([]string{}, portal.ParticipantIDs...),
+			IsGroup:        portal.RoomType == string(database.RoomTypeGroupDM) || len(portal.ParticipantIDs) > 1,
+			Username:       portal.Username,
 		}
 		if err := sa.syncChatMessagesAPI(ctx, chat, 0, "startup stored portal backfill", false, false); err != nil {
 			log.Printf("bridgev2 sync: startup message backfill failed chat=%q id=%s: %v", chat.Name, chat.ID, err)
@@ -387,7 +466,14 @@ func (sa *SnapchatAPI) restoreChatMappings() {
 		if portal.RemoteID == "" || portal.RemoteName == "" {
 			continue
 		}
-		sa.rememberChat(portal.RemoteID, "", portal.RemoteName, portal.OtherUserID)
+		sa.rememberChatDetails(sidecar.Chat{
+			ID:             portal.RemoteID,
+			Name:           portal.RemoteName,
+			OtherUserID:    portal.OtherUserID,
+			ParticipantIDs: append([]string{}, portal.ParticipantIDs...),
+			IsGroup:        portal.RoomType == "group_dm",
+			Username:       portal.Username,
+		})
 		sa.rememberChatState(portal.RemoteID, portal.Unread, portal.Preview, portal.LastMessage)
 	}
 }

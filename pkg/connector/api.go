@@ -15,6 +15,7 @@ import (
 
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/networkid"
+	"maunium.net/go/mautrix/bridgev2/status"
 	"maunium.net/go/mautrix/event"
 
 	sidecar "github.com/colej/mautrix-snapchat/internal/connector"
@@ -26,6 +27,9 @@ type chatRef struct {
 	URL                   string
 	Name                  string
 	OtherUserID           string
+	ParticipantIDs        []string
+	IsGroup               bool
+	Username              string
 	DisappearAfterSeconds int64
 }
 
@@ -41,28 +45,31 @@ type SnapchatAPI struct {
 	Label     string
 	Client    *sidecar.Client
 
-	apiMu                sync.Mutex
-	apiClient            *snapapi.Client
-	apiCookieString      string
-	apiAuthCheckedAt     time.Time
-	mu                   sync.Mutex
-	seenByChat           map[string]map[string]struct{}
-	chatsByID            map[string]chatRef
-	ghostNames           map[string]string
-	chatState            map[string]string
-	lastMessageID        map[string]int64
-	lastMessageVersion   map[string]int64
-	messageVersions      map[string]map[int64]int64
-	messageFailures      map[string]int
-	messageRetryAfter    map[string]time.Time
-	lastReadReceiptSync  map[string]time.Time
-	ghostAvatarCheckedAt map[string]time.Time
-	avatarURLBySnapID    map[string]string
-	queuedPortalResyncs  map[string]struct{}
-	recentOutgoing       map[string][]pendingOutgoing
-	chatDisappearAfter   map[string]int64
-	avatarBootstrapDone  bool
-	sidebarBaselineReady bool
+	apiMu                 sync.Mutex
+	apiClient             *snapapi.Client
+	apiCookieString       string
+	apiAuthCheckedAt      time.Time
+	mu                    sync.Mutex
+	seenByChat            map[string]map[string]struct{}
+	chatsByID             map[string]chatRef
+	ghostNames            map[string]string
+	ghostUsernames        map[string]string
+	chatState             map[string]string
+	lastMessageID         map[string]int64
+	lastMessageVersion    map[string]int64
+	messageVersions       map[string]map[int64]int64
+	messageFailures       map[string]int
+	messageRetryAfter     map[string]time.Time
+	lastReadReceiptSync   map[string]time.Time
+	ghostAvatarCheckedAt  map[string]time.Time
+	avatarURLBySnapID     map[string]string
+	queuedPortalResyncs   map[string]struct{}
+	recentOutgoing        map[string][]pendingOutgoing
+	chatDisappearAfter    map[string]int64
+	avatarBootstrapDone   bool
+	sidebarBaselineReady  bool
+	sidebarBaselineAt     time.Time
+	hybridBackfillStarted bool
 }
 
 type connectorEELDecrypter struct {
@@ -89,6 +96,7 @@ func (d connectorEELDecrypter) DecryptEEL(ctx context.Context, req snapapi.EELDe
 
 var _ bridgev2.NetworkAPI = (*SnapchatAPI)(nil)
 var _ bridgev2.ReadReceiptHandlingNetworkAPI = (*SnapchatAPI)(nil)
+var _ bridgev2.TypingHandlingNetworkAPI = (*SnapchatAPI)(nil)
 
 var relativeTimestampPattern = regexp.MustCompile(`(?i)^(\d+)\s*([mhdwy])$`)
 var snapUUIDPattern = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
@@ -106,6 +114,7 @@ func NewSnapchatAPI(sc *SnapchatConnector, login *bridgev2.UserLogin, label stri
 		seenByChat:           make(map[string]map[string]struct{}),
 		chatsByID:            make(map[string]chatRef),
 		ghostNames:           make(map[string]string),
+		ghostUsernames:       make(map[string]string),
 		chatState:            make(map[string]string),
 		lastMessageID:        make(map[string]int64),
 		lastMessageVersion:   make(map[string]int64),
@@ -123,6 +132,17 @@ func NewSnapchatAPI(sc *SnapchatConnector, login *bridgev2.UserLogin, label stri
 
 func (sa *SnapchatAPI) Connect(ctx context.Context) {
 	sa.restoreChatMappings()
+	if sa.UserLogin != nil {
+		sa.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
+	}
+	if sa.Connector.apiMode() == "hybrid" {
+		// Hybrid mode uses the browser sidebar as the authoritative portal list.
+		// Do not race that baseline with legacy stored-portal resync, avatar, or
+		// message backfill jobs; those can retain obsolete mappings and contend
+		// with the main SQLite connection during startup.
+		go sa.pollLoop(ctx)
+		return
+	}
 	sa.queueStoredPortalResyncs(ctx)
 	go sa.primeStoredPortalAvatars(ctx)
 	if sa.autoFetchMessagesEnabled() {
@@ -227,9 +247,9 @@ func dedupeChatsByName(chats []sidecar.Chat) []sidecar.Chat {
 	deduped := make([]sidecar.Chat, 0, len(chats))
 	seen := make(map[string]struct{}, len(chats))
 	for _, chat := range chats {
-		key := strings.ToLower(strings.TrimSpace(chat.Name))
+		key := strings.ToLower(strings.TrimSpace(chat.ID))
 		if key == "" {
-			key = strings.ToLower(strings.TrimSpace(chat.ID))
+			key = strings.ToLower(strings.TrimSpace(chat.Name))
 		}
 		if key == "" {
 			continue
@@ -548,11 +568,18 @@ func connectorChatFromAPI(chat snapapi.Chat) sidecar.Chat {
 	if preview == "" {
 		preview = strings.TrimSpace(chat.LastMessage)
 	}
+	participantIDs := append([]string{}, chat.ParticipantIDs...)
+	if len(participantIDs) == 0 && strings.TrimSpace(chat.OtherUserID) != "" {
+		participantIDs = []string{strings.TrimSpace(chat.OtherUserID)}
+	}
 	return sidecar.Chat{
 		ID:                    chat.ID,
 		OtherUserID:           chat.OtherUserID,
+		ParticipantIDs:        participantIDs,
+		IsGroup:               chat.IsGroup || len(participantIDs) > 1,
 		URL:                   snapchatConversationURL(chat.ID),
 		Name:                  name,
+		Username:              chat.Username,
 		Preview:               preview,
 		Unread:                chat.Unread,
 		LastMessage:           preview,

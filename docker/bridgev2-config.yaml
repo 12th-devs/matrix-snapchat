@@ -1,20 +1,22 @@
-﻿# Network-specific config options
+# Network-specific config options
 network:
     # Snapchat Web sidecar connector
     base_url: "http://connector:3101"
     shared_secret: "1225"
     request_timeout_seconds: 120
-    poll_interval_seconds: 10
-    message_fetch_limit: 5
+    poll_interval_seconds: 2
+    message_fetch_limit: 20
     api_mode: api_only
     dom_fallback_enabled: false
-    auto_fetch_messages: true
-    read_receipts_enabled: false
-    snap_media_enabled: true
-    snap_media_on_read: true
-    send_media_enabled: true
-    state_db_path: "/data/bridgev2-state.sqlite"
+      auto_fetch_messages: true
+      read_receipts_enabled: false
+      typing_enabled: false
+      snap_media_enabled: false
+    snap_media_on_read: false
+    send_media_enabled: false
+    state_db_path: "./data/bridgev2-state.sqlite"
     login_wait_seconds: 300
+    network_icon_mxc: "mxc://beeper.com/snapchat"
 
 # Config options that affect the central bridge module.
 bridge:
@@ -33,7 +35,6 @@ bridge:
     # By default, users who are in the same group on the remote network will be
     # in the same Matrix room bridged to that group. If this is set to true,
     # every user will get their own Matrix room instead.
-    # SETTING THIS IS IRREVERSIBLE AND POTENTIALLY DESTRUCTIVE IF PORTALS ALREADY EXIST.
     split_portals: true
     # Should the bridge resend `m.bridge` events to all portals on startup?
     resend_bridge_info: false
@@ -45,12 +46,9 @@ bridge:
     # Allowed values: none, errors, all
     bridge_status_notices: none
     # How long after an unknown error should the bridge attempt a full reconnect?
-    # Must be at least 1 minute. The bridge will add an extra Â±20% jitter to this value.
+    # Must be at least 1 minute. The bridge will add an extra ±20% jitter to this value.
     unknown_error_auto_reconnect: null
-    # Maximum number of times to do the auto-reconnect above.
-    # The counter is per login, but is never reset except on logout and restart.
-    unknown_error_max_auto_reconnects: 10
-
+    
     # Should leaving Matrix rooms be bridged as leaving groups on the remote network?
     bridge_matrix_leave: false
     # Should `m.notice` messages be bridged?
@@ -68,17 +66,7 @@ bridge:
     # Should cross-room reply metadata be bridged?
     # Most Matrix clients don't support this and servers may reject such messages too.
     cross_room_replies: true
-    # If a state event fails to bridge, should the bridge revert any state changes made by that event?
-    revert_failed_state_changes: false
-    # In portals with no relay set, should Matrix users be kicked if they're
-    # not logged into an account that's in the remote chat?
-    kick_matrix_users: true
-    # Should the bridge listen to com.beeper.state_request events?
-    # This is not necessary for anything outside of Beeper.
-    enable_send_state_requests: false
-    # Should the com.beeper.bridge.identifiers list in global ghost profiles include phone numbers?
-    phone_numbers_in_profile: false
-
+    
     # What should be done to portal rooms when a user logs out or is logged out?
     # Permitted values:
     #   nothing - Do nothing, let the user stay in the portals
@@ -105,7 +93,7 @@ bridge:
             relayed: nothing
             shared_no_users: nothing
             shared_has_users: nothing
-
+    
     # Settings for relay mode
     relay:
         # Whether relay mode should be allowed. If allowed, the set-relay command can be used to turn any
@@ -114,11 +102,6 @@ bridge:
         # Should only admins be allowed to set themselves as relay users?
         # If true, non-admins can only set users listed in default_relays as relays in a room.
         admin_only: true
-        # Should default relays be preferred when an explicit login ID isn't specified even if the user is logged in?
-        # This applies to the set-relay and bridge commands sent by any user, including admins.
-        prefer_default: true
-        # Should non-admins be allowed to use the bridge and sync-chat commands via default relays specified below?
-        allow_bridge: true
         # List of user login IDs which anyone can set as a relay, as long as the relay user is in the room.
         default_relays: []
         # The formats to use when sending messages via the relaybot.
@@ -145,20 +128,7 @@ bridge:
         # This has all the Sender variables available under message_formats (but without the .Sender prefix).
         # Note that you need to manually remove the displayname from message_formats above.
         displayname_format: "{{ .DisambiguatedName }}"
-
-    # Filter for automatically creating portals.
-    portal_create_filter:
-        # The mode for filtering, either `deny` or `allow`
-        mode: deny
-        # The list of portal IDs to deny or allow depending on the mode config.
-        # Items here can either be the plain portal ID as a string, or an object with `id` and `receiver` fields.
-        # The receiver field is necessary if you want to target a specific DM portal for example.
-        list: []
-        # A list of user login IDs from which to always deny creating portals.
-        # This is meant to be used with default relays, such that the relay bot
-        # being added to a group wouldn't automatically trigger portal creation.
-        always_deny_from_login: []
-
+    
     # Permissions for using the bridge.
     # Permitted values:
     #    relay - Talk through the relaybot (if enabled), no access otherwise
@@ -181,10 +151,10 @@ database:
     #           https://github.com/mattn/go-sqlite3#connection-string
     #   Postgres: Connection string. For example, postgres://user:password@host/database?sslmode=disable
     #             To connect via Unix socket, use something like postgres:///dbname?host=/var/run/postgresql
-    uri: file:/data/sh-snapchat.db?_txlock=immediate
+    uri: file:./data/sh-snapchat.db?_txlock=immediate
     # Maximum number of connections.
-    max_open_conns: 5
-    max_idle_conns: 2
+    max_open_conns: 1
+    max_idle_conns: 1
     # Maximum connection idle time and lifetime before they're closed. Disabled if null.
     # Parsed with https://pkg.go.dev/time#ParseDuration
     max_conn_idle_time: null
@@ -198,7 +168,7 @@ homeserver:
     address: https://matrix.beeper.com/_hungryserv/12th-gen
     # The domain of the homeserver (also known as server_name, used for MXIDs, etc).
     domain: beeper.local
-
+    
     # What software is the homeserver running?
     # Standard Matrix homeservers like Synapse, Dendrite and Conduit should just use "standard" here.
     software: hungry
@@ -214,7 +184,7 @@ homeserver:
     message_send_checkpoint_endpoint: null
     # Does the homeserver support https://github.com/matrix-org/matrix-spec-proposals/pull/2246?
     async_media: true
-
+    
     # Should the bridge use a websocket for connecting to the homeserver?
     # The server side is currently not documented anywhere and is only implemented by mautrix-wsproxy,
     # mautrix-asmux (deprecated), and hungryserv (proprietary).
@@ -234,12 +204,12 @@ appservice:
     # This is only needed for things like public media. A reverse proxy is generally necessary when using this field.
     # This value doesn't affect the registration file.
     public_address:
-
+    
     # The hostname and port where this appservice should listen.
     # For Docker, you generally have to change the hostname to 0.0.0.0.
     hostname: 0.0.0.0
     port: 4000
-
+    
     # The unique ID of this appservice.
     id: 22ae986b-8193-445c-b6ef-20390960fd6a
     # Appservice bot details.
@@ -249,8 +219,8 @@ appservice:
         # Display name and avatar for bot. Set to "remove" to remove display name/avatar, leave empty
         # to leave display name/avatar as-is.
         displayname: Snapchat bridge bot
-        avatar:
-
+        avatar: mxc://beeper.com/snapchat
+    
     # Whether to receive ephemeral events via appservice transactions.
     ephemeral_events: true
     # Should incoming events be handled asynchronously?
@@ -258,11 +228,11 @@ appservice:
     # However, messages will not be guaranteed to be bridged in the same order they were sent in.
     # This value doesn't affect the registration file.
     async_transactions: false
-
+    
     # Authentication tokens for AS <-> HS communication. Autogenerated; do not modify.
     as_token: hua_dmvDqsu4ua0nKPB1WY3MlZoWBLttGLK4N4t8qX0tYXckCvBanqjBQ_qruLI3
     hs_token: huh_xVY0Qdu4zPYEYSFGW8w9FMA5GHRi0QT6cEbv3iBlb0Absp7uxVQlz_ux4qU2
-
+    
     # Localpart template of MXIDs for remote users.
     # {{.}} is replaced with the internal ID of the user.
     username_template: sh-snapchat_{{.}}
@@ -283,9 +253,6 @@ matrix:
     # The threshold as bytes after which the bridge should roundtrip uploads via the disk
     # rather than keeping the whole file in memory.
     upload_file_threshold: 5242880
-    # Should the bridge set additional custom profile info for ghosts?
-    # This can make a lot of requests, as there's no batch profile update endpoint.
-    ghost_extra_profile_info: false
 
 # Segment-compatible analytics endpoint for tracking some events, like provisioning API login and encryption errors.
 analytics:
@@ -298,8 +265,10 @@ analytics:
 
 # Settings for provisioning API
 provisioning:
+    # Prefix for the provisioning API paths.
+    prefix: /_matrix/provision
     # Shared secret for authentication. If set to "generate" or null, a random secret will be generated,
-    # or if set to "disable", the provisioning API will be disabled. Must be at least 16 characters.
+    # or if set to "disable", the provisioning API will be disabled.
     shared_secret: 29ed5c7a971494b2885de83cf5e8a9d1bd925552
     # Whether to allow provisioning API requests to be authed using Matrix access tokens.
     # This follows the same rules as double puppeting to determine which server to contact to check the token,
@@ -325,14 +294,6 @@ public_media:
     expiry: 0
     # Length of hash to use for public media URLs. Must be between 0 and 32.
     hash_length: 32
-    # The path prefix for generated URLs. Note that this will NOT change the path where media is actually served.
-    # If you change this, you must configure your reverse proxy to rewrite the path accordingly.
-    path_prefix: /_mautrix/publicmedia
-    # Should the bridge store media metadata in the database in order to support encrypted media and generate shorter URLs?
-    # If false, the generated URLs will just have the MXC URI and a HMAC signature.
-    # The hash_length field will be used to decide the length of the generated URL.
-    # This also allows invalidating URLs by deleting the database entry.
-    use_database: false
 
 # Settings for converting remote media to custom mxc:// URIs instead of reuploading.
 # More details can be found at https://docs.mau.fi/bridges/go/discord/direct-media.html
@@ -363,7 +324,6 @@ backfill:
     # Whether to do backfilling at all.
     enabled: true
     # Maximum number of messages to backfill in empty rooms.
-    # If this is zero or negative, backfill will be disabled in new rooms.
     max_initial_messages: 50
     # Maximum number of missed messages to backfill after bridge restarts.
     max_catchup_messages: 500
@@ -379,8 +339,6 @@ backfill:
     queue:
         # Should the backfill queue be enabled?
         enabled: true
-        # Should manual calls to backfill queue tasks be allowed?
-        manual: false
         # Number of messages to backfill in one batch.
         batch_size: 50
         # Delay between batches in seconds.
@@ -422,20 +380,14 @@ encryption:
     # Whether to require all messages to be encrypted and drop any unencrypted messages.
     require: true
     # Whether to use MSC3202/MSC4203 instead of /sync long polling for receiving encryption-related data.
-    # This is an experimental option, see the docs for more info.
+    # This option is not yet compatible with standard Matrix servers like Synapse and should not be used.
     # Changing this option requires updating the appservice registration file.
     appservice: true
     # Whether to use MSC4190 instead of appservice login to create the bridge bot device.
     # Requires the homeserver to support MSC4190 and the device masquerading parts of MSC3202.
     # Only relevant when using end-to-bridge encryption, required when using encryption with next-gen auth (MSC3861).
+    # Changing this option requires updating the appservice registration file.
     msc4190: false
-    # Whether to encrypt reactions and reply metadata as per MSC4392.
-    # This is not supported by most clients.
-    msc4392: false
-    # Should the bridge bot generate a recovery key and cross-signing keys and verify itself?
-    # Note that without the latest version of MSC4190, this will fail if you reset the bridge database.
-    # The generated recovery key will be saved in the kv_store table under `recovery_key`.
-    self_sign: false
     # Enable key sharing? If enabled, key requests for rooms where users are in will be fulfilled.
     # You must use a client that supports requesting keys from other users to use this feature.
     allow_key_sharing: true
@@ -498,25 +450,9 @@ encryption:
         # You should not enable this option unless you understand all the implications.
         disable_device_change_key_rotation: true
 
-# Prefix for environment variables. All variables with this prefix must map to valid config fields.
-# Nesting in variable names is represented with a dot (.).
-# If there are no dots in the name, two underscores (__) are replaced with a dot.
-#
-# e.g. if the prefix is set to `BRIDGE_`, then `BRIDGE_APPSERVICE__AS_TOKEN` will set appservice.as_token.
-# `BRIDGE_appservice.as_token` would work as well, but can't be set in a shell as easily.
-#
-# If this is null, reading config fields from environment will be disabled.
-env_config_prefix: null
-
 # Logging config. See https://github.com/tulir/zeroconfig for details.
 logging:
     min_level: debug
     writers:
         - type: stdout
           format: pretty-colored
-        - type: file
-          format: json
-          filename: /data/logs/bridge.log
-          max_size: 100
-          max_backups: 10
-          compress: false

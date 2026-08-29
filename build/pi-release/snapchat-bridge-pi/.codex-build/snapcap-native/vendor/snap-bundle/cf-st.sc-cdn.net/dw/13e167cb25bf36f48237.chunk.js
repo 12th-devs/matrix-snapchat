@@ -1,0 +1,1 @@
+(globalThis.webpackChunk_snapchat_web_calling_app=globalThis.webpackChunk_snapchat_web_calling_app||[]).push([[473],{20473(a,p,c){a.exports=c.p+"dw/spi_a45c878b4cc29433f42a.png"}}]);

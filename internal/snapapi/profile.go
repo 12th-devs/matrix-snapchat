@@ -24,6 +24,7 @@ func (c *Client) GetPublicProfile(ctx context.Context, userID string) (PublicPro
 		c.mu.Lock()
 		profile := PublicProfile{
 			UserID:    userID,
+			Username:  c.usernamesByUserID[userID],
 			Name:      c.namesByUserID[userID],
 			AvatarURL: c.avatarsByUserID[userID],
 		}
@@ -37,6 +38,7 @@ func (c *Client) GetPublicProfile(ctx context.Context, userID string) (PublicPro
 	profile := profiles[userID]
 	return PublicProfile{
 		UserID:    userID,
+		Username:  profile.Username,
 		Name:      profile.Name,
 		AvatarURL: profile.AvatarURL,
 	}, nil
@@ -60,6 +62,7 @@ func (c *Client) GetPublicProfiles(ctx context.Context, userIDs []string) (map[s
 			c.mu.Lock()
 			result[userID] = PublicProfile{
 				UserID:    userID,
+				Username:  c.usernamesByUserID[userID],
 				Name:      c.namesByUserID[userID],
 				AvatarURL: c.avatarsByUserID[userID],
 			}
@@ -78,6 +81,7 @@ func (c *Client) GetPublicProfiles(ctx context.Context, userIDs []string) (map[s
 	for userID, profile := range profiles {
 		result[userID] = PublicProfile{
 			UserID:    userID,
+			Username:  profile.Username,
 			Name:      profile.Name,
 			AvatarURL: profile.AvatarURL,
 		}
@@ -165,6 +169,7 @@ func (c *Client) fetchPublicProfiles(ctx context.Context, userIDs []string) (map
 				avatarURL = extractProfileAvatarURL(raw)
 			}
 			profiles[user.ID] = publicProfile{
+				Username:  firstNonEmpty(user.MutableUsername, user.Username),
 				Name:      name,
 				AvatarURL: avatarURL,
 			}
@@ -179,6 +184,9 @@ func (c *Client) fetchPublicProfiles(ctx context.Context, userIDs []string) (map
 		}
 	}
 	for id, profile := range profiles {
+		if profile.Username != "" {
+			c.usernamesByUserID[id] = profile.Username
+		}
 		if profile.Name != "" {
 			c.namesByUserID[id] = profile.Name
 		}
@@ -189,10 +197,25 @@ func (c *Client) fetchPublicProfiles(ctx context.Context, userIDs []string) (map
 	return profiles, nil
 }
 
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
 func (c *Client) lookupName(userID string) string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.namesByUserID[userID]
+}
+
+func (c *Client) lookupUsername(userID string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.usernamesByUserID[userID]
 }
 
 func (c *Client) lookupAvatarURL(userID string) string {
@@ -216,6 +239,9 @@ func (c *Client) needsPublicProfile(userID string, needsName bool) bool {
 		return false
 	}
 	if needsName && strings.TrimSpace(c.namesByUserID[userID]) == "" {
+		return true
+	}
+	if strings.TrimSpace(c.usernamesByUserID[userID]) == "" {
 		return true
 	}
 	if strings.TrimSpace(c.avatarsByUserID[userID]) == "" {

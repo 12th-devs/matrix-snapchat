@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/0xzer/snapper/data/paths"
 	"github.com/0xzer/snapper/protos"
@@ -148,10 +149,10 @@ func (c *Client) messageBody(ctx context.Context, chatID string, msg *protos.Con
 	contentLen := len(envelope.GetContents())
 	var contents protos.Contents
 	if encodedContents := c.envelopeContentsForDecode(ctx, chatID, messageID, envelope); len(encodedContents) > 0 {
+		if text := decodedChatBody(encodedContents); contentType == protos.ContentType_CHAT && text != "" {
+			return text, false
+		}
 		if err := protos.DecodeProtoMessage(encodedContents, &contents); err == nil {
-			if text := contents.GetText().GetText(); strings.TrimSpace(text) != "" {
-				return text, false
-			}
 			if contentType == protos.ContentType_CHAT {
 				log.Printf("snapapi decode: CHAT payload had no text message_id=%s content_len=%d content_variant=%T encryption=%T",
 					messageID, contentLen, contents.GetContent(), envelope.GetEnvelopeEncryption().GetMethod())
@@ -181,6 +182,106 @@ func (c *Client) messageBody(ctx context.Context, chatID string, msg *protos.Con
 	}
 }
 
+func plaintextChatBody(raw []byte) string {
+	if len(raw) == 0 || !utf8.Valid(raw) {
+		return ""
+	}
+	text := strings.TrimSpace(string(raw))
+	if text == "" {
+		return ""
+	}
+	for _, r := range text {
+		if r == 0 || (r < 0x20 && r != '\n' && r != '\r' && r != '\t') {
+			return ""
+		}
+	}
+	return text
+}
+
+func decodedChatBody(raw []byte) string {
+	var contents protos.Contents
+	if err := protos.DecodeProtoMessage(raw, &contents); err == nil {
+		if text := contents.GetText().GetText(); strings.TrimSpace(text) != "" {
+			return text
+		}
+	}
+	if text := plaintextChatBody(raw); text != "" {
+		return text
+	}
+	if text := protoStringAtPath(raw, []int{4, 4, 2, 1}); text != "" {
+		return text
+	}
+	return ""
+}
+
+func protoStringAtPath(raw []byte, path []int) string {
+	if len(raw) == 0 || len(path) == 0 {
+		return ""
+	}
+	field := path[0]
+	for offset := 0; offset < len(raw); {
+		tag, next, ok := readProtoVarint(raw, offset)
+		if !ok {
+			return ""
+		}
+		offset = next
+		currentField := int(tag >> 3)
+		wireType := int(tag & 0x7)
+		switch wireType {
+		case 0:
+			_, next, ok = readProtoVarint(raw, offset)
+			if !ok {
+				return ""
+			}
+			offset = next
+		case 1:
+			if offset+8 > len(raw) {
+				return ""
+			}
+			offset += 8
+		case 2:
+			length, next, ok := readProtoVarint(raw, offset)
+			if !ok || length > uint64(len(raw)-next) {
+				return ""
+			}
+			start := next
+			end := start + int(length)
+			offset = end
+			if currentField != field {
+				continue
+			}
+			value := raw[start:end]
+			if len(path) == 1 {
+				return plaintextChatBody(value)
+			}
+			if text := protoStringAtPath(value, path[1:]); text != "" {
+				return text
+			}
+		case 5:
+			if offset+4 > len(raw) {
+				return ""
+			}
+			offset += 4
+		default:
+			return ""
+		}
+	}
+	return ""
+}
+
+func readProtoVarint(raw []byte, offset int) (uint64, int, bool) {
+	var value uint64
+	for shift := uint(0); offset < len(raw) && shift < 64; shift += 7 {
+		b := raw[offset]
+		offset++
+		value |= uint64(b&0x7f) << shift
+		if b < 0x80 {
+			return value, offset, true
+		}
+	}
+	return 0, offset, false
+}
+
 func (c *Client) envelopeContentsForDecode(ctx context.Context, chatID, messageID string, envelope *protos.ContentEnvelope) []byte {
 	if envelope == nil {
 		return nil
@@ -195,6 +296,9 @@ func (c *Client) envelopeContentsForDecode(ctx context.Context, chatID, messageI
 		}
 	}
 	if eel := envelope.GetEnvelopeEncryption().GetEelEncryption(); eel != nil {
+		if decrypted, ok := decryptEELGCM(raw, eel.GetCek(), eel.GetNonce()); ok {
+			return decrypted
+		}
 		if decrypted, ok := decryptEELGCM(raw, eel.GetCek(), eel.GetCekIv()); ok {
 			return decrypted
 		}
@@ -203,7 +307,12 @@ func (c *Client) envelopeContentsForDecode(ctx context.Context, chatID, messageI
 			c.mu.Lock()
 			lastFailure, alreadyFailed := c.failedEEL[cacheKey]
 			c.mu.Unlock()
-			if alreadyFailed && time.Since(lastFailure) < 15*time.Second {
+			// Full EEL decrypt depends on Snapchat's Fidelius/WASM session. If
+			// the helper is not ready for a historical message yet, retrying it
+			// every poll burns connector time and can make live sync look flaky.
+			// New message IDs still get one immediate attempt; known misses are
+			// retried periodically in case the helper becomes available later.
+			if alreadyFailed && time.Since(lastFailure) < 2*time.Minute {
 				return nil
 			}
 			decrypted, err := c.eelDecrypter.DecryptEEL(ctx, EELDecryptRequest{
@@ -217,7 +326,8 @@ func (c *Client) envelopeContentsForDecode(ctx context.Context, chatID, messageI
 				SenderVersion:   eel.GetSenderVersion(),
 			})
 			if err != nil {
-				log.Printf("snapapi decode: EEL helper failed message_id=%s conversation_id=%s failure=%T", messageID, chatID, err)
+				log.Printf("snapapi decode: EEL helper failed message_id=%s conversation_id=%s content=%d cek=%d cek_iv=%d nonce=%d sender_pub=%d sender_version=%d failure=%T",
+					messageID, chatID, len(raw), len(eel.GetCek()), len(eel.GetCekIv()), len(eel.GetNonce()), len(eel.GetSenderPublicKey()), eel.GetSenderVersion(), err)
 				c.mu.Lock()
 				if c.failedEEL == nil {
 					c.failedEEL = make(map[string]time.Time)

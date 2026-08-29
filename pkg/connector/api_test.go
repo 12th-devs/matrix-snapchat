@@ -129,6 +129,22 @@ func TestShouldSuppressOutgoingEchoMatchesRecentBody(t *testing.T) {
 	}
 }
 
+func TestShouldNotSuppressLaterSnapchatAppSendWithSameBody(t *testing.T) {
+	sa := &SnapchatAPI{recentOutgoing: map[string][]pendingOutgoing{
+		"chat-1": {{
+			Body:   normalizeOutgoingBody("hello there"),
+			SentAt: time.Now().Add(-2 * time.Minute),
+		}},
+	}}
+	if sa.shouldSuppressOutgoingEcho("chat-1", sidecar.Message{
+		ID:       "1488",
+		Text:     "hello there",
+		Outgoing: true,
+	}) {
+		t.Fatal("Snapchat app send with repeated text should not be suppressed after the short text-only echo window")
+	}
+}
+
 func TestNormalizeRemoteMessageDirectionTreatsLoginLabelAsSelf(t *testing.T) {
 	sa := &SnapchatAPI{Label: "browser-session"}
 	msg := sa.normalizeRemoteMessageDirection("chat-1", sidecar.Message{
@@ -219,5 +235,86 @@ func TestDisappearingSettingForMessageSkipsSavedMessages(t *testing.T) {
 	})
 	if got.Timer != 10*time.Second {
 		t.Fatalf("chat disappearing timer = %s, want 10s", got.Timer)
+	}
+}
+
+func TestShouldQueueMessageEditDetectsDecryptedBodyLater(t *testing.T) {
+	if !shouldQueueMessageEdit(&store.MessageState{
+		Text: "Snapchat message unavailable",
+		Kind: "chat",
+	}, sidecar.Message{Text: "now decoded"}) {
+		t.Fatal("expected plaintext replacement to queue a Matrix edit")
+	}
+}
+
+func TestShouldQueueMessageEditSkipsDuplicatesAndEmptyBodies(t *testing.T) {
+	if shouldQueueMessageEdit(nil, sidecar.Message{Text: "new"}) {
+		t.Fatal("nil baseline should not queue an edit")
+	}
+	if shouldQueueMessageEdit(&store.MessageState{Text: "same", Kind: "chat"}, sidecar.Message{Text: " same "}) {
+		t.Fatal("same normalized text should not queue an edit")
+	}
+	if shouldQueueMessageEdit(&store.MessageState{Text: "old", Kind: "chat"}, sidecar.Message{}) {
+		t.Fatal("empty replacement should not queue an edit")
+	}
+}
+
+func TestShouldQueueMessageEditSkipsSnapAndMediaRows(t *testing.T) {
+	for _, state := range []*store.MessageState{
+		{Text: "New Snap", Kind: "snap"},
+		{Text: "photo.jpg", Kind: "media"},
+		{Text: "caption", Kind: "chat", HasMedia: true},
+	} {
+		if shouldQueueMessageEdit(state, sidecar.Message{Text: "decoded"}) {
+			t.Fatalf("state %+v should not queue an ordinary text edit", state)
+		}
+	}
+}
+
+func TestShouldSendReadReceiptToSnapchatSkipsExactUnknownTargets(t *testing.T) {
+	if (&SnapchatAPI{}).shouldSendReadReceiptToSnapchat("chat-1", 123, true) {
+		t.Fatal("exact read receipt with no stored baseline should be skipped")
+	}
+}
+
+func TestShouldSendReadReceiptToSnapchatAllowsStoredText(t *testing.T) {
+	db, err := store.New(filepath.Join(t.TempDir(), "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.UpsertMessages([]store.MessageState{{
+		PortalKey:  "chat-1",
+		RemoteID:   "123",
+		Text:       "hello",
+		Kind:       "chat",
+		LastSeenAt: time.Now(),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	sa := &SnapchatAPI{Connector: &SnapchatConnector{store: db}}
+	if !sa.shouldSendReadReceiptToSnapchat("chat-1", 123, true) {
+		t.Fatal("stored chat text should be safe for read receipt")
+	}
+}
+
+func TestShouldSendReadReceiptToSnapchatSkipsSnapAndMediaTargets(t *testing.T) {
+	db, err := store.New(filepath.Join(t.TempDir(), "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.UpsertMessages([]store.MessageState{
+		{PortalKey: "chat-1", RemoteID: "123", Text: "New Snap", Kind: "snap", LastSeenAt: time.Now()},
+		{PortalKey: "chat-1", RemoteID: "124", Text: "photo.jpg", Kind: "media", LastSeenAt: time.Now()},
+		{PortalKey: "chat-1", RemoteID: "125", Text: "caption", Kind: "chat", HasMedia: true, LastSeenAt: time.Now()},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sa := &SnapchatAPI{Connector: &SnapchatConnector{store: db}}
+	for _, messageID := range []int64{123, 124, 125} {
+		if sa.shouldSendReadReceiptToSnapchat("chat-1", messageID, true) {
+			t.Fatalf("message %d should be skipped for safe read receipts", messageID)
+		}
 	}
 }

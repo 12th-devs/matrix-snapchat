@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -23,14 +24,17 @@ type LoginState struct {
 }
 
 type PortalState struct {
-	PortalKey    string
-	RemoteID     string
-	RemoteName   string
-	OtherUserID  string
-	Preview      string
-	LastMessage  string
-	Unread       bool
-	LastSyncedAt time.Time
+	PortalKey      string
+	RemoteID       string
+	RemoteName     string
+	OtherUserID    string
+	ParticipantIDs []string
+	RoomType       string
+	Username       string
+	Preview        string
+	LastMessage    string
+	Unread         bool
+	LastSyncedAt   time.Time
 }
 
 type MessageState struct {
@@ -59,6 +63,12 @@ func New(path string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite database: %w", err)
 	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	if _, err = db.Exec(`PRAGMA busy_timeout = 5000`); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("configure sqlite busy timeout: %w", err)
+	}
 
 	s := &Store{db: db}
 	if err = s.init(); err != nil {
@@ -84,6 +94,9 @@ func (s *Store) init() error {
 			remote_id TEXT,
 			remote_name TEXT,
 			other_user_id TEXT,
+			participant_ids_json TEXT,
+			room_type TEXT,
+			username TEXT,
 			preview TEXT,
 			last_message TEXT,
 			unread BOOLEAN DEFAULT FALSE,
@@ -128,6 +141,15 @@ func (s *Store) init() error {
 		return err
 	}
 	if err := s.ensureColumn("portal_state", "other_user_id", "other_user_id TEXT"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("portal_state", "participant_ids_json", "participant_ids_json TEXT"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("portal_state", "room_type", "room_type TEXT"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("portal_state", "username", "username TEXT"); err != nil {
 		return err
 	}
 
@@ -259,34 +281,52 @@ func (s *Store) GetAPISyncState(userID string) (*APISyncState, error) {
 }
 
 func (s *Store) UpsertPortal(state PortalState) error {
-	_, err := s.db.Exec(`
-		INSERT INTO portal_state (portal_key, remote_id, remote_name, other_user_id, preview, last_message, unread, last_synced_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+	if len(state.ParticipantIDs) == 0 && strings.TrimSpace(state.OtherUserID) != "" {
+		state.ParticipantIDs = []string{strings.TrimSpace(state.OtherUserID)}
+	}
+	participantIDs, err := json.Marshal(state.ParticipantIDs)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`
+		INSERT INTO portal_state (portal_key, remote_id, remote_name, other_user_id, participant_ids_json, room_type, username, preview, last_message, unread, last_synced_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 		ON CONFLICT(portal_key) DO UPDATE SET
 			remote_id=excluded.remote_id,
 			remote_name=excluded.remote_name,
-			other_user_id=excluded.other_user_id,
+			other_user_id=COALESCE(NULLIF(excluded.other_user_id, ''), portal_state.other_user_id),
+			participant_ids_json=CASE
+				WHEN excluded.participant_ids_json IS NULL OR excluded.participant_ids_json = '' OR excluded.participant_ids_json = '[]' OR excluded.participant_ids_json = 'null'
+					THEN portal_state.participant_ids_json
+				ELSE excluded.participant_ids_json
+			END,
+			room_type=COALESCE(NULLIF(excluded.room_type, ''), portal_state.room_type),
+			username=COALESCE(NULLIF(excluded.username, ''), portal_state.username),
 			preview=excluded.preview,
 			last_message=excluded.last_message,
 			unread=excluded.unread,
 			last_synced_at=CURRENT_TIMESTAMP
-	`, state.PortalKey, state.RemoteID, state.RemoteName, state.OtherUserID, state.Preview, state.LastMessage, state.Unread)
+	`, state.PortalKey, state.RemoteID, state.RemoteName, state.OtherUserID, string(participantIDs), state.RoomType, state.Username, state.Preview, state.LastMessage, state.Unread)
 	return err
 }
 
 func (s *Store) GetPortalByKey(portalKey string) (*PortalState, error) {
 	row := s.db.QueryRow(`
-		SELECT portal_key, remote_id, remote_name, COALESCE(other_user_id, ''), preview, last_message, unread, last_synced_at
+		SELECT portal_key, remote_id, remote_name, COALESCE(other_user_id, ''), COALESCE(participant_ids_json, '[]'), COALESCE(room_type, ''), COALESCE(username, ''), preview, last_message, unread, last_synced_at
 		FROM portal_state
 		WHERE portal_key = ?
 	`, portalKey)
 
 	var state PortalState
+	var participantIDsJSON string
 	err := row.Scan(
 		&state.PortalKey,
 		&state.RemoteID,
 		&state.RemoteName,
 		&state.OtherUserID,
+		&participantIDsJSON,
+		&state.RoomType,
+		&state.Username,
 		&state.Preview,
 		&state.LastMessage,
 		&state.Unread,
@@ -298,22 +338,27 @@ func (s *Store) GetPortalByKey(portalKey string) (*PortalState, error) {
 	if err != nil {
 		return nil, err
 	}
+	decodeParticipantIDs(participantIDsJSON, &state)
 	return &state, nil
 }
 
 func (s *Store) GetPortalByRemoteID(remoteID string) (*PortalState, error) {
 	row := s.db.QueryRow(`
-		SELECT portal_key, remote_id, remote_name, COALESCE(other_user_id, ''), preview, last_message, unread, last_synced_at
+		SELECT portal_key, remote_id, remote_name, COALESCE(other_user_id, ''), COALESCE(participant_ids_json, '[]'), COALESCE(room_type, ''), COALESCE(username, ''), preview, last_message, unread, last_synced_at
 		FROM portal_state
 		WHERE remote_id = ?
 	`, remoteID)
 
 	var state PortalState
+	var participantIDsJSON string
 	err := row.Scan(
 		&state.PortalKey,
 		&state.RemoteID,
 		&state.RemoteName,
 		&state.OtherUserID,
+		&participantIDsJSON,
+		&state.RoomType,
+		&state.Username,
 		&state.Preview,
 		&state.LastMessage,
 		&state.Unread,
@@ -325,12 +370,13 @@ func (s *Store) GetPortalByRemoteID(remoteID string) (*PortalState, error) {
 	if err != nil {
 		return nil, err
 	}
+	decodeParticipantIDs(participantIDsJSON, &state)
 	return &state, nil
 }
 
 func (s *Store) ListPortals() ([]PortalState, error) {
 	rows, err := s.db.Query(`
-		SELECT portal_key, remote_id, remote_name, COALESCE(other_user_id, ''), preview, last_message, unread, last_synced_at
+		SELECT portal_key, remote_id, remote_name, COALESCE(other_user_id, ''), COALESCE(participant_ids_json, '[]'), COALESCE(room_type, ''), COALESCE(username, ''), preview, last_message, unread, last_synced_at
 		FROM portal_state
 		ORDER BY last_synced_at DESC
 	`)
@@ -342,11 +388,15 @@ func (s *Store) ListPortals() ([]PortalState, error) {
 	var result []PortalState
 	for rows.Next() {
 		var state PortalState
+		var participantIDsJSON string
 		err = rows.Scan(
 			&state.PortalKey,
 			&state.RemoteID,
 			&state.RemoteName,
 			&state.OtherUserID,
+			&participantIDsJSON,
+			&state.RoomType,
+			&state.Username,
 			&state.Preview,
 			&state.LastMessage,
 			&state.Unread,
@@ -355,10 +405,18 @@ func (s *Store) ListPortals() ([]PortalState, error) {
 		if err != nil {
 			return nil, err
 		}
+		decodeParticipantIDs(participantIDsJSON, &state)
 		result = append(result, state)
 	}
 
 	return result, rows.Err()
+}
+
+func decodeParticipantIDs(raw string, state *PortalState) {
+	if state == nil || raw == "" {
+		return
+	}
+	_ = json.Unmarshal([]byte(raw), &state.ParticipantIDs)
 }
 
 func (s *Store) UpsertMessages(states []MessageState) error {

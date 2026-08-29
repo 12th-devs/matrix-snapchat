@@ -14,6 +14,7 @@ import (
 
 type Config struct {
 	CookieString        string
+	SSOToken            string
 	SelfUserID          string
 	UserAgent           string
 	SnapClientUserAgent string
@@ -50,7 +51,10 @@ type State struct {
 type Chat struct {
 	ID             string
 	OtherUserID    string
+	ParticipantIDs []string
+	IsGroup        bool
 	Name           string
+	Username       string
 	AvatarURL      string
 	Preview        string
 	LastMessage    string
@@ -117,15 +121,16 @@ type Client struct {
 	mcsCOFIDsBin      string
 	eelDecrypter      EELDecrypter
 
-	mu               sync.Mutex
-	selfUserID       string
-	selfEncoded      *protos.UUID
-	conversations    map[string]*protos.Conversation
-	conversationIDs  map[string]*protos.UUID
-	namesByUserID    map[string]string
-	avatarsByUserID  map[string]string
-	profileCheckedAt map[string]time.Time
-	failedEEL        map[string]time.Time
+	mu                sync.Mutex
+	selfUserID        string
+	selfEncoded       *protos.UUID
+	conversations     map[string]*protos.Conversation
+	conversationIDs   map[string]*protos.UUID
+	namesByUserID     map[string]string
+	usernamesByUserID map[string]string
+	avatarsByUserID   map[string]string
+	profileCheckedAt  map[string]time.Time
+	failedEEL         map[string]time.Time
 }
 
 const minPublicProfileRefreshInterval = 24 * time.Hour
@@ -153,7 +158,7 @@ func New(cfg Config) (*Client, error) {
 	}
 	client := &Client{
 		cookies:           cookies,
-		tokens:            &types.SnapTokens{},
+		tokens:            &types.SnapTokens{SSO_TOKEN: strings.TrimSpace(cfg.SSOToken)},
 		http:              &http.Client{Timeout: cfg.Timeout},
 		device:            types.NewDevice(),
 		sessionCookieName: sessionCookieName,
@@ -167,6 +172,7 @@ func New(cfg Config) (*Client, error) {
 		conversations:     make(map[string]*protos.Conversation),
 		conversationIDs:   make(map[string]*protos.UUID),
 		namesByUserID:     make(map[string]string),
+		usernamesByUserID: make(map[string]string),
 		avatarsByUserID:   make(map[string]string),
 		profileCheckedAt:  make(map[string]time.Time),
 		failedEEL:         make(map[string]time.Time),
@@ -183,6 +189,7 @@ func New(cfg Config) (*Client, error) {
 }
 
 type publicProfile struct {
+	Username  string
 	Name      string
 	AvatarURL string
 }
@@ -190,6 +197,7 @@ type publicProfile struct {
 // PublicProfile is the safe subset of Snapchat profile data that bridge code may expose.
 type PublicProfile struct {
 	UserID    string
+	Username  string
 	Name      string
 	AvatarURL string
 }

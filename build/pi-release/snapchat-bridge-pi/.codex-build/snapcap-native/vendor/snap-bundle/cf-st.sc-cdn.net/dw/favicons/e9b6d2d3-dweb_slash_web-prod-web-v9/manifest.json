@@ -1,0 +1,94 @@
+{
+  "name": "Snapchat",
+  "short_name": "Snapchat",
+  "description": "Snapchat is a fast and fun way to share the moment with your friends and family 👻",
+  "dir": "auto",
+  "lang": "en-US",
+  "display": "standalone",
+  "orientation": "landscape",
+  "scope": "https://www.snapchat.com/web",
+  "start_url": "https://www.snapchat.com/web",
+  "background_color": "#FFFC00",
+  "theme_color": "#fff",
+  "icons": [
+    {
+      "src": "android-chrome-36x36.png",
+      "sizes": "36x36",
+      "type": "image/png"
+    },
+    {
+      "src": "android-chrome-48x48.png",
+      "sizes": "48x48",
+      "type": "image/png"
+    },
+    {
+      "src": "android-chrome-72x72.png",
+      "sizes": "72x72",
+      "type": "image/png"
+    },
+    {
+      "src": "android-chrome-96x96.png",
+      "sizes": "96x96",
+      "type": "image/png"
+    },
+    {
+      "src": "android-chrome-144x144.png",
+      "sizes": "144x144",
+      "type": "image/png"
+    },
+    {
+      "src": "android-chrome-192x192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "android-chrome-256x256.png",
+      "sizes": "256x256",
+      "type": "image/png"
+    },
+    {
+      "src": "android-chrome-384x384.png",
+      "sizes": "384x384",
+      "type": "image/png"
+    },
+    {
+      "src": "android-chrome-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ],
+  "gcm_sender_id": "191410808405",
+  "related_applications": [
+    {
+      "platform": "play",
+      "url": "https://play.google.com/store/apps/details?id=com.snapchat.android"
+    },
+    {
+      "platform": "itunes",
+      "url": "https://apps.apple.com/us/app/snapchat/id447188370"
+    },
+    {
+      "platform": "windows",
+      "url": "https://apps.microsoft.com/detail/9pf9rtkmmq69"
+    }
+  ],
+  "prefer_related_applications": true,
+  "share_target": {
+    "action": "https://www.snapchat.com/web/_share-target",
+    "enctype": "multipart/form-data",
+    "method": "POST",
+    "params": {
+      "files": [
+        {
+          "name": "media",
+          "accept": [
+            "image/jpeg",
+            ".jpeg",
+            "image/png",
+            ".png"
+          ]
+        }
+      ]
+    }
+  }
+}

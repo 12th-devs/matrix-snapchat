@@ -186,6 +186,9 @@ func stableMediaID(parts ...string) string {
 }
 
 func detectMediaMime(data []byte, kind MediaKind) string {
+	if mimeType := mediaMagicMime(data); mimeType != "" {
+		return mimeType
+	}
 	detected := http.DetectContentType(data)
 	if detected != "application/octet-stream" {
 		return detected
@@ -199,6 +202,27 @@ func detectMediaMime(data []byte, kind MediaKind) string {
 		return "image/gif"
 	default:
 		return detected
+	}
+}
+
+func mediaMagicMime(data []byte) string {
+	switch {
+	case len(data) >= 3 && data[0] == 0xff && data[1] == 0xd8 && data[2] == 0xff:
+		return "image/jpeg"
+	case len(data) >= 3 && data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4e:
+		return "image/png"
+	case len(data) >= 6 && string(data[4:6]) == "ft":
+		return "video/mp4"
+	case len(data) >= 4 && data[0] == 0x00 && data[1] == 0x00 && data[2] == 0x00 && data[3] == 0x1c:
+		return "video/mp4"
+	case len(data) >= 4 && string(data[:4]) == "RIFF":
+		return "audio/wav"
+	case len(data) >= 3 && string(data[:3]) == "ID3":
+		return "audio/mpeg"
+	case len(data) >= 2 && data[0] == 0xff && (data[1] == 0xfb || data[1] == 0xf3 || data[1] == 0xf2):
+		return "audio/mpeg"
+	default:
+		return ""
 	}
 }
 

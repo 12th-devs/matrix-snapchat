@@ -1,0 +1,83 @@
+{
+  "name": "@snapcap/native",
+  "version": "0.0.1",
+  "description": "Browser-free Snap client. Runs Snap's web JavaScript and WASM directly in Node via shimmed Chrome APIs. Multi-account-friendly, no Playwright/Chromium overhead.",
+  "license": "MIT",
+  "homepage": "https://codingbutter.github.io/snapcap-native",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/codingbutter/snapcap-native.git"
+  },
+  "bugs": {
+    "url": "https://github.com/codingbutter/snapcap-native/issues"
+  },
+  "keywords": [
+    "snapchat",
+    "snap",
+    "client",
+    "sdk",
+    "web-grpc",
+    "automation"
+  ],
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "scripts/install-bundle.sh",
+    "scripts/refresh-bundle.sh",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test --path-ignore-patterns='**/bringup.test.ts' --path-ignore-patterns='**/presence-bridge-init.test.ts' && bun test tests/api/messaging/bringup.test.ts tests/api/messaging/presence-bridge-init.test.ts",
+    "lint:no-singletons": "bash scripts/lint-no-singletons.sh",
+    "install:bundle": "bash scripts/install-bundle.sh",
+    "release:bundle": "bash scripts/release-bundle.sh",
+    "refresh:bundle": "bash scripts/refresh-bundle.sh",
+    "init:repo": "bash scripts/worktree-init.sh",
+    "init:worktree": "bash scripts/worktree-init.sh",
+    "docs:api": "typedoc",
+    "docs:api:check": "typedoc --emit none",
+    "docs:update": "bash scripts/update-docs.sh",
+    "install-hooks": "bash scripts/install-hooks.sh",
+    "prepublishOnly": "pnpm build"
+  },
+  "snapcap": {
+    "bundle": {
+      "version": "2026-05-05",
+      "release_tag": "bundle-2026-05-05",
+      "asset": "snap-bundle.tar.gz",
+      "sha256": "2894bf6af195ca0eb723283a14c3470bfac5dd23f401f9a0ce24026e03236463",
+      "repo": "CodingButter/snapcap-native"
+    }
+  },
+  "dependencies": {
+    "happy-dom": "^15.0.0",
+    "tough-cookie": "^5.0.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/ws": "^8.5.0",
+    "knip": "^6.11.0",
+    "typedoc": "^0.28.19",
+    "typedoc-plugin-frontmatter": "^1.3.1",
+    "typedoc-plugin-markdown": "^4.11.0",
+    "typedoc-plugin-mdn-links": "^5.1.1",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "bun": ">=1.3.0",
+    "node": ">=22"
+  }
+}

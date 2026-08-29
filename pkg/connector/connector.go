@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -45,6 +46,27 @@ func (sc *SnapchatConnector) Init(bridge *bridgev2.Bridge) {
 }
 
 func (sc *SnapchatConnector) Start(ctx context.Context) error {
+	if baseURL := strings.TrimSpace(os.Getenv("SNAPCHAT_CONNECTOR_BASE_URL")); baseURL != "" {
+		sc.Config.BaseURL = baseURL
+	}
+	if sharedSecret := strings.TrimSpace(os.Getenv("SNAPCHAT_CONNECTOR_SHARED_SECRET")); sharedSecret != "" {
+		sc.Config.SharedSecret = sharedSecret
+	}
+	if err := applyBoolEnv("SNAPCHAT_READ_RECEIPTS_ENABLED", &sc.Config.ReadReceiptsEnabled); err != nil {
+		return err
+	}
+	if err := applyBoolEnv("SNAPCHAT_TYPING_ENABLED", &sc.Config.TypingEnabled); err != nil {
+		return err
+	}
+	if err := applyBoolEnv("SNAPCHAT_SNAP_MEDIA_ENABLED", &sc.Config.SnapMediaEnabled); err != nil {
+		return err
+	}
+	if err := applyBoolEnv("SNAPCHAT_SNAP_MEDIA_ON_READ", &sc.Config.SnapMediaOnRead); err != nil {
+		return err
+	}
+	if err := applyBoolEnv("SNAPCHAT_SEND_MEDIA_ENABLED", &sc.Config.SendMediaEnabled); err != nil {
+		return err
+	}
 	if sc.Config.StateDBPath == "" {
 		sc.Config.StateDBPath = "./data/bridgev2-state.sqlite"
 	}
@@ -57,6 +79,19 @@ func (sc *SnapchatConnector) Start(ctx context.Context) error {
 	}
 	sc.store = stateStore
 	sc.ensureNetworkIcon(ctx)
+	return nil
+}
+
+func applyBoolEnv(name string, target *bool) error {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return nil
+	}
+	value, err := strconv.ParseBool(raw)
+	if err != nil {
+		return fmt.Errorf("parse %s: %w", name, err)
+	}
+	*target = value
 	return nil
 }
 
@@ -205,7 +240,7 @@ func (sc *SnapchatConnector) pollInterval() time.Duration {
 func (sc *SnapchatConnector) apiMode() string {
 	mode := strings.ToLower(strings.TrimSpace(sc.Config.APIMode))
 	switch mode {
-	case "api_only", "dom_only":
+	case "api_only", "dom_only", "hybrid":
 		return mode
 	default:
 		return "auto"
@@ -242,11 +277,12 @@ func (sc *SnapchatConnector) resetSyncState() error {
 
 func (sc *SnapchatConnector) chatCapabilities() *event.RoomFeatures {
 	features := &event.RoomFeatures{
-		ID:            "fi.mau.snapchat.capabilities.2026_05_21",
-		MaxTextLength: 5000,
-		Edit:          event.CapLevelRejected,
-		Delete:        event.CapLevelRejected,
-		ReadReceipts:  sc != nil && sc.Config.ReadReceiptsEnabled,
+		ID:                  "fi.mau.snapchat.capabilities.2026_05_21",
+		MaxTextLength:       5000,
+		Edit:                event.CapLevelRejected,
+		Delete:              event.CapLevelRejected,
+		ReadReceipts:        sc != nil && sc.Config.ReadReceiptsEnabled,
+		TypingNotifications: sc != nil && sc.Config.TypingEnabled,
 		DisappearingTimer: &event.DisappearingTimerCapability{
 			Types:          []event.DisappearingType{event.DisappearingTypeAfterSend},
 			OmitEmptyTimer: true,

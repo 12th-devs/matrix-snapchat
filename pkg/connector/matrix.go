@@ -101,6 +101,10 @@ func (sa *SnapchatAPI) HandleMatrixReadReceipt(ctx context.Context, receipt *bri
 		log.Printf("bridgev2 receipts: no API message id available chat_id=%s read_up_to=%s", chatID, receipt.ReadUpTo.Format(time.RFC3339))
 		return nil
 	}
+	if !sa.shouldSendReadReceiptToSnapchat(chatID, messageID, hasExactTarget) {
+		log.Printf("bridgev2 receipts: skipping unsafe/non-chat read receipt chat_id=%s message_id=%d exact=%t", chatID, messageID, hasExactTarget)
+		return nil
+	}
 	client, err := sa.ensureSnapClient(ctx)
 	if err != nil {
 		log.Printf("bridgev2 receipts: API client unavailable chat_id=%s message_id=%d: %v", chatID, messageID, err)
@@ -113,6 +117,50 @@ func (sa *SnapchatAPI) HandleMatrixReadReceipt(ctx context.Context, receipt *bri
 	}
 	log.Printf("bridgev2 receipts: marked Snapchat read via API chat_id=%s message_id=%d version=%d", chatID, messageID, version)
 	return nil
+}
+
+func (sa *SnapchatAPI) HandleMatrixTyping(ctx context.Context, msg *bridgev2.MatrixTyping) error {
+	if msg == nil || msg.Portal == nil || !sa.typingEnabled() {
+		return nil
+	}
+	if msg.Type != bridgev2.TypingTypeText {
+		return nil
+	}
+	chatID := string(msg.Portal.ID)
+	if chatID == "" {
+		return nil
+	}
+	if !sa.useAPI() {
+		log.Printf("bridgev2 typing: skipping non-API typing side effects chat_id=%s typing=%t", chatID, msg.IsTyping)
+		return nil
+	}
+	// The bridgev2 hook is intentionally wired before advertising typing by
+	// default. The actual Snapchat call should come from the snapcap-native
+	// setTyping path (presence-out.ts) once the sidecar can boot that bundle
+	// reliably from the logged-in browser session.
+	log.Printf("bridgev2 typing: received Matrix typing event, Snapchat API adapter not enabled yet chat_id=%s typing=%t", chatID, msg.IsTyping)
+	return nil
+}
+
+func (sa *SnapchatAPI) shouldSendReadReceiptToSnapchat(chatID string, messageID int64, exactTarget bool) bool {
+	if messageID <= 0 {
+		return false
+	}
+	state := sa.lookupStoredMessage(chatID, fmt.Sprintf("%d", messageID))
+	if state == nil && exactTarget {
+		return false
+	}
+	if state == nil {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(state.Kind)) {
+	case "snap", "media":
+		return false
+	}
+	if state.HasMedia {
+		return false
+	}
+	return true
 }
 
 func (sa *SnapchatAPI) hydrateSnapMediaFromReadReceipt(ctx context.Context, chatID string, receipt *bridgev2.MatrixReadReceipt) {

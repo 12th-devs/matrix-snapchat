@@ -37,30 +37,66 @@ func (sa *SnapchatAPI) markSeen(chatName, messageID string) {
 }
 
 func (sa *SnapchatAPI) rememberChat(chatID, chatURL, chatName, otherUserID string) {
-	chatID = strings.TrimSpace(chatID)
+	sa.rememberChatDetails(sidecar.Chat{
+		ID:          chatID,
+		URL:         chatURL,
+		Name:        chatName,
+		OtherUserID: otherUserID,
+	})
+}
+
+func (sa *SnapchatAPI) rememberChatDetails(chat sidecar.Chat) {
+	chatID := strings.TrimSpace(chat.ID)
 	if chatID == "" {
 		return
 	}
+	otherUserID := strings.TrimSpace(chat.OtherUserID)
 	sa.mu.Lock()
 	defer sa.mu.Unlock()
 	ref := sa.chatsByID[chatID]
 	ref.ID = chatID
-	if strings.TrimSpace(chatURL) != "" {
-		ref.URL = chatURL
+	if strings.TrimSpace(chat.URL) != "" {
+		ref.URL = chat.URL
 	}
-	if strings.TrimSpace(chatName) != "" {
-		ref.Name = chatName
+	if strings.TrimSpace(chat.Name) != "" {
+		ref.Name = chat.Name
 	}
-	if strings.TrimSpace(otherUserID) != "" {
+	if otherUserID != "" {
 		if ref.OtherUserID != otherUserID {
 			delete(sa.queuedPortalResyncs, chatID)
 		}
 		ref.OtherUserID = otherUserID
 	}
+	if len(chat.ParticipantIDs) > 0 {
+		ref.ParticipantIDs = append([]string{}, chat.ParticipantIDs...)
+		ref.IsGroup = len(chat.ParticipantIDs) > 1
+		if ref.IsGroup {
+			ref.OtherUserID = ""
+		}
+	}
+	if len(ref.ParticipantIDs) == 0 && otherUserID != "" {
+		ref.ParticipantIDs = []string{otherUserID}
+	}
+	if chat.IsGroup {
+		ref.IsGroup = true
+		ref.OtherUserID = ""
+	}
+	if strings.TrimSpace(chat.Username) != "" {
+		ref.Username = strings.TrimSpace(chat.Username)
+		if ref.OtherUserID != "" {
+			sa.ghostUsernames[string(makeUserID(ref.OtherUserID))] = ref.Username
+		}
+	}
+	if chat.DisappearAfterSeconds > 0 {
+		ref.DisappearAfterSeconds = chat.DisappearAfterSeconds
+	}
 	sa.chatsByID[chatID] = ref
-	log.Printf("bridgev2 map: remembered chat chat_id=%s other_user_id=%s name=%q url=%q", chatID, ref.OtherUserID, ref.Name, ref.URL)
+	log.Printf("bridgev2 map: remembered chat chat_id=%s other_user_id=%s participants=%d is_group=%t username=%q name=%q url=%q", chatID, ref.OtherUserID, len(ref.ParticipantIDs), ref.IsGroup, ref.Username, ref.Name, ref.URL)
 	if ref.Name != "" && ref.OtherUserID != "" {
 		sa.rememberGhostNameLocked(makeUserID(ref.OtherUserID), ref.Name)
+		if ref.Username != "" {
+			sa.ghostUsernames[string(makeUserID(ref.OtherUserID))] = ref.Username
+		}
 	} else if ref.Name != "" {
 		sa.rememberGhostNameLocked(makeUserID(ref.ID), ref.Name)
 	}
@@ -108,6 +144,23 @@ func (sa *SnapchatAPI) lookupGhostName(userID networkid.UserID) string {
 	sa.mu.Lock()
 	defer sa.mu.Unlock()
 	return sa.ghostNames[string(userID)]
+}
+
+func (sa *SnapchatAPI) rememberGhostUsername(userID networkid.UserID, username string) {
+	id := strings.TrimSpace(string(userID))
+	username = strings.TrimSpace(username)
+	if id == "" || username == "" {
+		return
+	}
+	sa.mu.Lock()
+	defer sa.mu.Unlock()
+	sa.ghostUsernames[id] = username
+}
+
+func (sa *SnapchatAPI) lookupGhostUsername(userID networkid.UserID) string {
+	sa.mu.Lock()
+	defer sa.mu.Unlock()
+	return sa.ghostUsernames[string(userID)]
 }
 
 func (sa *SnapchatAPI) recordRecentOutgoing(chatID, body, remoteID string) {
@@ -159,8 +212,12 @@ func (sa *SnapchatAPI) shouldSuppressOutgoingEcho(chatID string, message sidecar
 		if item.SentAt.Before(cutoff) {
 			continue
 		}
-		if !suppressed && ((item.RemoteID != "" && remoteID != "" && item.RemoteID == remoteID) || (item.Body != "" && body != "" && item.Body == body)) {
-			suppressed = true
+		if !suppressed {
+			if item.RemoteID != "" && remoteID != "" && item.RemoteID == remoteID {
+				suppressed = true
+			} else if item.Body != "" && body != "" && item.Body == body && now.Sub(item.SentAt) <= 90*time.Second {
+				suppressed = true
+			}
 		}
 		filtered = append(filtered, item)
 	}
@@ -282,11 +339,26 @@ func (sa *SnapchatAPI) lookupChat(chatID string) sidecar.Chat {
 		return sidecar.Chat{}
 	}
 	return sidecar.Chat{
-		ID:          ref.ID,
-		OtherUserID: ref.OtherUserID,
-		URL:         ref.URL,
-		Name:        ref.Name,
+		ID:             ref.ID,
+		OtherUserID:    ref.OtherUserID,
+		ParticipantIDs: append([]string{}, ref.ParticipantIDs...),
+		IsGroup:        ref.IsGroup,
+		URL:            ref.URL,
+		Name:           ref.Name,
+		Username:       ref.Username,
 	}
+}
+
+func (sa *SnapchatAPI) lookupChatRef(chatID string) chatRef {
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return chatRef{}
+	}
+	sa.mu.Lock()
+	defer sa.mu.Unlock()
+	ref := sa.chatsByID[chatID]
+	ref.ParticipantIDs = append([]string{}, ref.ParticipantIDs...)
+	return ref
 }
 
 func (sa *SnapchatAPI) shouldSyncFromReadReceipt(chatID string) bool {
@@ -311,6 +383,35 @@ func (sa *SnapchatAPI) markSidebarBaselineReady() {
 	sa.mu.Lock()
 	sa.sidebarBaselineReady = true
 	sa.mu.Unlock()
+}
+
+// claimSidebarBaseline atomically reserves the one-time baseline reconciliation.
+// Polls can overlap while a large Matrix portal sync is still being processed, so
+// reading the flag and setting it after the loop is not sufficient.
+func (sa *SnapchatAPI) claimSidebarBaseline() bool {
+	sa.mu.Lock()
+	defer sa.mu.Unlock()
+	if sa.sidebarBaselineReady {
+		return false
+	}
+	sa.sidebarBaselineReady = true
+	return true
+}
+
+func (sa *SnapchatAPI) completeSidebarBaseline() {
+	sa.mu.Lock()
+	sa.sidebarBaselineAt = time.Now()
+	sa.mu.Unlock()
+}
+
+func (sa *SnapchatAPI) claimHybridBackfill(delay time.Duration) bool {
+	sa.mu.Lock()
+	defer sa.mu.Unlock()
+	if sa.hybridBackfillStarted || sa.sidebarBaselineAt.IsZero() || time.Since(sa.sidebarBaselineAt) < delay {
+		return false
+	}
+	sa.hybridBackfillStarted = true
+	return true
 }
 
 func (sa *SnapchatAPI) requestTimeout() time.Duration {
@@ -350,6 +451,10 @@ func (sa *SnapchatAPI) autoFetchMessagesEnabled() bool {
 
 func (sa *SnapchatAPI) readReceiptsEnabled() bool {
 	return sa != nil && sa.Connector != nil && sa.Connector.Config.ReadReceiptsEnabled
+}
+
+func (sa *SnapchatAPI) typingEnabled() bool {
+	return sa != nil && sa.Connector != nil && sa.Connector.Config.TypingEnabled
 }
 
 func (sa *SnapchatAPI) snapMediaEnabled() bool {
@@ -415,6 +520,7 @@ func (sa *SnapchatAPI) ensureSnapClient(ctx context.Context) (*snapapi.Client, e
 
 	client, err = snapapi.New(snapapi.Config{
 		CookieString:        cookieString,
+		SSOToken:            auth.SSOToken,
 		SelfUserID:          selfUserID,
 		UserAgent:           auth.BrowserUserAgent,
 		SnapClientUserAgent: auth.SnapClientUserAgent,
@@ -533,6 +639,7 @@ func (sa *SnapchatAPI) resetSyncState() {
 	sa.seenByChat = make(map[string]map[string]struct{})
 	sa.chatsByID = make(map[string]chatRef)
 	sa.ghostNames = make(map[string]string)
+	sa.ghostUsernames = make(map[string]string)
 	sa.chatState = make(map[string]string)
 	sa.lastMessageID = make(map[string]int64)
 	sa.lastMessageVersion = make(map[string]int64)
@@ -543,26 +650,56 @@ func (sa *SnapchatAPI) resetSyncState() {
 	sa.ghostAvatarCheckedAt = make(map[string]time.Time)
 	sa.queuedPortalResyncs = make(map[string]struct{})
 	sa.sidebarBaselineReady = false
+	sa.sidebarBaselineAt = time.Time{}
+	sa.hybridBackfillStarted = false
 	sa.mu.Unlock()
 	if sa.Connector != nil {
 		_ = sa.Connector.resetSyncState()
 	}
 }
 
-func (sa *SnapchatAPI) persistChat(chatID, chatName, otherUserID, preview, lastMessage string, unread bool) {
+func (sa *SnapchatAPI) persistChat(chat sidecar.Chat) {
 	if sa.Connector == nil || sa.Connector.store == nil {
 		return
 	}
-	_ = sa.Connector.store.UpsertPortal(store.PortalState{
-		PortalKey:    chatID,
-		RemoteID:     chatID,
-		RemoteName:   chatName,
-		OtherUserID:  strings.TrimSpace(otherUserID),
-		Preview:      preview,
-		LastMessage:  lastMessage,
-		Unread:       unread,
-		LastSyncedAt: time.Now(),
-	})
+	if ref := sa.lookupChatRef(chat.ID); ref.ID != "" {
+		if strings.TrimSpace(chat.OtherUserID) == "" {
+			chat.OtherUserID = ref.OtherUserID
+		}
+		if len(chat.ParticipantIDs) == 0 && len(ref.ParticipantIDs) > 0 {
+			chat.ParticipantIDs = append([]string{}, ref.ParticipantIDs...)
+		}
+		if strings.TrimSpace(chat.Username) == "" {
+			chat.Username = ref.Username
+		}
+		if !chat.IsGroup {
+			chat.IsGroup = ref.IsGroup
+		}
+	}
+	participantIDs := append([]string{}, chat.ParticipantIDs...)
+	otherUserID := strings.TrimSpace(chat.OtherUserID)
+	if len(participantIDs) == 0 && otherUserID != "" {
+		participantIDs = []string{otherUserID}
+	}
+	roomType := "dm"
+	if chat.IsGroup || len(participantIDs) > 1 {
+		roomType = "group_dm"
+	}
+	if err := sa.Connector.store.UpsertPortal(store.PortalState{
+		PortalKey:      chat.ID,
+		RemoteID:       chat.ID,
+		RemoteName:     chat.Name,
+		OtherUserID:    otherUserID,
+		ParticipantIDs: participantIDs,
+		RoomType:       roomType,
+		Username:       strings.TrimSpace(chat.Username),
+		Preview:        chat.Preview,
+		LastMessage:    chat.LastMessage,
+		Unread:         chat.Unread,
+		LastSyncedAt:   time.Now(),
+	}); err != nil {
+		log.Printf("bridgev2 sync: failed to persist chat metadata chat_id=%s name=%q: %v", chat.ID, chat.Name, err)
+	}
 }
 
 func (sa *SnapchatAPI) updateLoginState(status *sidecar.SessionStatus) {

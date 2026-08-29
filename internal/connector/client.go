@@ -31,14 +31,17 @@ type SessionStatus struct {
 }
 
 type Chat struct {
-	ID                    string `json:"id"`
-	OtherUserID           string `json:"otherUserId,omitempty"`
-	URL                   string `json:"url,omitempty"`
-	Name                  string `json:"name"`
-	Preview               string `json:"preview,omitempty"`
-	Unread                bool   `json:"unread"`
-	LastMessage           string `json:"lastMessage,omitempty"`
-	DisappearAfterSeconds int64  `json:"disappearAfterSeconds,omitempty"`
+	ID                    string   `json:"id"`
+	OtherUserID           string   `json:"otherUserId,omitempty"`
+	ParticipantIDs        []string `json:"participantIds,omitempty"`
+	IsGroup               bool     `json:"isGroup,omitempty"`
+	URL                   string   `json:"url,omitempty"`
+	Name                  string   `json:"name"`
+	Username              string   `json:"username,omitempty"`
+	Preview               string   `json:"preview,omitempty"`
+	Unread                bool     `json:"unread"`
+	LastMessage           string   `json:"lastMessage,omitempty"`
+	DisappearAfterSeconds int64    `json:"disappearAfterSeconds,omitempty"`
 }
 
 type Message struct {
@@ -105,6 +108,7 @@ type APIAuth struct {
 	State               string `json:"state"`
 	Authenticated       bool   `json:"authenticated"`
 	CookieString        string `json:"cookieString"`
+	SSOToken            string `json:"ssoToken,omitempty"`
 	SelfUserID          string `json:"selfUserID,omitempty"`
 	Username            string `json:"username,omitempty"`
 	DisplayName         string `json:"displayName,omitempty"`

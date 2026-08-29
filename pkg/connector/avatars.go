@@ -37,6 +37,9 @@ func (sa *SnapchatAPI) avatarForGhost(ctx context.Context, ghostID networkid.Use
 	if profile.Name != "" {
 		sa.rememberGhostName(ghostID, profile.Name)
 	}
+	if profile.Username != "" {
+		sa.rememberGhostUsername(ghostID, profile.Username)
+	}
 	sa.rememberSnapAvatarURL(snapUserID, profile.AvatarURL)
 	return sa.avatarFromURL(snapUserID, profile.AvatarURL)
 }

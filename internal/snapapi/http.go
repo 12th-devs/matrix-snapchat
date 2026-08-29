@@ -26,6 +26,13 @@ func (c *Client) doGRPC(ctx context.Context, endpoint string, req proto.Message,
 	if err != nil {
 		return err
 	}
+	if len(body) >= 5 && body[0]&0x80 != 0 {
+		trailerLength := int(body[1])<<24 | int(body[2])<<16 | int(body[3])<<8 | int(body[4])
+		if trailerLength <= len(body)-5 {
+			trailer := strings.TrimSpace(string(body[5 : 5+trailerLength]))
+			return fmt.Errorf("grpc error from %s: %s", endpoint, trailer)
+		}
+	}
 	if err = protos.DecodeGRPCProtoMessage(body, target); err != nil {
 		return fmt.Errorf("decode grpc response from %s len=%d: %w", endpoint, len(body), err)
 	}

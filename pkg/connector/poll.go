@@ -5,9 +5,11 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"log"
+	"strings"
 	"time"
 
 	sidecar "github.com/colej/mautrix-snapchat/internal/connector"
+	"github.com/colej/mautrix-snapchat/internal/snapapi"
 )
 
 func (sa *SnapchatAPI) pollLoop(ctx context.Context) {
@@ -31,6 +33,10 @@ func (sa *SnapchatAPI) pollOnce(ctx context.Context) {
 		log.Printf("bridgev2 sync: skipping poll because user login is not fully initialized label=%s", sa.Label)
 		return
 	}
+	if sa.Connector.apiMode() == "hybrid" {
+		sa.pollOnceDOM(ctx)
+		return
+	}
 	if !sa.useAPI() {
 		log.Printf("bridgev2 sync: skipping DOM poll in no-open mode label=%s api_mode=%s", sa.Label, sa.Connector.apiMode())
 		return
@@ -50,20 +56,109 @@ func (sa *SnapchatAPI) pollOnceDOM(ctx context.Context) {
 		return
 	}
 	chats = dedupeChatsByName(chats)
+	chats = sa.enrichSidebarChatsFromAPI(ctx, chats)
 	log.Printf("bridgev2 sync: fetched %d chats for label=%s", len(chats), sa.Label)
 	sidebarUpdates := 0
-	baselineReady := sa.isSidebarBaselineReady()
+	baselineReady := !sa.claimSidebarBaseline()
 	for _, chat := range chats {
-		sa.rememberChat(chat.ID, chat.URL, chat.Name, chat.OtherUserID)
-		sa.persistChat(chat.ID, chat.Name, chat.OtherUserID, chat.Preview, chat.LastMessage, chat.Unread)
-		sa.queueChatResync(ctx, chat.ID, chat.Name)
+		sa.rememberChatDetails(chat)
+		sa.persistChat(chat)
+		if !baselineReady {
+			sa.queueChatResync(ctx, chat.ID, chat.Name)
+		}
 		if fingerprint, ok := sa.shouldQueueSidebarUpdate(chat, baselineReady); ok {
 			sa.queueSidebarUpdate(chat, fingerprint)
 			sidebarUpdates++
 		}
 	}
-	sa.markSidebarBaselineReady()
+	if !baselineReady {
+		sa.completeSidebarBaseline()
+	} else if sa.autoFetchMessagesEnabled() && sa.claimHybridBackfill(30*time.Second) {
+		log.Printf("bridgev2 sync: starting delayed hybrid message backfill label=%s", sa.Label)
+		maxHybridBackfillChats := sa.messageSyncLimitPerPoll(false)
+		synced := 0
+		for _, chat := range chats {
+			if synced >= maxHybridBackfillChats || ctx.Err() != nil {
+				break
+			}
+			if err := sa.syncChatMessagesAPI(ctx, chat, 0, "delayed hybrid sidebar backfill", false, false); err != nil {
+				log.Printf("bridgev2 sync: delayed hybrid message backfill failed chat=%q id=%s: %v", chat.Name, chat.ID, err)
+				continue
+			}
+			synced++
+		}
+		log.Printf("bridgev2 sync: delayed hybrid message backfilled %d current chats for label=%s", synced, sa.Label)
+	}
 	log.Printf("bridgev2 sync: queued %d sidebar update notices for label=%s", sidebarUpdates, sa.Label)
+}
+
+func (sa *SnapchatAPI) enrichSidebarChatsFromAPI(ctx context.Context, chats []sidecar.Chat) []sidecar.Chat {
+	if len(chats) == 0 || !sa.useAPI() {
+		return chats
+	}
+	needsIdentity := false
+	for _, chat := range chats {
+		if strings.TrimSpace(chat.ID) != "" && strings.TrimSpace(chat.OtherUserID) == "" {
+			needsIdentity = true
+			break
+		}
+	}
+	if !needsIdentity {
+		return chats
+	}
+
+	client, err := sa.ensureSnapClient(ctx)
+	if err != nil {
+		log.Printf("bridgev2 sync: sidebar identity enrichment skipped, API client unavailable: %v", err)
+		return chats
+	}
+	result, err := client.Sync(ctx, snapapi.State{}, sa.conversationFetchLimit())
+	if err != nil {
+		sa.invalidateSnapClient()
+		log.Printf("bridgev2 sync: sidebar identity enrichment failed: %v", err)
+		return chats
+	}
+
+	byID := make(map[string]sidecar.Chat, len(result.Chats))
+	for _, apiChat := range result.Chats {
+		chat := connectorChatFromAPI(apiChat)
+		if strings.TrimSpace(chat.ID) == "" {
+			continue
+		}
+		byID[chat.ID] = chat
+	}
+
+	enriched := 0
+	for i := range chats {
+		if strings.TrimSpace(chats[i].ID) == "" {
+			continue
+		}
+		apiChat, ok := byID[chats[i].ID]
+		if !ok {
+			continue
+		}
+		if strings.TrimSpace(chats[i].OtherUserID) == "" && strings.TrimSpace(apiChat.OtherUserID) != "" {
+			chats[i].OtherUserID = apiChat.OtherUserID
+			enriched++
+		}
+		if len(apiChat.ParticipantIDs) > 0 {
+			chats[i].ParticipantIDs = append([]string{}, apiChat.ParticipantIDs...)
+			chats[i].IsGroup = apiChat.IsGroup || len(apiChat.ParticipantIDs) > 1
+			if chats[i].IsGroup {
+				chats[i].OtherUserID = ""
+			}
+		}
+		if strings.TrimSpace(chats[i].Username) == "" && strings.TrimSpace(apiChat.Username) != "" {
+			chats[i].Username = apiChat.Username
+		}
+		if chats[i].DisappearAfterSeconds <= 0 && apiChat.DisappearAfterSeconds > 0 {
+			chats[i].DisappearAfterSeconds = apiChat.DisappearAfterSeconds
+		}
+	}
+	if enriched > 0 {
+		log.Printf("bridgev2 sync: enriched %d sidebar chats with Snapchat API identity metadata", enriched)
+	}
+	return chats
 }
 
 func (sa *SnapchatAPI) pollOnceAPI(ctx context.Context) error {
@@ -88,12 +183,13 @@ func (sa *SnapchatAPI) pollOnceAPI(ctx context.Context) error {
 	if firstSync {
 		maxPortalResyncsPerPoll = 100
 	}
-	const maxMessageSyncsPerPoll = 3
+	maxMessageSyncsPerPoll := sa.messageSyncLimitPerPoll(firstSync)
+	limitedMessageSyncs := 0
 	for idx, apiChat := range result.Chats {
 		chat := connectorChatFromAPI(apiChat)
-		sa.rememberChat(chat.ID, chat.URL, chat.Name, chat.OtherUserID)
+		sa.rememberChatDetails(chat)
 		sa.rememberChatDisappear(chat.ID, chat.DisappearAfterSeconds)
-		sa.persistChat(chat.ID, chat.Name, chat.OtherUserID, chat.Preview, chat.LastMessage, chat.Unread)
+		sa.persistChat(chat)
 		_, changed := result.ChangedChatIDs[chat.ID]
 		if (!baselineReady || changed) && portalResyncs < maxPortalResyncsPerPoll {
 			sa.queueChatResync(ctx, chat.ID, chat.Name)
@@ -106,7 +202,7 @@ func (sa *SnapchatAPI) pollOnceAPI(ctx context.Context) error {
 
 		if sa.autoFetchMessagesEnabled() {
 			shouldFetch := changed && !firstSync
-			if firstSync && (idx < 3 || chat.Unread) {
+			if firstSync && (idx < maxMessageSyncsPerPoll || chat.Unread) {
 				shouldFetch = true
 				initialFetches++
 			}
@@ -117,14 +213,30 @@ func (sa *SnapchatAPI) pollOnceAPI(ctx context.Context) error {
 				} else {
 					messageSyncs++
 				}
+			} else if shouldFetch {
+				limitedMessageSyncs++
 			}
 		}
 	}
 	sa.saveAPISyncState(result.State)
 	sa.markSidebarBaselineReady()
-	log.Printf("bridgev2 sync: API fetched %d chats, synced %d chats, resynced %d portals, queued %d sidebar notices, first_sync=%t initial_fetches=%d auto_fetch_messages=%t label=%s",
-		len(result.Chats), messageSyncs, portalResyncs, sidebarUpdates, firstSync, initialFetches, sa.autoFetchMessagesEnabled(), sa.Label)
+	log.Printf("bridgev2 sync: API fetched %d chats, synced %d chats, limited %d changed chats, resynced %d portals, queued %d sidebar notices, first_sync=%t initial_fetches=%d auto_fetch_messages=%t label=%s",
+		len(result.Chats), messageSyncs, limitedMessageSyncs, portalResyncs, sidebarUpdates, firstSync, initialFetches, sa.autoFetchMessagesEnabled(), sa.Label)
 	return nil
+}
+
+func (sa *SnapchatAPI) messageSyncLimitPerPoll(firstSync bool) int {
+	limit := sa.messageFetchLimit()
+	if limit < 8 {
+		limit = 8
+	}
+	if firstSync && limit < 20 {
+		limit = 20
+	}
+	if limit > 40 {
+		limit = 40
+	}
+	return limit
 }
 
 func (sa *SnapchatAPI) selectPollTargets(chats []sidecar.Chat) []sidecar.Chat {

@@ -261,18 +261,25 @@ func (c *Client) chatFromEntry(entry *protos.ConversationEntry) Chat {
 	id := uuidToString(entry.GetVersionInfo().GetConversationId())
 	name := strings.TrimSpace(entry.GetTitle())
 	otherUserID := ""
+	username := ""
+	participants := make([]string, 0, len(entry.GetParticipants()))
 	nonSelfParticipants := 0
 	for _, participant := range entry.GetParticipants() {
 		userID := uuidToString(participant)
 		if userID == "" || userID == c.SelfUserID() {
 			continue
 		}
+		participants = append(participants, userID)
 		nonSelfParticipants++
 		if otherUserID == "" {
 			otherUserID = userID
+			username = c.lookupUsername(userID)
 		}
 		if name == "" {
 			name = c.lookupName(userID)
+			if name == "" {
+				name = c.lookupUsername(userID)
+			}
 			if name == "" {
 				name = shortID(userID)
 			}
@@ -280,6 +287,7 @@ func (c *Client) chatFromEntry(entry *protos.ConversationEntry) Chat {
 	}
 	if nonSelfParticipants != 1 {
 		otherUserID = ""
+		username = ""
 	}
 	if name == "" {
 		name = shortID(id)
@@ -293,7 +301,10 @@ func (c *Client) chatFromEntry(entry *protos.ConversationEntry) Chat {
 	return Chat{
 		ID:             id,
 		OtherUserID:    otherUserID,
+		ParticipantIDs: participants,
+		IsGroup:        nonSelfParticipants > 1,
 		Name:           name,
+		Username:       username,
 		AvatarURL:      c.lookupAvatarURL(otherUserID),
 		Preview:        preview,
 		LastMessage:    preview,

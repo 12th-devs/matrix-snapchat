@@ -102,7 +102,7 @@ func (sa *SnapchatAPI) syncChatMessagesAPI(ctx context.Context, chat sidecar.Cha
 			}
 		}
 		sa.rememberAPIMessage(chat.ID, apiMessage)
-		if existing := sa.lookupStoredMessage(chat.ID, baseRemoteID); existing != nil && existing.Text != "" && existing.Text != message.Text {
+		if existing := sa.lookupStoredMessage(chat.ID, baseRemoteID); shouldQueueMessageEdit(existing, message) {
 			log.Printf("bridgev2 edit: API message text changed, queueing Matrix edit chat_id=%s message_id=%s kind=%s old_len=%d new_len=%d", chat.ID, baseRemoteID, messageKindFromAPI(apiMessage), len(existing.Text), len(message.Text))
 			sa.queueRemoteMessageEdit(chat, baseRemoteID, message)
 		} else {
@@ -126,6 +126,24 @@ func (sa *SnapchatAPI) syncChatMessagesAPI(ctx context.Context, chat sidecar.Cha
 	return nil
 }
 
+func shouldQueueMessageEdit(existing *store.MessageState, message sidecar.Message) bool {
+	if existing == nil {
+		return false
+	}
+	oldText := strings.TrimSpace(existing.Text)
+	newText := strings.TrimSpace(message.Text)
+	if oldText == "" || newText == "" || oldText == newText {
+		return false
+	}
+	// Media hydration edits are queued explicitly by hydrateSnapMediaFromReadReceipt.
+	// During ordinary API sync, keep snap placeholders stable unless the update is
+	// plain text replacing a previous undecoded/plain placeholder.
+	if existing.HasMedia || existing.Kind == "media" || existing.Kind == "snap" {
+		return false
+	}
+	return true
+}
+
 func (sa *SnapchatAPI) queueRemoteMessage(chat sidecar.Chat, message sidecar.Message) {
 	if sa.UserLogin == nil || sa.UserLogin.Bridge == nil || chat.ID == "" || message.ID == "" {
 		return
@@ -143,7 +161,7 @@ func (sa *SnapchatAPI) queueRemoteMessage(chat sidecar.Chat, message sidecar.Mes
 	}
 	sa.markSeen(chat.ID, message.ID)
 	copyMsg := message
-	sa.rememberChat(chat.ID, chat.URL, chat.Name, chat.OtherUserID)
+	sa.rememberChatDetails(chat)
 	if !message.Outgoing {
 		if strings.TrimSpace(message.AuthorID) != "" {
 			sa.rememberGhostName(makeUserID(message.AuthorID), message.Author)
@@ -158,11 +176,10 @@ func (sa *SnapchatAPI) queueRemoteMessage(chat sidecar.Chat, message sidecar.Mes
 		Sender:   senderID,
 	}
 	if message.Outgoing {
-		// Leave Sender empty for from-me events. If Sender is set to
-		// browser-session, bridgev2 creates/uses a ghost before checking
-		// IsFromMe, which makes Snapchat UI sends appear as received messages
-		// from @sh-snapchat_browser-session in Beeper.
-		sender.Sender = ""
+		// Keep the remote sender tied to the login while marking it as from-me.
+		// SenderLogin makes bridgev2 send as the logged-in Matrix user, while
+		// Sender gives the database a stable remote sender for dedupe/storage.
+		sender.Sender = makeUserID(sa.Label)
 		sender.SenderLogin = makeUserLoginID(sa.Label)
 	}
 	if strings.HasPrefix(message.ID, "sidebar-") {
@@ -200,7 +217,7 @@ func (sa *SnapchatAPI) queueRemoteMessageEdit(chat sidecar.Chat, targetMessageID
 	}
 	message = sa.normalizeRemoteMessageDirection(chat.ID, message)
 	copyMsg := message
-	sa.rememberChat(chat.ID, chat.URL, chat.Name, chat.OtherUserID)
+	sa.rememberChatDetails(chat)
 	sa.rememberChatDisappear(chat.ID, chat.DisappearAfterSeconds)
 	if !message.Outgoing {
 		if strings.TrimSpace(message.AuthorID) != "" {
@@ -215,7 +232,7 @@ func (sa *SnapchatAPI) queueRemoteMessageEdit(chat sidecar.Chat, targetMessageID
 		Sender:   sa.messageSenderID(chat, message),
 	}
 	if message.Outgoing {
-		sender.Sender = ""
+		sender.Sender = makeUserID(sa.Label)
 		sender.SenderLogin = makeUserLoginID(sa.Label)
 	}
 	portalKey := networkid.PortalKey{

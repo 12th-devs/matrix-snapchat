@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/colej/mautrix-snapchat/internal/config"
@@ -113,14 +114,28 @@ func (a *App) pollConnector(ctx context.Context) {
 		chats, chatErr := a.connector.ListChats(ctx)
 		if chatErr == nil {
 			for _, chat := range chats {
+				participantIDs := append([]string{}, chat.ParticipantIDs...)
+				otherUserID := strings.TrimSpace(chat.OtherUserID)
+				if len(participantIDs) == 0 && otherUserID != "" {
+					participantIDs = []string{otherUserID}
+				}
+				roomType := "dm"
+				if chat.IsGroup || len(participantIDs) > 1 {
+					roomType = "group_dm"
+					otherUserID = ""
+				}
 				_ = a.store.UpsertPortal(store.PortalState{
-					PortalKey:    chat.Name,
-					RemoteID:     chat.ID,
-					RemoteName:   chat.Name,
-					Preview:      chat.Preview,
-					LastMessage:  chat.LastMessage,
-					Unread:       chat.Unread,
-					LastSyncedAt: time.Now(),
+					PortalKey:      chat.Name,
+					RemoteID:       chat.ID,
+					RemoteName:     chat.Name,
+					OtherUserID:    otherUserID,
+					ParticipantIDs: participantIDs,
+					RoomType:       roomType,
+					Username:       strings.TrimSpace(chat.Username),
+					Preview:        chat.Preview,
+					LastMessage:    chat.LastMessage,
+					Unread:         chat.Unread,
+					LastSyncedAt:   time.Now(),
 				})
 			}
 		}

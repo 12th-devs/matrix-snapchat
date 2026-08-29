@@ -128,6 +128,57 @@ func TestMessageBodyClearTextEELChatText(t *testing.T) {
 	}
 }
 
+func TestMessageBodyFullEELUsesMessageNonceBeforeCEKIV(t *testing.T) {
+	contentBytes, err := protos.EncodeProtoMessage(&protos.Contents{
+		Content: &protos.Contents_Text{
+			Text: &protos.Text{Text: "hello from eel nonce"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	key := []byte("0123456789abcdef0123456789abcdef")
+	messageNonce := []byte("123456789012")
+	cekIV := []byte("abcdefghijkl")
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encrypted := gcm.Seal(nil, messageNonce, contentBytes, nil)
+
+	decrypter := &fakeEELDecrypter{err: errors.New("helper should not be called")}
+	body, isSnap := (&Client{eelDecrypter: decrypter}).messageBody(context.Background(), "chat-1", &protos.ContentMessage{
+		MessageId: 790,
+		Contents: &protos.ContentEnvelope{
+			ContentType: protos.ContentType_CHAT,
+			Contents:    encrypted,
+			EnvelopeEncryption: &protos.EnvelopeEncryption{
+				Method: &protos.EnvelopeEncryption_EelEncryption{
+					EelEncryption: &protos.EelEncryption{
+						Cek:   key,
+						CekIv: cekIV,
+						Nonce: messageNonce,
+					},
+				},
+			},
+		},
+	})
+	if body != "hello from eel nonce" {
+		t.Fatalf("body = %q, want decoded full EEL text using message nonce", body)
+	}
+	if isSnap {
+		t.Fatal("full EEL nonce text was marked as snap")
+	}
+	if decrypter.calls != 0 {
+		t.Fatalf("helper calls = %d, want 0", decrypter.calls)
+	}
+}
+
 type fakeEELDecrypter struct {
 	output []byte
 	err    error
@@ -181,6 +232,69 @@ func TestMessageBodyFullEELHelperChatText(t *testing.T) {
 	}
 }
 
+func TestMessageBodyFullEELHelperPlaintextChatText(t *testing.T) {
+	decrypter := &fakeEELDecrypter{output: []byte("hello from raw fidelius")}
+
+	body, isSnap := (&Client{eelDecrypter: decrypter}).messageBody(context.Background(), "chat-1", &protos.ContentMessage{
+		MessageId: 905,
+		Contents: &protos.ContentEnvelope{
+			ContentType: protos.ContentType_CHAT,
+			Contents:    []byte{0x01, 0x02},
+			EnvelopeEncryption: &protos.EnvelopeEncryption{
+				Method: &protos.EnvelopeEncryption_EelEncryption{
+					EelEncryption: &protos.EelEncryption{
+						CekIv:           []byte("123456789012"),
+						Nonce:           []byte("abcdefghijklmnop"),
+						SenderPublicKey: []byte("sender-public-key-placeholder"),
+						SenderVersion:   7,
+					},
+				},
+			},
+		},
+	})
+	if body != "hello from raw fidelius" {
+		t.Fatalf("body = %q, want raw decrypted Fidelius text", body)
+	}
+	if isSnap {
+		t.Fatal("raw decrypted Fidelius text was marked as snap")
+	}
+	if decrypter.calls != 1 {
+		t.Fatalf("helper calls = %d, want 1", decrypter.calls)
+	}
+}
+
+func TestMessageBodyFullEELHelperALEAPPMessageContentPath(t *testing.T) {
+	decrypted := protoBytesField(4, protoBytesField(4, protoBytesField(2, protoBytesField(1, []byte("hello from modern message content")))))
+	decrypter := &fakeEELDecrypter{output: decrypted}
+
+	body, isSnap := (&Client{eelDecrypter: decrypter}).messageBody(context.Background(), "chat-1", &protos.ContentMessage{
+		MessageId: 906,
+		Contents: &protos.ContentEnvelope{
+			ContentType: protos.ContentType_CHAT,
+			Contents:    []byte{0x01, 0x02},
+			EnvelopeEncryption: &protos.EnvelopeEncryption{
+				Method: &protos.EnvelopeEncryption_EelEncryption{
+					EelEncryption: &protos.EelEncryption{
+						CekIv:           []byte("123456789012"),
+						Nonce:           []byte("abcdefghijklmnop"),
+						SenderPublicKey: []byte("sender-public-key-placeholder"),
+						SenderVersion:   7,
+					},
+				},
+			},
+		},
+	})
+	if body != "hello from modern message content" {
+		t.Fatalf("body = %q, want decoded modern message_content text", body)
+	}
+	if isSnap {
+		t.Fatal("modern message_content text was marked as snap")
+	}
+	if decrypter.calls != 1 {
+		t.Fatalf("helper calls = %d, want 1", decrypter.calls)
+	}
+}
+
 func TestMessageBodyFullEELHelperFailureFallsBackToUnavailableNotice(t *testing.T) {
 	decrypter := &fakeEELDecrypter{err: errors.New("key unavailable")}
 	body, isSnap := (&Client{eelDecrypter: decrypter}).messageBody(context.Background(), "chat-1", &protos.ContentMessage{
@@ -208,6 +322,20 @@ func TestMessageBodyFullEELHelperFailureFallsBackToUnavailableNotice(t *testing.
 	}
 }
 
+func protoBytesField(field int, value []byte) []byte {
+	out := appendProtoVarint(nil, uint64(field<<3|2))
+	out = appendProtoVarint(out, uint64(len(value)))
+	return append(out, value...)
+}
+
+func appendProtoVarint(out []byte, value uint64) []byte {
+	for value >= 0x80 {
+		out = append(out, byte(value)|0x80)
+		value >>= 7
+	}
+	return append(out, byte(value))
+}
+
 func TestMessageFromProtoExternalMediaIsNotSnap(t *testing.T) {
 	msg := (&Client{}).messageFromProto(context.Background(), "chat-1", &protos.ContentMessage{
 		MessageId: 902,
@@ -229,5 +357,56 @@ func TestMessageFromProtoExternalMediaIsNotSnap(t *testing.T) {
 	}
 	if msg.Text != "Media" {
 		t.Fatalf("external media body = %q, want Media", msg.Text)
+	}
+}
+
+func TestDetectMediaMimeUsesSnapchatMagicBytes(t *testing.T) {
+	tests := []struct {
+		name string
+		data []byte
+		want string
+	}{
+		{
+			name: "jpeg",
+			data: []byte{0xff, 0xd8, 0xff, 0xe0},
+			want: "image/jpeg",
+		},
+		{
+			name: "png",
+			data: []byte{0x89, 0x50, 0x4e, 0x47},
+			want: "image/png",
+		},
+		{
+			name: "mp4-ftyp",
+			data: []byte{0x00, 0x00, 0x00, 0x18, 'f', 't', 'y', 'p'},
+			want: "video/mp4",
+		},
+		{
+			name: "snap-video-header",
+			data: []byte{0x00, 0x00, 0x00, 0x1c, 0x12, 0x34},
+			want: "video/mp4",
+		},
+		{
+			name: "wav",
+			data: []byte{'R', 'I', 'F', 'F', 0x24, 0x00},
+			want: "audio/wav",
+		},
+		{
+			name: "mp3-id3",
+			data: []byte{'I', 'D', '3', 0x04},
+			want: "audio/mpeg",
+		},
+		{
+			name: "mp3-frame-sync",
+			data: []byte{0xff, 0xfb, 0x90, 0x64},
+			want: "audio/mpeg",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := detectMediaMime(tt.data, MediaKindFile); got != tt.want {
+				t.Fatalf("detectMediaMime() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
