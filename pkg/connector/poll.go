@@ -4,12 +4,23 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
+	"errors"
 	"log"
 	"strings"
 	"time"
 
 	sidecar "github.com/colej/mautrix-snapchat/internal/connector"
 	"github.com/colej/mautrix-snapchat/internal/snapapi"
+)
+
+// Dead-session handling: after this many consecutive 401/403 responses the
+// messaging session is treated as dead and we stop hammering Snapchat, surfacing
+// a clear re-login-required state instead. A recovery check still runs at
+// reLoginRecoveryInterval so a successful re-login resumes sync automatically.
+const (
+	reLoginUnauthorizedThreshold = 6
+	reLoginRecoveryInterval      = 30 * time.Second
+	reLoginLogInterval           = 60 * time.Second
 )
 
 func (sa *SnapchatAPI) pollLoop(ctx context.Context) {
@@ -161,17 +172,94 @@ func (sa *SnapchatAPI) enrichSidebarChatsFromAPI(ctx context.Context, chats []si
 	return chats
 }
 
+// recordSyncFailure counts consecutive unauthorized (401/403) sync failures and,
+// once the bounded threshold is reached, marks the messaging session as dead and
+// surfaces a clear re-login-required state instead of letting 403 polling continue.
+func (sa *SnapchatAPI) recordSyncFailure(err error, now time.Time) {
+	if !errors.Is(err, snapapi.ErrUnauthorized) {
+		// A non-auth failure is transient; don't count it toward the dead-session
+		// threshold, but don't clear an already-confirmed dead state either (re-login
+		// recovery clears it once Sync succeeds again).
+		return
+	}
+	sa.apiMu.Lock()
+	sa.consecutiveUnauthorized++
+	consec := sa.consecutiveUnauthorized
+	alreadyDead := sa.reLoginRequired
+	// Always push the next recovery check out so a confirmed-dead session is
+	// retried at most once per recovery interval, never hot-looped at poll rate.
+	sa.nextRecoveryCheckAt = now.Add(reLoginRecoveryInterval)
+	transitioned := !alreadyDead && consec >= reLoginUnauthorizedThreshold
+	if transitioned {
+		sa.reLoginRequired = true
+	}
+	sa.apiMu.Unlock()
+
+	if transitioned {
+		status := sidecar.SessionStatus{
+			State:           "re_login_required",
+			Authenticated:   false,
+			ReLoginRequired: true,
+			Message:         "Snapchat messaging session is no longer valid. Re-login in the open Snapchat browser window/profile to resume syncing.",
+		}
+		sa.updateLoginState(&status)
+		log.Printf("bridgev2 sync: SNAPCHAT RE-LOGIN REQUIRED label=%s consecutive_unauthorized=%d - messaging session is dead; use the open Snapchat window to log back in", sa.Label, consec)
+	} else if !alreadyDead {
+		log.Printf("bridgev2 sync: API unauthorized label=%s consecutive=%d/%d (not yet dead)", sa.Label, consec, reLoginUnauthorizedThreshold)
+	}
+}
+
+// recordSyncSuccess clears the dead-session state so a recovered session resumes
+// normal syncing automatically.
+func (sa *SnapchatAPI) recordSyncSuccess(now time.Time) {
+	sa.apiMu.Lock()
+	wasDead := sa.reLoginRequired
+	sa.consecutiveUnauthorized = 0
+	sa.reLoginRequired = false
+	sa.nextRecoveryCheckAt = time.Time{}
+	sa.apiMu.Unlock()
+	if wasDead {
+		log.Printf("bridgev2 sync: SNAPCHAT SESSION RECOVERED label=%s - messaging session restored, resuming sync", sa.Label)
+		sa.updateLoginState(&sidecar.SessionStatus{
+			State:           "ready",
+			Authenticated:   true,
+			ReLoginRequired: false,
+		})
+	}
+}
+
+// syncSuppressed reports whether the dead-session gate should skip this poll:
+// a confirmed-dead session waits for the recovery interval before one bounded
+// retry, so repeated 403s never hammer Snapchat at poll rate.
+func (sa *SnapchatAPI) syncSuppressed(now time.Time) bool {
+	sa.apiMu.Lock()
+	defer sa.apiMu.Unlock()
+	return sa.reLoginRequired && now.Before(sa.nextRecoveryCheckAt)
+}
+
 func (sa *SnapchatAPI) pollOnceAPI(ctx context.Context) error {
+	now := time.Now()
+	if sa.syncSuppressed(now) {
+		// Session is confirmed dead; wait for the recovery interval before the
+		// next attempt so we stop the repeated 403 polling.
+		return nil
+	}
+
 	client, err := sa.ensureSnapClient(ctx)
 	if err != nil {
+		// Auth-layer failures (surface here before any Sync call) feed the same
+		// dead-session state machine; unrelated errors stay neutral.
+		sa.recordSyncFailure(err, now)
 		return err
 	}
 	prevState := sa.loadAPISyncState()
 	result, err := client.Sync(ctx, prevState, sa.conversationFetchLimit())
 	if err != nil {
 		sa.invalidateSnapClient()
+		sa.recordSyncFailure(err, now)
 		return err
 	}
+	sa.recordSyncSuccess(now)
 
 	firstSync := len(prevState.SyncToken) == 0 && len(prevState.ConversationVersions) == 0
 	baselineReady := sa.isSidebarBaselineReady()
@@ -190,6 +278,7 @@ func (sa *SnapchatAPI) pollOnceAPI(ctx context.Context) error {
 		sa.rememberChatDetails(chat)
 		sa.rememberChatDisappear(chat.ID, chat.DisappearAfterSeconds)
 		sa.persistChat(chat)
+		sa.syncReadWatermarks(chat)
 		_, changed := result.ChangedChatIDs[chat.ID]
 		if (!baselineReady || changed) && portalResyncs < maxPortalResyncsPerPoll {
 			sa.queueChatResync(ctx, chat.ID, chat.Name)

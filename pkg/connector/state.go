@@ -373,6 +373,23 @@ func (sa *SnapchatAPI) shouldSyncFromReadReceipt(chatID string) bool {
 	return true
 }
 
+func (sa *SnapchatAPI) claimTypingUpdate(chatID string, typing bool, minInterval time.Duration) bool {
+	if sa == nil || chatID == "" {
+		return false
+	}
+	now := time.Now()
+	sa.mu.Lock()
+	defer sa.mu.Unlock()
+	if sa.lastTypingSent == nil {
+		sa.lastTypingSent = make(map[string]typingUpdateState)
+	}
+	if last, ok := sa.lastTypingSent[chatID]; ok && last.Typing == typing && now.Sub(last.SentAt) < minInterval {
+		return false
+	}
+	sa.lastTypingSent[chatID] = typingUpdateState{Typing: typing, SentAt: now}
+	return true
+}
+
 func (sa *SnapchatAPI) isSidebarBaselineReady() bool {
 	sa.mu.Lock()
 	defer sa.mu.Unlock()
@@ -499,7 +516,19 @@ func (sa *SnapchatAPI) ensureSnapClient(ctx context.Context) (*snapapi.Client, e
 	}
 	savedState := sa.loadAPISyncState()
 	selfUserID := strings.TrimSpace(auth.SelfUserID)
+	if selfUserID == "" {
+		return nil, fmt.Errorf("connector API auth did not return Snapchat self user id; wait for browser messenger warmup and retry")
+	}
+	if strings.TrimSpace(auth.SSOToken) == "" {
+		return nil, fmt.Errorf("connector API auth did not return Snapchat SSO token; wait for browser messenger warmup and retry")
+	}
+	if strings.TrimSpace(auth.MCSCOFIDsBin) == "" {
+		return nil, fmt.Errorf("connector API auth did not return messenger headers; wait for browser messenger warmup and retry")
+	}
 	if selfUserID != "" {
+		sa.mu.Lock()
+		sa.apiSelfUserID = selfUserID
+		sa.mu.Unlock()
 		savedSelfUserID := strings.TrimSpace(savedState.SelfUserID)
 		if savedSelfUserID != "" && !strings.EqualFold(savedSelfUserID, selfUserID) {
 			log.Printf("bridgev2 sync: Snapchat account changed, resetting API sync state old_self=%s new_self=%s label=%s", savedSelfUserID, selfUserID, sa.Label)
@@ -558,12 +587,12 @@ func (sa *SnapchatAPI) invalidateSnapClient() {
 	sa.apiMu.Unlock()
 }
 
-func (sa *SnapchatAPI) sendTextAPI(ctx context.Context, chatID, body string) (string, error) {
+func (sa *SnapchatAPI) sendTextAPI(ctx context.Context, chatID, body string, replyToMessageID int64) (string, error) {
 	client, err := sa.ensureSnapClient(ctx)
 	if err != nil {
 		return "", err
 	}
-	messageID, err := client.SendText(ctx, chatID, body)
+	messageID, err := client.SendText(ctx, chatID, body, replyToMessageID)
 	if err != nil {
 		sa.invalidateSnapClient()
 	} else if seconds := int64(client.RetentionDuration(chatID) / time.Second); seconds > 0 {

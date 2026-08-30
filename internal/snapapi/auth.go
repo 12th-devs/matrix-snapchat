@@ -12,6 +12,10 @@ import (
 	"github.com/0xzer/snapper/payload"
 )
 
+// webGraphQLURL is a package-level seam so tests can point the identity query
+// at a local server; production always uses the real WEB_GRAPHQL_URL constant.
+var webGraphQLURL = paths.WEB_GRAPHQL_URL
+
 func (c *Client) Authenticate(ctx context.Context) error {
 	if c.tokens.SSO_TOKEN == "" {
 		token, err := c.fetchSSOToken(ctx)
@@ -74,7 +78,7 @@ func (c *Client) fetchSelf(ctx context.Context) error {
 	header := headers.NewDefaultHeaders(c.cookies, c.tokens, true)
 	c.applyUserAgentHeaders(header)
 	header.Set("content-type", "application/json")
-	body, err := c.doHTTP(ctx, paths.WEB_GRAPHQL_URL, http.MethodPost, header, payload.USER_QUERY)
+	body, err := c.doHTTP(ctx, webGraphQLURL, http.MethodPost, header, payload.USER_QUERY)
 	if err != nil {
 		return err
 	}
@@ -88,6 +92,13 @@ func (c *Client) fetchSelf(ctx context.Context) error {
 		} `json:"data"`
 	}
 	if err = json.Unmarshal(body, &resp); err != nil {
+		// A dead web session makes Snapchat answer the identity query with an
+		// HTML page (login/error) instead of JSON. Classify that at the auth
+		// layer so the dead-session state machine can act on it; other decode
+		// failures stay neutral.
+		if strings.HasPrefix(strings.TrimSpace(string(body)), "<") {
+			return fmt.Errorf("%w: identity query returned HTML instead of JSON (%d bytes)", ErrUnauthorized, len(body))
+		}
 		return err
 	}
 	if resp.Data.User.ID == "" {

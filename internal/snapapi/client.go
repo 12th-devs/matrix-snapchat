@@ -62,6 +62,10 @@ type Chat struct {
 	Version        int64
 	LastActivityAt time.Time
 	DisappearAfter time.Duration
+	// ReadWatermarks maps participant Snapchat user ID -> last-read message ID
+	// (ReadHighWatermark) from the hydrated conversation object. Absent/zero
+	// entries mean the participant has not read anything.
+	ReadWatermarks map[string]int64
 }
 
 type MediaKind string
@@ -99,6 +103,12 @@ type Message struct {
 	// DisappearAfter mirrors Snapchat's per-conversation retention timer for
 	// unsaved messages. Saved messages intentionally leave this unset.
 	DisappearAfter time.Duration
+	// QuotedMessageID is the numeric Snapchat message this message replies to
+	// (from MessageMetadata.QuotedMetadata), 0 when not a reply.
+	QuotedMessageID int64
+	// Tombstone marks a message that was erased/unsent on Snapchat
+	// (MessageMetadata.Tombstone): it should be removed, not displayed.
+	Tombstone bool
 }
 
 type SyncResult struct {
@@ -130,6 +140,7 @@ type Client struct {
 	usernamesByUserID map[string]string
 	avatarsByUserID   map[string]string
 	profileCheckedAt  map[string]time.Time
+	eelPlaintext      map[string][]byte
 	failedEEL         map[string]time.Time
 }
 
@@ -175,6 +186,7 @@ func New(cfg Config) (*Client, error) {
 		usernamesByUserID: make(map[string]string),
 		avatarsByUserID:   make(map[string]string),
 		profileCheckedAt:  make(map[string]time.Time),
+		eelPlaintext:      make(map[string][]byte),
 		failedEEL:         make(map[string]time.Time),
 	}
 	if selfUserID := strings.TrimSpace(cfg.SelfUserID); selfUserID != "" {

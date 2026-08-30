@@ -3,6 +3,7 @@ package snapapi
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -13,11 +14,11 @@ import (
 	"github.com/google/uuid"
 )
 
-func (c *Client) SendText(ctx context.Context, chatID, text string) (string, error) {
+func (c *Client) SendText(ctx context.Context, chatID, text string, replyToMessageID int64) (string, error) {
 	if err := c.ensureAuthenticated(ctx); err != nil {
 		return "", err
 	}
-	conv, err := c.conversation(ctx, chatID)
+	conv, err := c.conversationFresh(ctx, chatID)
 	if err != nil {
 		return "", err
 	}
@@ -59,8 +60,17 @@ func (c *Client) SendText(ctx context.Context, chatID, text string) (string, err
 			SendMessageAttemptId: &protos.UUID{EncodedId: attemptID},
 		},
 	}
+	if replyToMessageID > 0 {
+		// Snapchat replies are sent as a feature attachment referencing the
+		// quoted message ID (the same shape the web client sends).
+		req.FeatureAttachment = []*protos.FeatureAttachment{{
+			Attachment: &protos.FeatureAttachment_ReplyMessageInfo{
+				ReplyMessageInfo: &protos.ReplyMessageInfo{QuotedMessageId: replyToMessageID},
+			},
+		}}
+	}
 	var resp protos.CreateContentMessageResponse
-	if err = c.doGRPC(ctx, paths.CREATE_CONTENT_MESSAGE, req, &resp); err != nil {
+	if err = c.doGRPC(ctx, createContentMessageURL, req, &resp); err != nil {
 		return "", err
 	}
 	for _, result := range resp.GetResult() {
@@ -89,7 +99,7 @@ func (c *Client) SendMedia(ctx context.Context, chatID string, media MediaAttach
 	if err != nil {
 		return "", err
 	}
-	conv, err := c.conversation(ctx, chatID)
+	conv, err := c.conversationFresh(ctx, chatID)
 	if err != nil {
 		return "", err
 	}
@@ -162,16 +172,22 @@ func (c *Client) MarkRead(ctx context.Context, chatID string, messageID int64, v
 	if err := c.ensureAuthenticated(ctx); err != nil {
 		return err
 	}
-	conv, err := c.conversation(ctx, chatID)
+	conv, err := c.conversationFresh(ctx, chatID)
 	if err != nil {
 		return err
 	}
-	if version <= 0 {
-		version = conv.GetVersion()
+	// UpdateContentMessage requires the conversation's CURRENT version. The
+	// version carried by receipt metadata was captured when the message was
+	// received and is stale by read time, which made Snapchat reject the read
+	// update (success=false). Prefer the version from the freshly synced
+	// conversation; the receipt version is only a fallback.
+	currentVersion := conv.GetVersion()
+	if currentVersion <= 0 {
+		currentVersion = version
 	}
 	req := &protos.UpdateContentMessageRequest{
 		ClientResolutionId: randomUint64(),
-		CurrentVersion:     version,
+		CurrentVersion:     currentVersion,
 		Update: &protos.UpdateAction{
 			MessageId:       messageID,
 			SenderId:        c.selfUUID(),
@@ -181,11 +197,59 @@ func (c *Client) MarkRead(ctx context.Context, chatID string, messageID int64, v
 		},
 	}
 	var resp protos.UpdateContentMessageResponse
-	if err = c.doGRPC(ctx, paths.UPDATE_CONTENT_MESSAGE, req, &resp); err != nil {
+	if err = c.doGRPC(ctx, updateContentMessageURL, req, &resp); err != nil {
 		return err
 	}
 	if !resp.GetSuccess() && !resp.GetRetryable() {
 		return fmt.Errorf("snapchat api read receipt failed")
+	}
+	return nil
+}
+
+// EraseMessage unsends/deletes a Snapchat message (UpdateAction_Erase, the
+// operation Snapchat Web uses for "unsend"). Like MarkRead it uses the
+// conversation's CURRENT version, which Snapchat requires.
+//
+// A delete is only treated as successful when the server explicitly confirms
+// Success=true. Retryable failures are reported as errors (never treated as
+// success) so a destructive unsend is never claimed without server commit.
+func (c *Client) EraseMessage(ctx context.Context, chatID string, messageID int64) error {
+	if messageID <= 0 {
+		return nil
+	}
+	if err := c.ensureAuthenticated(ctx); err != nil {
+		return err
+	}
+	conv, err := c.conversationFresh(ctx, chatID)
+	if err != nil {
+		return err
+	}
+	req := &protos.UpdateContentMessageRequest{
+		ClientResolutionId: randomUint64(),
+		CurrentVersion:     conv.GetVersion(),
+		Update: &protos.UpdateAction{
+			MessageId:       messageID,
+			SenderId:        c.selfUUID(),
+			ConversationId:  conv.GetConversationId(),
+			UpdateTimestamp: time.Now().UnixMilli(),
+			Update:          &protos.UpdateAction_Erase{Erase: &protos.Erase{}},
+		},
+	}
+	var resp protos.UpdateContentMessageResponse
+	if err = c.doGRPC(ctx, updateContentMessageURL, req, &resp); err != nil {
+		return err
+	}
+	eraseResult := resp.GetErase()
+	log.Printf("snapapi erase: response chat_id=%s message_id=%d requested_version=%d response_version=%d success=%t retryable=%t erase_result=%t erase_updated_message=%t status_message=%t failure_present=%t failure_type=%s failure_desc=%q",
+		chatID, messageID, conv.GetVersion(), resp.GetCurrentVersion(),
+		resp.GetSuccess(), resp.GetRetryable(),
+		eraseResult != nil, eraseResult != nil && eraseResult.GetUpdatedMessage() != nil,
+		resp.GetStatusMessage() != nil,
+		resp.GetResult() != nil, resp.GetResult().GetFailureType(), resp.GetResult().GetFailureDescription())
+	if !resp.GetSuccess() {
+		return fmt.Errorf("snapchat api erase rejected chat_id=%s message_id=%d success=%t retryable=%t failure_type=%s failure_desc=%q",
+			chatID, messageID, resp.GetSuccess(), resp.GetRetryable(),
+			resp.GetResult().GetFailureType(), resp.GetResult().GetFailureDescription())
 	}
 	return nil
 }

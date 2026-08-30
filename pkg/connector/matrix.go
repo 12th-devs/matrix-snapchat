@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rs/zerolog"
 	sidecar "github.com/colej/mautrix-snapchat/internal/connector"
 	"github.com/colej/mautrix-snapchat/internal/snapapi"
 	"github.com/colej/mautrix-snapchat/internal/store"
@@ -51,7 +52,7 @@ func (sa *SnapchatAPI) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Ma
 	if !sa.useAPI() {
 		return nil, fmt.Errorf("send snapchat message: api_mode=%s is unsafe in no-open mode; API sending is required", sa.Connector.apiMode())
 	}
-	messageID, err := sa.sendTextAPI(ctx, chatID, body)
+	messageID, err := sa.sendTextAPI(ctx, chatID, body, sa.matrixReplyTarget(chatID, msg))
 	if err != nil {
 		return nil, fmt.Errorf("send snapchat message via API (DOM fallback disabled): %w", err)
 	}
@@ -87,9 +88,11 @@ func (sa *SnapchatAPI) HandleMatrixReadReceipt(ctx context.Context, receipt *bri
 	}
 
 	if receipt.Implicit || !sa.readReceiptsEnabled() {
+		log.Printf("bridgev2 event_class: kind=read_receipt source=matrix chat_id=%s enabled=%t implicit=%t action=skip", chatID, sa.readReceiptsEnabled(), receipt.Implicit)
 		return nil
 	}
 	if !allowedSync {
+		log.Printf("bridgev2 event_class: kind=read_receipt source=matrix chat_id=%s action=skip reason=unsafe_sync", chatID)
 		return nil
 	}
 	if !sa.useAPI() {
@@ -115,6 +118,7 @@ func (sa *SnapchatAPI) HandleMatrixReadReceipt(ctx context.Context, receipt *bri
 		log.Printf("bridgev2 receipts: API read update failed chat_id=%s message_id=%d version=%d: %v", chatID, messageID, version, err)
 		return nil
 	}
+	log.Printf("bridgev2 event_class: kind=read_receipt source=matrix chat_id=%s message_id=%d version=%d action=sent", chatID, messageID, version)
 	log.Printf("bridgev2 receipts: marked Snapchat read via API chat_id=%s message_id=%d version=%d", chatID, messageID, version)
 	return nil
 }
@@ -131,14 +135,22 @@ func (sa *SnapchatAPI) HandleMatrixTyping(ctx context.Context, msg *bridgev2.Mat
 		return nil
 	}
 	if !sa.useAPI() {
+		log.Printf("bridgev2 event_class: kind=typing source=matrix chat_id=%s typing=%t action=skip reason=non_api", chatID, msg.IsTyping)
 		log.Printf("bridgev2 typing: skipping non-API typing side effects chat_id=%s typing=%t", chatID, msg.IsTyping)
 		return nil
 	}
-	// The bridgev2 hook is intentionally wired before advertising typing by
-	// default. The actual Snapchat call should come from the snapcap-native
-	// setTyping path (presence-out.ts) once the sidecar can boot that bundle
-	// reliably from the logged-in browser session.
-	log.Printf("bridgev2 typing: received Matrix typing event, Snapchat API adapter not enabled yet chat_id=%s typing=%t", chatID, msg.IsTyping)
+	const typingPulseMs = 1500
+	if !sa.claimTypingUpdate(chatID, msg.IsTyping, 1200*time.Millisecond) {
+		log.Printf("bridgev2 event_class: kind=typing source=matrix chat_id=%s typing=%t action=skip reason=debounce", chatID, msg.IsTyping)
+		return nil
+	}
+	if err := sa.Client.SetTyping(ctx, chatID, msg.IsTyping, typingPulseMs); err != nil {
+		log.Printf("bridgev2 event_class: kind=typing source=matrix chat_id=%s typing=%t action=failed", chatID, msg.IsTyping)
+		log.Printf("bridgev2 typing: Snapchat typing API unavailable chat_id=%s typing=%t: %v", chatID, msg.IsTyping, err)
+		return nil
+	}
+	log.Printf("bridgev2 event_class: kind=typing source=matrix chat_id=%s typing=%t duration_ms=%d action=sent", chatID, msg.IsTyping, typingPulseMs)
+	log.Printf("bridgev2 typing: sent Snapchat typing update chat_id=%s typing=%t duration_ms=%d", chatID, msg.IsTyping, typingPulseMs)
 	return nil
 }
 
@@ -325,6 +337,84 @@ func (sa *SnapchatAPI) matrixTextToSend(msg *bridgev2.MatrixMessage) (string, bo
 		return "", false
 	}
 	return body, true
+}
+
+// matrixReplyTarget resolves the Beeper reply relation to the numeric Snapchat
+// message ID that CreateContentMessage.FeatureAttachment expects. A missing or
+// unresolvable target sends the message without a reply relation (logged).
+func (sa *SnapchatAPI) matrixReplyTarget(chatID string, msg *bridgev2.MatrixMessage) int64 {
+	if msg == nil || msg.ReplyTo == nil {
+		return 0
+	}
+	targetID := string(msg.ReplyTo.ID)
+	messageID, ok := parseSnapchatMessageID(targetID)
+	if !ok {
+		log.Printf("bridgev2 send: reply target not resolvable to a Snapchat message chat_id=%s target=%s - sending without reply", chatID, targetID)
+		return 0
+	}
+	return messageID
+}
+
+// chatIDFromScopedMessageID extracts the chat ID from a scoped message ID of
+// the form "<chatID>.msg.<messageID>". Returns empty for unscoped IDs.
+func chatIDFromScopedMessageID(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if idx := strings.LastIndex(raw, ".msg."); idx > 0 {
+		return raw[:idx]
+	}
+	return ""
+}
+
+// HandleMatrixEdit handles edits of previously bridged messages. Snapchat has
+// no edit operation in its web/API protocol (no content-editing update action),
+// so edits are rejected explicitly rather than faked with a follow-up message.
+// The capability matrix advertises Edit: CapLevelRejected, so this is a safety
+// net for clients that send an edit anyway.
+func (sa *SnapchatAPI) HandleMatrixEdit(ctx context.Context, msg *bridgev2.MatrixEdit) error {
+	if msg == nil || msg.EditTarget == nil {
+		return nil
+	}
+	return fmt.Errorf("Snapchat does not support editing sent messages; the edit was not forwarded")
+}
+
+// HandleMatrixMessageRemove redacts/deletes a previously bridged message and
+// unsends the corresponding Snapchat message (UpdateAction_Erase).
+func (sa *SnapchatAPI) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.MatrixMessageRemove) error {
+	removeLog := zerolog.Nop()
+	if sa.UserLogin != nil {
+		removeLog = sa.UserLogin.Log
+	}
+	if msg == nil || msg.TargetMessage == nil {
+		removeLog.Debug().Str("action", "handle matrix remove").Msg("remove handler entered with no mapped target message - nothing to erase")
+		return nil
+	}
+	targetID := string(msg.TargetMessage.ID)
+	chatID := chatIDFromScopedMessageID(targetID)
+	messageID, _ := parseSnapchatMessageID(targetID)
+	removeLog.Debug().Str("action", "handle matrix remove").Str("target_message_id", targetID).Str("chat_id", chatID).Int64("snap_message_id", messageID).Msg("remove handler entered")
+	if messageID <= 0 {
+		log.Printf("bridgev2 remove: target is not a Snapchat-mapped message id=%s - nothing to erase", targetID)
+		return nil
+	}
+	if chatID == "" {
+		return fmt.Errorf("delete snapchat message: target %s is missing the chat scope", targetID)
+	}
+	if !sa.useAPI() {
+		return fmt.Errorf("delete snapchat message: api_mode=%s is unsafe in no-open mode; API sending is required", sa.Connector.apiMode())
+	}
+	client, err := sa.ensureSnapClient(ctx)
+	if err != nil {
+		return fmt.Errorf("snapchat client unavailable for message delete: %w", err)
+	}
+	eraseErr := client.EraseMessage(ctx, chatID, messageID)
+	if eraseErr != nil {
+		sa.invalidateSnapClient()
+		removeLog.Warn().Str("action", "handle matrix remove").Str("chat_id", chatID).Int64("snap_message_id", messageID).Err(eraseErr).Msg("EraseMessage returned error")
+		return fmt.Errorf("unsend Snapchat message failed chat_id=%s message_id=%d: %w", chatID, messageID, eraseErr)
+	}
+	removeLog.Info().Str("action", "handle matrix remove").Str("chat_id", chatID).Int64("snap_message_id", messageID).Msg("EraseMessage returned success")
+	log.Printf("bridgev2 event_class: kind=message_delete source=matrix chat_id=%s message_id=%d action=sent", chatID, messageID)
+	return nil
 }
 
 func (sa *SnapchatAPI) matrixMediaToSend(ctx context.Context, msg *bridgev2.MatrixMessage) (sidecar.MediaAttachment, string, bool, error) {

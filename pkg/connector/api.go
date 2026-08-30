@@ -39,37 +39,48 @@ type pendingOutgoing struct {
 	SentAt   time.Time
 }
 
+type typingUpdateState struct {
+	Typing bool
+	SentAt time.Time
+}
+
 type SnapchatAPI struct {
 	Connector *SnapchatConnector
 	UserLogin *bridgev2.UserLogin
 	Label     string
 	Client    *sidecar.Client
 
-	apiMu                 sync.Mutex
-	apiClient             *snapapi.Client
-	apiCookieString       string
-	apiAuthCheckedAt      time.Time
-	mu                    sync.Mutex
-	seenByChat            map[string]map[string]struct{}
-	chatsByID             map[string]chatRef
-	ghostNames            map[string]string
-	ghostUsernames        map[string]string
-	chatState             map[string]string
-	lastMessageID         map[string]int64
-	lastMessageVersion    map[string]int64
-	messageVersions       map[string]map[int64]int64
-	messageFailures       map[string]int
-	messageRetryAfter     map[string]time.Time
-	lastReadReceiptSync   map[string]time.Time
-	ghostAvatarCheckedAt  map[string]time.Time
-	avatarURLBySnapID     map[string]string
-	queuedPortalResyncs   map[string]struct{}
-	recentOutgoing        map[string][]pendingOutgoing
-	chatDisappearAfter    map[string]int64
-	avatarBootstrapDone   bool
-	sidebarBaselineReady  bool
-	sidebarBaselineAt     time.Time
-	hybridBackfillStarted bool
+	apiMu                   sync.Mutex
+	apiClient               *snapapi.Client
+	apiCookieString         string
+	apiAuthCheckedAt        time.Time
+	consecutiveUnauthorized int
+	reLoginRequired         bool
+	nextRecoveryCheckAt     time.Time
+	readWatermarks          map[string]map[string]int64
+	apiSelfUserID           string
+	mu                      sync.Mutex
+	seenByChat              map[string]map[string]struct{}
+	chatsByID               map[string]chatRef
+	ghostNames              map[string]string
+	ghostUsernames          map[string]string
+	chatState               map[string]string
+	lastMessageID           map[string]int64
+	lastMessageVersion      map[string]int64
+	messageVersions         map[string]map[int64]int64
+	messageFailures         map[string]int
+	messageRetryAfter       map[string]time.Time
+	lastReadReceiptSync     map[string]time.Time
+	lastTypingSent          map[string]typingUpdateState
+	ghostAvatarCheckedAt    map[string]time.Time
+	avatarURLBySnapID       map[string]string
+	queuedPortalResyncs     map[string]struct{}
+	recentOutgoing          map[string][]pendingOutgoing
+	chatDisappearAfter      map[string]int64
+	avatarBootstrapDone     bool
+	sidebarBaselineReady    bool
+	sidebarBaselineAt       time.Time
+	hybridBackfillStarted   bool
 }
 
 type connectorEELDecrypter struct {
@@ -122,11 +133,13 @@ func NewSnapchatAPI(sc *SnapchatConnector, login *bridgev2.UserLogin, label stri
 		messageFailures:      make(map[string]int),
 		messageRetryAfter:    make(map[string]time.Time),
 		lastReadReceiptSync:  make(map[string]time.Time),
+		lastTypingSent:       make(map[string]typingUpdateState),
 		ghostAvatarCheckedAt: make(map[string]time.Time),
 		avatarURLBySnapID:    make(map[string]string),
 		queuedPortalResyncs:  make(map[string]struct{}),
 		recentOutgoing:       make(map[string][]pendingOutgoing),
 		chatDisappearAfter:   make(map[string]int64),
+		readWatermarks:       make(map[string]map[string]int64),
 	}
 }
 
@@ -584,6 +597,7 @@ func connectorChatFromAPI(chat snapapi.Chat) sidecar.Chat {
 		Unread:                chat.Unread,
 		LastMessage:           preview,
 		DisappearAfterSeconds: int64(chat.DisappearAfter / time.Second),
+		ReadWatermarks:        chat.ReadWatermarks,
 	}
 }
 
@@ -614,7 +628,18 @@ func connectorMessageFromAPI(message snapapi.Message) sidecar.Message {
 		ContentType:           message.ContentType,
 		Saved:                 message.Saved,
 		DisappearAfterSeconds: int64(message.DisappearAfter / time.Second),
+		QuotedMessageID:       quotedMessageIDString(message.QuotedMessageID),
+		Tombstone:             message.Tombstone,
 	}
+}
+
+// quotedMessageIDString renders the numeric quoted-message reference; 0 means
+// "not a reply" and becomes empty.
+func quotedMessageIDString(id int64) string {
+	if id <= 0 {
+		return ""
+	}
+	return strconv.FormatInt(id, 10)
 }
 
 func messageKindFromAPI(message snapapi.Message) string {

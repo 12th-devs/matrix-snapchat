@@ -17,14 +17,17 @@ import (
 )
 
 type Client struct {
-	baseURL string
-	secret  string
-	http    *http.Client
+	baseURL     string
+	secret      string
+	http        *http.Client
+	browserHTTP *http.Client
 }
 
 type SessionStatus struct {
 	State            string `json:"state"`
 	Authenticated    bool   `json:"authenticated"`
+	ReLoginRequired  bool   `json:"reLoginRequired,omitempty"`
+	Message          string `json:"message,omitempty"`
 	ActiveChatName   string `json:"activeChatName,omitempty"`
 	URL              string `json:"url,omitempty"`
 	VisibleChatCount int    `json:"visibleChatCount,omitempty"`
@@ -42,6 +45,9 @@ type Chat struct {
 	Unread                bool     `json:"unread"`
 	LastMessage           string   `json:"lastMessage,omitempty"`
 	DisappearAfterSeconds int64    `json:"disappearAfterSeconds,omitempty"`
+	// ReadWatermarks maps participant Snapchat user ID -> last-read message ID
+	// as reported by the conversation object (snapchat-side read receipts).
+	ReadWatermarks map[string]int64 `json:"readWatermarks,omitempty"`
 }
 
 type Message struct {
@@ -56,6 +62,12 @@ type Message struct {
 	Media                 []MediaAttachment `json:"media,omitempty"`
 	Saved                 bool              `json:"saved,omitempty"`
 	DisappearAfterSeconds int64             `json:"disappearAfterSeconds,omitempty"`
+	// QuotedMessageID is the RAW numeric Snapchat message ID this message
+	// replies to (empty when not a reply). Scoping to the chat happens where
+	// the chat ID is known.
+	QuotedMessageID string `json:"quotedMessageId,omitempty"`
+	// Tombstone marks a message that was erased/unsent on Snapchat.
+	Tombstone bool `json:"tombstone,omitempty"`
 }
 
 type MediaAttachment struct {
@@ -82,6 +94,12 @@ type SendMediaRequest struct {
 	Caption  string `json:"caption,omitempty"`
 }
 
+type TypingRequest struct {
+	ChatID     string `json:"chatId"`
+	Typing     bool   `json:"typing"`
+	DurationMs int    `json:"durationMs,omitempty"`
+}
+
 type SendMessageResponse struct {
 	Queued    bool   `json:"queued"`
 	Confirmed bool   `json:"confirmed"`
@@ -89,6 +107,11 @@ type SendMessageResponse struct {
 	ChatName  string `json:"chatName,omitempty"`
 	ChatURL   string `json:"chatURL,omitempty"`
 	Text      string `json:"text,omitempty"`
+}
+
+type TypingResponse struct {
+	OK    bool   `json:"ok"`
+	Error string `json:"error,omitempty"`
 }
 
 type Diagnostics struct {
@@ -142,13 +165,21 @@ type EELDecryptResponse struct {
 }
 
 func New(cfg config.ConnectorConfig) *Client {
+	requestTimeout := time.Duration(cfg.RequestTimeoutSeconds) * time.Second
+	browserTimeout := maxDuration(requestTimeout, 180*time.Second)
 	return &Client{
-		baseURL: cfg.BaseURL,
-		secret:  cfg.SharedSecret,
-		http: &http.Client{
-			Timeout: time.Duration(cfg.RequestTimeoutSeconds) * time.Second,
-		},
+		baseURL:     cfg.BaseURL,
+		secret:      cfg.SharedSecret,
+		http:        &http.Client{Timeout: requestTimeout},
+		browserHTTP: &http.Client{Timeout: browserTimeout},
 	}
+}
+
+func maxDuration(a, b time.Duration) time.Duration {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func (c *Client) BaseURL() string {
@@ -161,7 +192,7 @@ func (c *Client) StartSession(ctx context.Context) error {
 		return err
 	}
 
-	resp, err := c.http.Do(req)
+	resp, err := c.browserHTTP.Do(req)
 	if err != nil {
 		return err
 	}
@@ -195,7 +226,7 @@ func (c *Client) APIAuth(ctx context.Context) (*APIAuth, error) {
 	}
 
 	var auth APIAuth
-	if err = c.doJSON(req, &auth); err != nil {
+	if err = c.doJSONWithClient(c.browserHTTP, req, &auth); err != nil {
 		return nil, err
 	}
 
@@ -339,6 +370,33 @@ func (c *Client) SendMedia(ctx context.Context, chatID, chatName, chatURL string
 	return nil
 }
 
+func (c *Client) SetTyping(ctx context.Context, chatID string, typing bool, durationMs int) error {
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return fmt.Errorf("missing chat ID")
+	}
+	payload := TypingRequest{
+		ChatID:     chatID,
+		Typing:     typing,
+		DurationMs: durationMs,
+	}
+	req, err := c.newRequest(ctx, http.MethodPost, "/typing", payload)
+	if err != nil {
+		return err
+	}
+	var result TypingResponse
+	if err = c.doJSON(req, &result); err != nil {
+		return err
+	}
+	if !result.OK {
+		if result.Error == "" {
+			result.Error = "typing update was not accepted"
+		}
+		return errors.New(result.Error)
+	}
+	return nil
+}
+
 func (c *Client) Diagnostics(ctx context.Context) (*Diagnostics, error) {
 	req, err := c.newRequest(ctx, http.MethodGet, "/debug/diagnostics", nil)
 	if err != nil {
@@ -379,7 +437,11 @@ func (c *Client) newRequest(ctx context.Context, method, path string, body any) 
 }
 
 func (c *Client) doJSON(req *http.Request, target any) error {
-	resp, err := c.http.Do(req)
+	return c.doJSONWithClient(c.http, req, target)
+}
+
+func (c *Client) doJSONWithClient(client *http.Client, req *http.Request, target any) error {
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("%s %s: %w", req.Method, req.URL.String(), err)
 	}

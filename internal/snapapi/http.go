@@ -3,6 +3,7 @@ package snapapi
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +13,36 @@ import (
 	"github.com/0xzer/snapper/protos"
 	"google.golang.org/protobuf/proto"
 )
+
+// ErrUnauthorized marks an API response that Snapchat rejected with HTTP
+// 401/403 or a PERMISSION_DENIED/UNAUTHENTICATED gRPC status, typically meaning
+// the web messaging session is no longer valid server-side.
+var ErrUnauthorized = errors.New("snapchat session unauthorized")
+
+// messagingEndpointPrefix marks RPCs that belong to the messaging core service.
+// Both SyncConversations and DeltaSync (plus BatchDeltaSync/QueryConversations)
+// live under this single service, so auth failures on any of them surface through
+// the same doHTTP/doGRPC path and can be normalized consistently.
+const messagingEndpointPrefix = "messagingcoreservice.MessagingCoreService"
+
+func isMessagingEndpoint(endpoint string) bool {
+	return strings.Contains(endpoint, messagingEndpointPrefix)
+}
+
+// grpcAuthRejected reports whether a grpc-web trailer block carries an
+// auth-rejection status (PERMISSION_DENIED or UNAUTHENTICATED).
+func grpcAuthRejected(trailer string) bool {
+	for _, line := range strings.Split(trailer, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "grpc-status:") {
+			continue
+		}
+		code := strings.TrimSpace(strings.TrimPrefix(line, "grpc-status:"))
+		// 7 = PERMISSION_DENIED, 16 = UNAUTHENTICATED.
+		return code == "7" || code == "16"
+	}
+	return false
+}
 
 func (c *Client) doGRPC(ctx context.Context, endpoint string, req proto.Message, target proto.Message) error {
 	payloadBytes, err := protos.EncodeProtoMessage(req)
@@ -30,6 +61,9 @@ func (c *Client) doGRPC(ctx context.Context, endpoint string, req proto.Message,
 		trailerLength := int(body[1])<<24 | int(body[2])<<16 | int(body[3])<<8 | int(body[4])
 		if trailerLength <= len(body)-5 {
 			trailer := strings.TrimSpace(string(body[5 : 5+trailerLength]))
+			if isMessagingEndpoint(endpoint) && grpcAuthRejected(trailer) {
+				return fmt.Errorf("%w: grpc from %s rejected: %s", ErrUnauthorized, endpoint, trailer)
+			}
 			return fmt.Errorf("grpc error from %s: %s", endpoint, trailer)
 		}
 	}
@@ -132,7 +166,11 @@ func (c *Client) doHTTP(ctx context.Context, endpoint, method string, header htt
 		return nil, err
 	}
 	if resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("%s %s returned %s: %s", method, endpoint, resp.Status, strings.TrimSpace(string(data[:min(len(data), 500)])))
+		msg := fmt.Sprintf("%s %s returned %s: %s", method, endpoint, resp.Status, strings.TrimSpace(string(data[:min(len(data), 500)])))
+		if isMessagingEndpoint(endpoint) && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
+			return nil, fmt.Errorf("%w: %s", ErrUnauthorized, msg)
+		}
+		return nil, fmt.Errorf("%s", msg)
 	}
 	return data, nil
 }

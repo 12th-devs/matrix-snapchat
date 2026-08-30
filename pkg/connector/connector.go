@@ -277,10 +277,13 @@ func (sc *SnapchatConnector) resetSyncState() error {
 
 func (sc *SnapchatConnector) chatCapabilities() *event.RoomFeatures {
 	features := &event.RoomFeatures{
-		ID:                  "fi.mau.snapchat.capabilities.2026_05_21",
-		MaxTextLength:       5000,
+		ID:            "fi.mau.snapchat.capabilities.2026_05_21",
+		MaxTextLength: 5000,
+		// Snapchat has no edit operation, so edits stay rejected (explicitly
+		// handled by HandleMatrixEdit). Unsend/delete IS supported via
+		// UpdateAction_Erase.
 		Edit:                event.CapLevelRejected,
-		Delete:              event.CapLevelRejected,
+		Delete:              event.CapLevelFullySupported,
 		ReadReceipts:        sc != nil && sc.Config.ReadReceiptsEnabled,
 		TypingNotifications: sc != nil && sc.Config.TypingEnabled,
 		DisappearingTimer: &event.DisappearingTimerCapability{

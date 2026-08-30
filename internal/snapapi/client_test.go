@@ -6,6 +6,7 @@ import (
 	"crypto/cipher"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/0xzer/snapper/protos"
 )
@@ -289,6 +290,49 @@ func TestMessageBodyFullEELHelperALEAPPMessageContentPath(t *testing.T) {
 	}
 	if isSnap {
 		t.Fatal("modern message_content text was marked as snap")
+	}
+	if decrypter.calls != 1 {
+		t.Fatalf("helper calls = %d, want 1", decrypter.calls)
+	}
+}
+
+func TestMessageBodyFullEELHelperCachesPlaintext(t *testing.T) {
+	contentBytes, err := protos.EncodeProtoMessage(&protos.Contents{
+		Content: &protos.Contents_Text{
+			Text: &protos.Text{Text: "cached eel text"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decrypter := &fakeEELDecrypter{output: contentBytes}
+	client := &Client{
+		eelDecrypter: decrypter,
+		eelPlaintext: make(map[string][]byte),
+		failedEEL:    make(map[string]time.Time),
+	}
+	msg := &protos.ContentMessage{
+		MessageId: 907,
+		Contents: &protos.ContentEnvelope{
+			ContentType: protos.ContentType_CHAT,
+			Contents:    []byte{0x01, 0x02},
+			EnvelopeEncryption: &protos.EnvelopeEncryption{
+				Method: &protos.EnvelopeEncryption_EelEncryption{
+					EelEncryption: &protos.EelEncryption{
+						CekIv:           []byte("123456789012"),
+						Nonce:           []byte("abcdefghijklmnop"),
+						SenderPublicKey: []byte("sender-public-key-placeholder"),
+						SenderVersion:   7,
+					},
+				},
+			},
+		},
+	}
+	for i := 0; i < 2; i++ {
+		body, isSnap := client.messageBody(context.Background(), "chat-1", msg)
+		if body != "cached eel text" || isSnap {
+			t.Fatalf("decode %d = body %q isSnap %t, want cached eel text false", i, body, isSnap)
+		}
 	}
 	if decrypter.calls != 1 {
 		t.Fatalf("helper calls = %d, want 1", decrypter.calls)

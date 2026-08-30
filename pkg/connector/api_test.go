@@ -271,6 +271,124 @@ func TestShouldQueueMessageEditSkipsSnapAndMediaRows(t *testing.T) {
 	}
 }
 
+func TestClassifyMessageSync(t *testing.T) {
+	if got := classifyMessageSync(nil, sidecar.Message{ID: "1", Text: "hello"}); got != messageSyncNew {
+		t.Fatalf("nil existing classify = %s, want %s", got, messageSyncNew)
+	}
+	if got := classifyMessageSync(&store.MessageState{Text: "old text", Kind: "chat"}, sidecar.Message{ID: "1", Text: "new text"}); got != messageSyncEdit {
+		t.Fatalf("changed text classify = %s, want %s", got, messageSyncEdit)
+	}
+	if got := classifyMessageSync(&store.MessageState{Text: "same text", Kind: "chat"}, sidecar.Message{ID: "1", Text: " same text "}); got != messageSyncUnchanged {
+		t.Fatalf("same text classify = %s, want %s", got, messageSyncUnchanged)
+	}
+	if got := classifyMessageSync(&store.MessageState{Text: "photo.jpg", Kind: "media"}, sidecar.Message{ID: "1", Text: "caption changed"}); got != messageSyncUnchanged {
+		t.Fatalf("media text classify = %s, want %s", got, messageSyncUnchanged)
+	}
+}
+
+func TestClassifyMessageSyncTreatsDelayedDecryptionAsEdit(t *testing.T) {
+	got := classifyMessageSync(&store.MessageState{
+		Text: "[Snapchat message unavailable]",
+		Kind: "chat",
+	}, sidecar.Message{ID: "1", Text: "finally decoded"})
+	if got != messageSyncEdit {
+		t.Fatalf("delayed decrypt classify = %s, want %s", got, messageSyncEdit)
+	}
+}
+
+func TestSuppressUndecryptedBackfillSkipsOnlyNewHistoricalPlaceholders(t *testing.T) {
+	placeholder := sidecar.Message{ID: "123", Text: "[Snapchat message unavailable]"}
+	apiMessage := snapapi.Message{ID: "123", ContentType: "CHAT"}
+	if !suppressUndecryptedBackfill("startup stored portal backfill", nil, placeholder, apiMessage) {
+		t.Fatal("expected new historical undecrypted placeholder to be suppressed")
+	}
+	if suppressUndecryptedBackfill("api poll", nil, placeholder, apiMessage) {
+		t.Fatal("live API poll placeholder should not be suppressed")
+	}
+	if suppressUndecryptedBackfill("startup stored portal backfill", &store.MessageState{Text: "old"}, placeholder, apiMessage) {
+		t.Fatal("stored baseline should not be suppressed")
+	}
+	if suppressUndecryptedBackfill("startup stored portal backfill", nil, sidecar.Message{ID: "124", Text: "decoded"}, snapapi.Message{ID: "124", ContentType: "CHAT"}) {
+		t.Fatal("decoded historical text should not be suppressed")
+	}
+}
+
+func TestSuppressUndecryptedBackfillKeepsSnapsAndMediaVisible(t *testing.T) {
+	if suppressUndecryptedBackfill("startup stored portal backfill", nil, sidecar.Message{ID: "123", Text: "New Snap", IsSnap: true}, snapapi.Message{ID: "123", IsSnap: true}) {
+		t.Fatal("snap placeholder should stay visible")
+	}
+	if suppressUndecryptedBackfill("startup stored portal backfill", nil, sidecar.Message{ID: "124", Text: "[Snapchat message unavailable]"}, snapapi.Message{
+		ID:          "124",
+		Media:       []snapapi.MediaAttachment{{ID: "m1"}},
+		ContentType: "EXTERNAL_MEDIA",
+	}) {
+		t.Fatal("media placeholder should stay visible")
+	}
+}
+
+func TestRestoreStoredDecryptedTextUsesStableTextForTransientEELFailure(t *testing.T) {
+	got, ok := restoreStoredDecryptedText(&store.MessageState{
+		Text: "decoded earlier",
+		Kind: "chat",
+	}, sidecar.Message{
+		ID:   "123",
+		Text: "[Snapchat message unavailable]",
+	}, snapapi.Message{
+		ID:          "123",
+		ContentType: "CHAT",
+	})
+	if !ok || got != "decoded earlier" {
+		t.Fatalf("restoreStoredDecryptedText = %q, %t; want decoded earlier, true", got, ok)
+	}
+}
+
+func TestRestoreStoredDecryptedTextDoesNotRestoreGeneratedOrMediaText(t *testing.T) {
+	cases := []struct {
+		name     string
+		existing *store.MessageState
+		message  sidecar.Message
+		api      snapapi.Message
+	}{
+		{
+			name:     "existing notice",
+			existing: &store.MessageState{Text: "New Snap", Kind: "chat"},
+			message:  sidecar.Message{ID: "123", Text: "[Snapchat message unavailable]"},
+			api:      snapapi.Message{ID: "123", ContentType: "CHAT"},
+		},
+		{
+			name:     "new text already decoded",
+			existing: &store.MessageState{Text: "decoded earlier", Kind: "chat"},
+			message:  sidecar.Message{ID: "123", Text: "decoded now"},
+			api:      snapapi.Message{ID: "123", ContentType: "CHAT"},
+		},
+		{
+			name:     "snap",
+			existing: &store.MessageState{Text: "decoded earlier", Kind: "chat"},
+			message:  sidecar.Message{ID: "123", Text: "[Snapchat message unavailable]", IsSnap: true},
+			api:      snapapi.Message{ID: "123", IsSnap: true},
+		},
+		{
+			name:     "stored media",
+			existing: &store.MessageState{Text: "caption", Kind: "media"},
+			message:  sidecar.Message{ID: "123", Text: "[Snapchat message unavailable]"},
+			api:      snapapi.Message{ID: "123", ContentType: "CHAT"},
+		},
+		{
+			name:     "incoming media",
+			existing: &store.MessageState{Text: "caption", Kind: "chat"},
+			message:  sidecar.Message{ID: "123", Text: "[Snapchat message unavailable]"},
+			api:      snapapi.Message{ID: "123", ContentType: "EXTERNAL_MEDIA", Media: []snapapi.MediaAttachment{{ID: "m1"}}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got, ok := restoreStoredDecryptedText(tc.existing, tc.message, tc.api); ok {
+				t.Fatalf("restoreStoredDecryptedText unexpectedly restored %q", got)
+			}
+		})
+	}
+}
+
 func TestShouldSendReadReceiptToSnapchatSkipsExactUnknownTargets(t *testing.T) {
 	if (&SnapchatAPI{}).shouldSendReadReceiptToSnapchat("chat-1", 123, true) {
 		t.Fatal("exact read receipt with no stored baseline should be skipped")

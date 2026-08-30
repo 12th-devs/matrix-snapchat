@@ -111,18 +111,20 @@ func (c *Client) messageFromProto(ctx context.Context, chatID string, msg *proto
 		disappearAfter = c.retentionDurationForChat(chatID)
 	}
 	return Message{
-		ID:             id,
-		AuthorID:       authorID,
-		Author:         authorName,
-		Text:           body,
-		Timestamp:      createdAt,
-		Outgoing:       authorID != "" && authorID == c.SelfUserID(),
-		IsSnap:         isSnap,
-		ContentType:    contentType.String(),
-		Media:          media,
-		Version:        msg.GetMetaData().GetConversationVersion(),
-		Saved:          saved,
-		DisappearAfter: disappearAfter,
+		ID:              id,
+		AuthorID:        authorID,
+		Author:          authorName,
+		Text:            body,
+		Timestamp:       createdAt,
+		Outgoing:        authorID != "" && authorID == c.SelfUserID(),
+		IsSnap:          isSnap,
+		ContentType:     contentType.String(),
+		Media:           media,
+		Version:         msg.GetMetaData().GetConversationVersion(),
+		Saved:           saved,
+		DisappearAfter:  disappearAfter,
+		QuotedMessageID: msg.GetMetaData().GetQuotedMetadata().GetQuotedMessageId(),
+		Tombstone:       msg.GetMetaData().GetTombstone(),
 	}
 }
 
@@ -305,6 +307,11 @@ func (c *Client) envelopeContentsForDecode(ctx context.Context, chatID, messageI
 		if c != nil && c.eelDecrypter != nil {
 			cacheKey := chatID + "|" + messageID
 			c.mu.Lock()
+			if cached := c.eelPlaintext[cacheKey]; len(cached) > 0 {
+				out := append([]byte(nil), cached...)
+				c.mu.Unlock()
+				return out
+			}
 			lastFailure, alreadyFailed := c.failedEEL[cacheKey]
 			c.mu.Unlock()
 			// Full EEL decrypt depends on Snapchat's Fidelius/WASM session. If
@@ -337,6 +344,10 @@ func (c *Client) envelopeContentsForDecode(ctx context.Context, chatID, messageI
 				return nil
 			}
 			c.mu.Lock()
+			if c.eelPlaintext == nil {
+				c.eelPlaintext = make(map[string][]byte)
+			}
+			c.eelPlaintext[cacheKey] = append([]byte(nil), decrypted...)
 			delete(c.failedEEL, cacheKey)
 			c.mu.Unlock()
 			return decrypted
@@ -355,6 +366,9 @@ func createdMessageIDFromResponse(resp *protos.CreateContentMessageResponse) str
 	for _, result := range resp.GetResult() {
 		if result.GetCreatedMessageId() != 0 {
 			return fmt.Sprintf("%d", result.GetCreatedMessageId())
+		}
+		if result.GetConversationDestinationResult().GetCreatedMessageId() != 0 {
+			return fmt.Sprintf("%d", result.GetConversationDestinationResult().GetCreatedMessageId())
 		}
 	}
 	return ""

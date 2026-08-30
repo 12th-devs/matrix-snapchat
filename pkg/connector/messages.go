@@ -17,6 +17,14 @@ import (
 	"maunium.net/go/mautrix/event"
 )
 
+type messageSyncAction string
+
+const (
+	messageSyncNew       messageSyncAction = "new_message"
+	messageSyncEdit      messageSyncAction = "message_edit"
+	messageSyncUnchanged messageSyncAction = "unchanged_message"
+)
+
 func (sa *SnapchatAPI) syncChatMessages(ctx context.Context, chat sidecar.Chat, reason string) {
 	if sa.UserLogin == nil || sa.UserLogin.Bridge == nil || chat.ID == "" {
 		return
@@ -102,11 +110,36 @@ func (sa *SnapchatAPI) syncChatMessagesAPI(ctx context.Context, chat sidecar.Cha
 			}
 		}
 		sa.rememberAPIMessage(chat.ID, apiMessage)
-		if existing := sa.lookupStoredMessage(chat.ID, baseRemoteID); shouldQueueMessageEdit(existing, message) {
-			log.Printf("bridgev2 edit: API message text changed, queueing Matrix edit chat_id=%s message_id=%s kind=%s old_len=%d new_len=%d", chat.ID, baseRemoteID, messageKindFromAPI(apiMessage), len(existing.Text), len(message.Text))
+		existing := sa.lookupStoredMessage(chat.ID, baseRemoteID)
+		if apiMessage.Tombstone {
+			// Erased/unsent on Snapchat: remove the bridged message instead of
+			// displaying it. A tombstone for an unknown message is skipped.
+			if existing != nil {
+				log.Printf("bridgev2 event_class: kind=message_delete source=api chat_id=%s message_id=%s action=queue", chat.ID, baseRemoteID)
+				sa.queueRemoteMessageRemove(chat, baseRemoteID, message)
+			} else {
+				log.Printf("bridgev2 sync: skipping tombstone for unbridged message chat_id=%s message_id=%s", chat.ID, baseRemoteID)
+			}
+			continue
+		}
+		if restored, ok := restoreStoredDecryptedText(existing, message, apiMessage); ok {
+			log.Printf("bridgev2 decrypt-cache: restored stored text for transient undecrypted API message chat_id=%s message_id=%s len=%d", chat.ID, baseRemoteID, len(restored))
+			message.Text = restored
+			apiMessage.Text = restored
+		}
+		if suppressUndecryptedBackfill(reason, existing, message, apiMessage) {
+			log.Printf("bridgev2 sync: suppressing undecrypted historical placeholder chat_id=%s message_id=%s reason=%s", chat.ID, baseRemoteID, reason)
+			continue
+		}
+		switch action := classifyMessageSync(existing, message); action {
+		case messageSyncEdit:
+			log.Printf("bridgev2 event_class: kind=%s source=api chat_id=%s message_id=%s api_kind=%s old_len=%d new_len=%d", action, chat.ID, baseRemoteID, messageKindFromAPI(apiMessage), len(existing.Text), len(message.Text))
 			sa.queueRemoteMessageEdit(chat, baseRemoteID, message)
-		} else {
+		case messageSyncNew:
+			log.Printf("bridgev2 event_class: kind=%s source=api chat_id=%s message_id=%s api_kind=%s sender_id=%s outgoing=%t", action, chat.ID, baseRemoteID, messageKindFromAPI(apiMessage), message.AuthorID, message.Outgoing)
 			sa.queueRemoteMessage(chat, message)
+		case messageSyncUnchanged:
+			log.Printf("bridgev2 event_class: kind=%s source=api chat_id=%s message_id=%s api_kind=%s", action, chat.ID, baseRemoteID, messageKindFromAPI(apiMessage))
 		}
 		states = append(states, store.MessageState{
 			PortalKey:    chat.ID,
@@ -124,6 +157,46 @@ func (sa *SnapchatAPI) syncChatMessagesAPI(ctx context.Context, chat sidecar.Cha
 		_ = sa.Connector.store.UpsertMessages(states)
 	}
 	return nil
+}
+
+func restoreStoredDecryptedText(existing *store.MessageState, message sidecar.Message, apiMessage snapapi.Message) (string, bool) {
+	if existing == nil {
+		return "", false
+	}
+	if apiMessage.IsSnap || message.IsSnap || len(apiMessage.Media) > 0 || len(message.Media) > 0 {
+		return "", false
+	}
+	if existing.HasMedia || existing.Kind == "media" || existing.Kind == "snap" {
+		return "", false
+	}
+	if strings.TrimSpace(message.Text) != "[Snapchat message unavailable]" {
+		return "", false
+	}
+	text := strings.TrimSpace(existing.Text)
+	if text == "" || isGeneratedSnapchatNotice(text) {
+		return "", false
+	}
+	return text, true
+}
+
+func suppressUndecryptedBackfill(reason string, existing *store.MessageState, message sidecar.Message, apiMessage snapapi.Message) bool {
+	if reason != "startup stored portal backfill" || existing != nil {
+		return false
+	}
+	if apiMessage.IsSnap || message.IsSnap || len(apiMessage.Media) > 0 || len(message.Media) > 0 {
+		return false
+	}
+	return strings.TrimSpace(message.Text) == "[Snapchat message unavailable]"
+}
+
+func classifyMessageSync(existing *store.MessageState, message sidecar.Message) messageSyncAction {
+	if existing == nil {
+		return messageSyncNew
+	}
+	if shouldQueueMessageEdit(existing, message) {
+		return messageSyncEdit
+	}
+	return messageSyncUnchanged
 }
 
 func shouldQueueMessageEdit(existing *store.MessageState, message sidecar.Message) bool {
@@ -208,6 +281,38 @@ func (sa *SnapchatAPI) queueRemoteMessage(chat sidecar.Chat, message sidecar.Mes
 		ID:                 makeMessageID(eventID),
 		Data:               copyMsg,
 		ConvertMessageFunc: sa.convertMessage,
+	})
+}
+
+func (sa *SnapchatAPI) queueRemoteMessageRemove(chat sidecar.Chat, targetMessageID string, message sidecar.Message) {
+	if sa.UserLogin == nil || sa.UserLogin.Bridge == nil || chat.ID == "" || targetMessageID == "" {
+		return
+	}
+	portalKey := networkid.PortalKey{
+		ID:       networkid.PortalID(chat.ID),
+		Receiver: sa.UserLogin.ID,
+	}
+	sender := bridgev2.EventSender{
+		IsFromMe: message.Outgoing,
+		Sender:   sa.messageSenderID(chat, message),
+	}
+	if message.Outgoing {
+		sender.Sender = makeUserID(sa.Label)
+		sender.SenderLogin = makeUserLoginID(sa.Label)
+	} else if strings.TrimSpace(message.AuthorID) != "" {
+		sa.rememberGhostName(makeUserID(message.AuthorID), message.Author)
+	}
+	sa.UserLogin.Bridge.QueueRemoteEvent(sa.UserLogin, &simplevent.MessageRemove{
+		EventMeta: simplevent.EventMeta{
+			Type: bridgev2.RemoteEventMessageRemove,
+			LogContext: func(c zerolog.Context) zerolog.Context {
+				return c.Str("chat", chat.Name).Str("chat_id", chat.ID).Str("target_message_id", targetMessageID)
+			},
+			PortalKey: portalKey,
+			Sender:    sender,
+			Timestamp: time.Now(),
+		},
+		TargetMessage: makeMessageID(scopedSnapchatMessageID(chat.ID, targetMessageID)),
 	})
 }
 
@@ -312,6 +417,7 @@ func (sa *SnapchatAPI) convertMessage(ctx context.Context, portal *bridgev2.Port
 		}
 		if len(parts) > 0 {
 			return &bridgev2.ConvertedMessage{
+				ReplyTo:   sa.resolveReplyTarget(portalID, message.QuotedMessageID),
 				Parts:     parts,
 				Disappear: sa.disappearingSettingForMessage(portalID, message),
 			}, nil
@@ -322,6 +428,7 @@ func (sa *SnapchatAPI) convertMessage(ctx context.Context, portal *bridgev2.Port
 		msgType = event.MsgNotice
 	}
 	return &bridgev2.ConvertedMessage{
+		ReplyTo: sa.resolveReplyTarget(portalID, message.QuotedMessageID),
 		Parts: []*bridgev2.ConvertedMessagePart{{
 			Type: event.EventMessage,
 			Content: &event.MessageEventContent{
@@ -331,6 +438,25 @@ func (sa *SnapchatAPI) convertMessage(ctx context.Context, portal *bridgev2.Port
 		}},
 		Disappear: sa.disappearingSettingForMessage(portalID, message),
 	}, nil
+}
+
+// resolveReplyTarget maps an incoming Snapchat reply's quoted message ID to the
+// bridged Matrix event. The mapping is deterministic ("<chatID>.msg.<id>") and
+// the target must already be bridged locally (persisted in the connector store,
+// so it survives restarts). A miss logs clearly and returns nil so the message
+// is sent as a normal message instead of a dangling reply.
+func (sa *SnapchatAPI) resolveReplyTarget(portalID, quotedRawID string) *networkid.MessageOptionalPartID {
+	quotedRawID = strings.TrimSpace(quotedRawID)
+	if quotedRawID == "" || quotedRawID == "0" {
+		return nil
+	}
+	baseID := baseSnapchatMessageID(quotedRawID)
+	if sa.lookupStoredMessage(portalID, baseID) == nil {
+		log.Printf("bridgev2 reply: quoted Snapchat message not in local mapping chat_id=%s quoted=%s - sending without reply relation", portalID, quotedRawID)
+		return nil
+	}
+	id := makeMessageID(scopedSnapchatMessageID(portalID, quotedRawID))
+	return &networkid.MessageOptionalPartID{MessageID: id}
 }
 
 func (sa *SnapchatAPI) convertMessageEdit(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, existing []*database.Message, message sidecar.Message) (*bridgev2.ConvertedEdit, error) {

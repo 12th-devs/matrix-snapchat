@@ -73,6 +73,9 @@ The full-stack runner writes connector stdout/stderr to `logs/connector.out.log`
 - `/session/status` returned `state=ready`, `authenticated=true`.
 - `/session/api-auth` returned authenticated cookies and an SSO token after the timeout fix.
 - Existing `logs/bridge.log` shows prior Beeper websocket pings and Matrix message sends on 2026-08-30.
+- Beeper→Snapchat delete/unsend is live-verified (2026-08-30) for newly sent/mapped outgoing text messages: deleting such a message in Beeper reached `UpdateAction_Erase` with the correct message ID and returned `success=true`; the message disappeared in Snapchat.
+- The nested `conversationDestinationResult.createdMessageId` field in `CreateContentMessageResponse` is required to capture the real Snapchat server message ID on outgoing sends. The top-level `result.createdMessageId` alone was insufficient, which caused the bridge to persist the client resolution ID and later erase attempts to fail with `failure_type=NOT_FOUND`.
+- Legacy caveat: older Beeper-sent messages persisted before the server-ID fix may carry client-resolution IDs (huge ~10^18 values). Deleting those can still fail with `failure_type=NOT_FOUND`, and redactions of messages the bridge has no mapping for are reported as `redaction target message not found`. Only newly sent messages verify the fix.
 
 ## Current Broken or Risky Areas
 

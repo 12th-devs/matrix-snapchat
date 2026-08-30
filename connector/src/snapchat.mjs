@@ -2169,7 +2169,12 @@ export async function getAPIAuth() {
       })),
       url: page && !page.isClosed() ? page.url() : "",
     };
-    if (snapshot.authenticated) {
+    if (
+      snapshot.authenticated
+      && snapshot.selfUserID
+      && snapshot.ssoToken
+      && snapshot.mcsCofIdsBin
+    ) {
       lastAPIAuthSnapshot = snapshot;
       lastAPIAuthSnapshotAt = Date.now();
     }
@@ -2858,6 +2863,181 @@ export async function sendMedia(chatID, chatName, chatURL = "", fileName = "snap
       }
     }
   }, { priority: 0 });
+}
+
+export async function setTyping(chatID, typing, durationMs = 1500) {
+  return withLock(async () => {
+    const currentPage = await gotoSnapchat();
+    const result = await currentPage.evaluate(async ({ chatID, typing, durationMs }) => {
+      function findWebpackRequire() {
+        for (const key of Object.keys(globalThis)) {
+          if (!/^webpackChunk/.test(key)) {
+            continue;
+          }
+          const chunk = globalThis[key];
+          if (!Array.isArray(chunk) || typeof chunk.push !== "function") {
+            continue;
+          }
+          let webpackRequire;
+          try {
+            chunk.push([[`codex-typing-${Date.now()}`], {}, (req) => {
+              webpackRequire = req;
+            }]);
+          } catch {
+            continue;
+          }
+          if (webpackRequire?.m) {
+            return webpackRequire;
+          }
+        }
+        return undefined;
+      }
+
+      function safeRequire(webpackRequire, moduleId) {
+        if (!webpackRequire || !moduleId) {
+          return undefined;
+        }
+        try {
+          return webpackRequire(moduleId);
+        } catch {
+          return undefined;
+        }
+      }
+
+      function resolveAppState(webpackRequire) {
+        for (const moduleId of [96821, 97003]) {
+          const appState = safeRequire(webpackRequire, moduleId)?.M?.getState?.();
+          if (appState) {
+            return appState;
+          }
+        }
+        return undefined;
+      }
+
+      function uuidBytes(uuid) {
+        const hex = String(uuid || "").replace(/-/g, "");
+        if (!/^[0-9a-f]{32}$/i.test(hex)) {
+          return undefined;
+        }
+        const bytes = new Uint8Array(16);
+        for (let i = 0; i < 16; i += 1) {
+          bytes[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+        }
+        return bytes;
+      }
+
+      async function resolveMessagingClient(webpackRequire) {
+        let appState = resolveAppState(webpackRequire);
+        if (appState?.messaging?.client) {
+          return { appState, messagingClient: appState.messaging.client };
+        }
+        const initWasm = appState?.wasm?.initialize;
+        if (!appState?.wasm?.workerProxy && typeof initWasm === "function") {
+          try {
+            await Promise.race([
+              initWasm(),
+              new Promise((_, reject) => setTimeout(() => reject(new Error("wasm_init_timeout")), 5000)),
+            ]);
+          } catch {
+          }
+          for (let i = 0; i < 50; i += 1) {
+            appState = resolveAppState(webpackRequire);
+            if (appState?.wasm?.workerProxy) {
+              break;
+            }
+            await new Promise((resolve) => setTimeout(resolve, 100));
+          }
+        }
+        const initClient = appState?.messaging?.initClient || appState?.messaging?.initializeClient;
+        if (typeof initClient === "function") {
+          try {
+            await Promise.race([
+              initClient(),
+              new Promise((_, reject) => setTimeout(() => reject(new Error("messaging_init_timeout")), 5000)),
+            ]);
+          } catch {
+          }
+          for (let i = 0; i < 50; i += 1) {
+            appState = resolveAppState(webpackRequire);
+            if (appState?.messaging?.client) {
+              break;
+            }
+            await new Promise((resolve) => setTimeout(resolve, 100));
+          }
+        }
+        return { appState, messagingClient: appState?.messaging?.client };
+      }
+
+      function fireBundleCall(fn) {
+        try {
+          const value = fn();
+          if (value && typeof value.then === "function") {
+            value.catch(() => {});
+          }
+          return true;
+        } catch {
+          return false;
+        }
+      }
+
+      const webpackRequire = findWebpackRequire();
+      const messaging = safeRequire(webpackRequire, 56639);
+      const { appState, messagingClient } = await resolveMessagingClient(webpackRequire);
+      const conversationID = String(chatID || "");
+      const feedItem = appState?.messaging?.feed?.[conversationID];
+      const conversationRef = feedItem?.conversationId || { id: uuidBytes(conversationID), str: conversationID };
+      if (!messagingClient || !conversationRef?.id) {
+        return {
+          ok: false,
+          error: "messaging_client_unavailable",
+          hasMessagingClient: Boolean(messagingClient),
+          hasConversationRef: Boolean(conversationRef?.id),
+        };
+      }
+
+      if (!typing) {
+        const exitConversation = messaging?.ON;
+        if (typeof exitConversation === "function") {
+          fireBundleCall(() => exitConversation(messagingClient, conversationRef, 0));
+        }
+        return { ok: true, typing: false, method: "bundle_exit_conversation" };
+      }
+
+      const sendTyping = messaging?.zM;
+      if (typeof sendTyping !== "function") {
+        return {
+          ok: false,
+          error: "typing_export_unavailable",
+          exportKeys: Object.keys(messaging || {}).slice(0, 80),
+        };
+      }
+
+      const clampedDurationMs = Math.max(500, Math.min(Number(durationMs || 1500), 8000));
+      const intervalMs = 2000;
+      const started = Date.now();
+      let pulseCount = 0;
+      do {
+        if (fireBundleCall(() => sendTyping(messagingClient, conversationRef))) {
+          pulseCount += 1;
+        }
+        const elapsed = Date.now() - started;
+        const remaining = clampedDurationMs - elapsed;
+        if (remaining <= intervalMs) {
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, intervalMs));
+      } while (Date.now() - started < clampedDurationMs);
+      return { ok: pulseCount > 0, typing: true, method: "bundle_send_typing", pulseCount, durationMs: clampedDurationMs };
+    }, {
+      chatID: String(chatID || ""),
+      typing: Boolean(typing),
+      durationMs: Number(durationMs || 1500),
+    });
+    if (!result?.ok) {
+      throw new Error(result?.error || "Snapchat typing update failed");
+    }
+    return result;
+  }, { priority: 1, timeoutMs: 12000, label: "setTyping" });
 }
 
 export async function getDiagnostics() {
