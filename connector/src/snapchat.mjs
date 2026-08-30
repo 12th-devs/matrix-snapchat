@@ -32,6 +32,15 @@ const CHAT_LIST_SETTLE_MS = Math.max(0, Number(process.env.SNAPCHAT_CHAT_LIST_SE
 const CHAT_DEEP_SCAN_MIN_CACHE = Math.max(0, Number(process.env.SNAPCHAT_CHAT_DEEP_SCAN_MIN_CACHE || 25));
 const CHAT_OPEN_NAVIGATION_TIMEOUT_MS = Math.max(3000, Number(process.env.SNAPCHAT_CHAT_OPEN_NAVIGATION_TIMEOUT_MS || 8000));
 const CONVERSATION_OPEN_ATTEMPTS = Math.max(4, Number(process.env.SNAPCHAT_CONVERSATION_OPEN_ATTEMPTS || 10));
+const API_AUTH_WARMUP_TIMEOUT_MS = Math.max(3000, Number(process.env.SNAPCHAT_API_AUTH_WARMUP_TIMEOUT_MS || 10000));
+const API_AUTH_CACHE_MS = Math.max(10000, Number(process.env.SNAPCHAT_API_AUTH_CACHE_MS || 5 * 60 * 1000));
+const MESSENGER_WARMUP_ATTEMPTS = Math.max(1, Number(process.env.SNAPCHAT_MESSENGER_WARMUP_ATTEMPTS || 3));
+const MESSENGER_WARMUP_SETTLE_MS = Math.max(2000, Number(process.env.SNAPCHAT_MESSENGER_WARMUP_SETTLE_MS || 15000));
+const MESSENGER_WARMUP_CHAT_MS = Math.max(2000, Number(process.env.SNAPCHAT_MESSENGER_WARMUP_CHAT_MS || 12000));
+const API_AUTH_REQUEST_TIMEOUT_MS = Math.max(
+  DEFAULT_TIMEOUT_MS + API_AUTH_WARMUP_TIMEOUT_MS + 10000,
+  4 * (API_AUTH_WARMUP_TIMEOUT_MS + MESSENGER_WARMUP_SETTLE_MS) + 15000,
+);
 
 let context;
 let page;
@@ -51,6 +60,8 @@ let identityWarmupAttempted = false;
 let accountIdentityWarmupAttempted = false;
 let capturedIdentitySource = "";
 const capturedAccountEndpoints = new Set();
+let lastAPIAuthSnapshot = null;
+let lastAPIAuthSnapshotAt = 0;
 
 function identityUUIDFromJSON(value, pathParts = [], seen = new Set(), depth = 0) {
   if (!value || typeof value !== "object" || seen.has(value) || depth > 8) {
@@ -94,28 +105,82 @@ function runNextTask() {
 
   pendingTasks.sort((a, b) => a.priority - b.priority || a.id - b.id);
   const next = pendingTasks.shift();
-  const promise = Promise.resolve()
+  const taskTimeoutMs = Math.max(3000, Number(next.timeoutMs || DEFAULT_TIMEOUT_MS + 5000));
+  let taskSettled = false;
+  let timeoutFired = false;
+  let watchdog;
+  const taskPromise = Promise.resolve()
     .then(next.fn)
-    .then(next.resolve, next.reject)
+    .finally(() => {
+      taskSettled = true;
+      clearTimeout(watchdog);
+    });
+  const responsePromise = withTimeout(taskPromise, taskTimeoutMs, `connector task ${next.label || next.id}`)
+    .then(next.resolve, async (error) => {
+      timeoutFired = true;
+      try {
+        console.error(`connector task ${next.label || next.id} failed: ${String(error)}`);
+      } catch {
+      }
+      try {
+        await resetSession();
+      } catch {
+      }
+      next.reject(error);
+    });
+  watchdog = setTimeout(async () => {
+    if (taskSettled || !timeoutFired) {
+      return;
+    }
+    try {
+      console.error(`connector task ${next.label || next.id} still running after timeout; forcing queue recovery`);
+      await resetSession();
+    } catch {
+    }
+    if (!taskSettled && inflight === promise) {
+      inflight = null;
+      runNextTask();
+    }
+  }, taskTimeoutMs + 5000);
+  const promise = taskPromise
+    .catch(() => {
+      // The per-request timeout above may already have returned an error to the
+      // caller, but the underlying browser operation can keep running. Keep the
+      // queue locked until it actually settles so a second persistent Chrome
+      // launch can't race the first one against the same profile.
+    })
     .finally(() => {
       inflight = null;
       runNextTask();
     });
+  responsePromise.catch(() => {});
   inflight = promise;
 }
 
 let taskID = 0;
-function withLock(fn, { priority = 1 } = {}) {
+function withLock(fn, { priority = 1, timeoutMs, label = "" } = {}) {
   return new Promise((resolve, reject) => {
     pendingTasks.push({
       fn,
       priority,
+      timeoutMs,
+      label,
       resolve,
       reject,
       id: taskID++,
     });
     runNextTask();
   });
+}
+
+function withTimeout(promise, timeoutMs, label) {
+  let timer;
+  return Promise.race([
+    Promise.resolve(promise).finally(() => clearTimeout(timer)),
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+    }),
+  ]);
 }
 
 function isSnapchatURL(value) {
@@ -179,6 +244,8 @@ async function ensureSession() {
     args: [
       "--disable-blink-features=AutomationControlled",
       "--disable-dev-shm-usage",
+      "--disable-session-crashed-bubble",
+      "--disable-restore-session-state",
       "--no-first-run",
     ],
   });
@@ -1507,7 +1574,7 @@ export async function createSession() {
       url: currentPage.url(),
       title: await currentPage.title(),
     };
-  }, { priority: 0 });
+  }, { priority: 0, timeoutMs: DEFAULT_TIMEOUT_MS + 5000, label: "session/start" });
 }
 
 export async function getStatus() {
@@ -1523,7 +1590,7 @@ export async function getStatus() {
       url: currentPage.url(),
       visibleChatCount: state === "ready" ? knownChatsByKey.size : 0,
     };
-  }, { priority: 0 });
+  }, { priority: 0, timeoutMs: DEFAULT_TIMEOUT_MS + 5000, label: "session/status" });
 }
 
 async function readSnapchatAPIIdentity(currentPage) {
@@ -1897,16 +1964,99 @@ async function readSnapchatAPIUserAgents(currentPage) {
   };
 }
 
+function hasMessengerHeaders() {
+  return Boolean(lastSnapAPIRequestHeaders?.headers?.["mcs-cof-ids-bin"]);
+}
+
+async function waitForMessengerHeaders(currentPage, timeoutMs, labelText) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (hasMessengerHeaders()) {
+      return true;
+    }
+    if (currentPage && (currentPage.isClosed() || !isSnapchatURL(currentPage.url()))) {
+      return false;
+    }
+    try {
+      await withTimeout(currentPage.waitForTimeout(500), 4000, `${labelText} sleep`);
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+// The messaging-core RPC (SyncConversations) authenticates against a session that
+// the web app only registers once the messenger actually runs in the browser. After a
+// profile restart the page can show a "ready" shell while never booting the messenger,
+// leaving mcs-cof-ids-bin/Bearer un-captured so the Go client replays a dead session.
+// This aggressively reloads the web app and drives into a chat until the messenger
+// headers are captured (or we exhaust the attempt budget).
+async function warmupMessagingSession() {
+  const { context: currentContext } = await ensureSession();
+  let currentPage = pickBestPage(currentContext.pages());
+  if (!currentPage || currentPage.isClosed()) {
+    currentPage = (await ensureSession()).page;
+  }
+  let registered = hasMessengerHeaders();
+  for (let attempt = 1; attempt <= MESSENGER_WARMUP_ATTEMPTS && !registered; attempt += 1) {
+    try {
+      await withTimeout(gotoSnapchat({ reload: true }), API_AUTH_WARMUP_TIMEOUT_MS, `messenger warmup goto ${attempt}`);
+      registered = await waitForMessengerHeaders(currentPage, MESSENGER_WARMUP_SETTLE_MS, `messenger warmup settle ${attempt}`);
+      if (registered) {
+        break;
+      }
+      const safeChat = Array.from(knownChatsByKey.values())
+        .find((chat) => /^Delivered\b/i.test(String(chat.preview || chat.lastMessage || "")) && chat.url);
+      if (safeChat) {
+        try {
+          await withTimeout(currentPage.goto(safeChat.url, { waitUntil: "domcontentloaded" }), API_AUTH_WARMUP_TIMEOUT_MS, `messenger warmup chat ${attempt}`);
+          registered = await waitForMessengerHeaders(currentPage, MESSENGER_WARMUP_CHAT_MS, `messenger warmup chat settle ${attempt}`);
+        } catch (error) {
+          console.error(`warmupMessagingSession: chat drive ${attempt} error: ${String(error)}`);
+        }
+        if (registered) {
+          break;
+        }
+        try {
+          await withTimeout(currentPage.goto(SNAPCHAT_URL, { waitUntil: "domcontentloaded" }), API_AUTH_WARMUP_TIMEOUT_MS, `messenger warmup return ${attempt}`);
+        } catch {
+        }
+      }
+    } catch (error) {
+      console.error(`warmupMessagingSession: attempt ${attempt} error: ${String(error)}`);
+    }
+  }
+  const capturedHeaders = lastSnapAPIRequestHeaders?.headers || {};
+  console.log(`WARMUP ${JSON.stringify({
+    result: hasMessengerHeaders() ? "captured" : `gave_up_after_${MESSENGER_WARMUP_ATTEMPTS}`,
+    capturedHeadersPresent: hasMessengerHeaders(),
+    mcsCofIdsBin: capturedHeaders["mcs-cof-ids-bin"] ? `present(len=${String(capturedHeaders["mcs-cof-ids-bin"]).length})` : "missing",
+    url: currentPage && !currentPage.isClosed() ? currentPage.url() : "",
+  })}`);
+  return currentPage;
+}
+
 export async function getAPIAuth() {
   return withLock(async () => {
+    if (
+      lastAPIAuthSnapshot?.authenticated
+      && Date.now() - lastAPIAuthSnapshotAt < API_AUTH_CACHE_MS
+    ) {
+      return {
+        ...lastAPIAuthSnapshot,
+        cached: true,
+        cacheAgeMs: Date.now() - lastAPIAuthSnapshotAt,
+      };
+    }
     await ensureKnownChatsLoaded();
     let { context: currentContext, page: currentPage } = await ensureSession();
-    if (!lastSnapAPIRequestHeaders?.headers?.["mcs-cof-ids-bin"]) {
+    if (!hasMessengerHeaders()) {
       try {
-        currentPage = await gotoSnapchat({ reload: true });
+        currentPage = await withTimeout(warmupMessagingSession(), 4 * (API_AUTH_WARMUP_TIMEOUT_MS + MESSENGER_WARMUP_SETTLE_MS), "Snapchat messenger warmup");
         currentContext = context || currentContext;
-        await currentPage.waitForTimeout(3000);
-      } catch {
+      } catch (error) {
+        console.error(`getAPIAuth: warmup skipped: ${String(error)}`);
         // Auth can still succeed from cookies; this only warms API header capture.
       }
     }
@@ -1916,11 +2066,12 @@ export async function getAPIAuth() {
         .find((chat) => /^Delivered\b/i.test(String(chat.preview || chat.lastMessage || "")) && chat.url);
       if (safeChat) {
         try {
-          await currentPage.goto(safeChat.url, { waitUntil: "domcontentloaded" });
+          await withTimeout(currentPage.goto(safeChat.url, { waitUntil: "domcontentloaded" }), API_AUTH_WARMUP_TIMEOUT_MS, "Snapchat identity safe-chat warmup");
           await currentPage.waitForTimeout(4000);
-          await currentPage.goto(SNAPCHAT_URL, { waitUntil: "domcontentloaded" });
+          await withTimeout(currentPage.goto(SNAPCHAT_URL, { waitUntil: "domcontentloaded" }), API_AUTH_WARMUP_TIMEOUT_MS, "Snapchat identity return warmup");
           await currentPage.waitForTimeout(2000);
-        } catch {
+        } catch (error) {
+          console.error(`getAPIAuth: identity warmup skipped: ${String(error)}`);
           // A delivered outgoing chat is used only to provoke the current
           // messaging RPC. Auth can continue through the other probes.
         }
@@ -1931,9 +2082,10 @@ export async function getAPIAuth() {
       let accountPage;
       try {
         accountPage = await currentContext.newPage();
-        await accountPage.goto("https://accounts.snapchat.com/v2/welcome", { waitUntil: "domcontentloaded" });
+        await withTimeout(accountPage.goto("https://accounts.snapchat.com/v2/welcome", { waitUntil: "domcontentloaded" }), API_AUTH_WARMUP_TIMEOUT_MS, "Snapchat account identity warmup");
         await accountPage.waitForTimeout(5000);
-      } catch {
+      } catch (error) {
+        console.error(`getAPIAuth: account identity warmup skipped: ${String(error)}`);
       } finally {
         try {
           await accountPage?.close();
@@ -1988,7 +2140,7 @@ export async function getAPIAuth() {
       // browser-context exchange is unavailable.
     }
 
-    return {
+    const snapshot = {
       state: hasNonce && hasSession && hasClient ? "ready" : "missing_cookies",
       authenticated: hasNonce && hasSession && hasClient,
       cookieString,
@@ -2017,7 +2169,27 @@ export async function getAPIAuth() {
       })),
       url: page && !page.isClosed() ? page.url() : "",
     };
-  }, { priority: 0 });
+    if (snapshot.authenticated) {
+      lastAPIAuthSnapshot = snapshot;
+      lastAPIAuthSnapshotAt = Date.now();
+    }
+    const authFingerprint = {
+      authenticated: snapshot.authenticated,
+      state: snapshot.state,
+      cookies: Object.fromEntries((snapshot.cookies || []).map((c) => [c.name, { domain: c.domain, expires: c.expires }])),
+      selfUserID: snapshot.selfUserID ? `present(len=${snapshot.selfUserID.length})` : "missing",
+      selfUserIDSource: snapshot.identitySource || null,
+      username: snapshot.username ? "present" : "missing",
+      ssoToken: snapshot.ssoToken ? `present(len=${snapshot.ssoToken.length})` : "missing",
+      mcsCofIdsBin: snapshot.mcsCofIdsBin ? `present(len=${snapshot.mcsCofIdsBin.length})` : "missing",
+      webVersion: snapshot.webVersion || null,
+      capturedHeadersPresent: Boolean(lastSnapAPIRequestHeaders?.headers?.["mcs-cof-ids-bin"]),
+      pageURL: snapshot.url ? (snapshot.url.length > 80 ? snapshot.url.slice(0, 80) + "..." : snapshot.url) : "",
+      cached: Boolean(snapshot.cached),
+    };
+    console.log(`AUTHFP ${JSON.stringify(authFingerprint)}`);
+    return snapshot;
+  }, { priority: 0, timeoutMs: API_AUTH_REQUEST_TIMEOUT_MS, label: "session/api-auth" });
 }
 
 export async function decryptEELMessage(input = {}) {

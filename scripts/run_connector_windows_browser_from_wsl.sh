@@ -54,5 +54,12 @@ rm -f \
     "${repo_dir}/data/snapchat-profile/SingletonLock" \
     "${repo_dir}/data/snapchat-profile/SingletonSocket"
 
+mkdir -p "${repo_dir}/logs" "${repo_dir}/data/snapchat-profile" "${repo_dir}/data/debug"
+echo "Starting Windows Snapchat connector on port ${PORT}" >&2
+echo "Chrome executable: ${SNAPCHAT_BROWSER_EXECUTABLE_PATH}" >&2
+echo "Chrome profile: ${SNAPCHAT_PROFILE_DIR}" >&2
+echo "Trace directory: ${SNAPCHAT_TRACE_DIR}" >&2
+echo "Headless: ${SNAPCHAT_HEADLESS}; safeNoOpen: ${SNAPCHAT_SAFE_NO_OPEN}" >&2
+
 cd "${repo_dir}/connector"
 exec "${node_exe}" src/index.mjs

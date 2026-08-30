@@ -4,17 +4,40 @@ set -euo pipefail
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 config_path="${SNAPCHAT_BRIDGE_CONFIG:-${HOME}/.local/share/bbctl/bridges/sh-snapchat/config.yaml}"
 bridge_binary="${SNAPCHAT_BRIDGE_BINARY:-${repo_dir}/bin/mautrix-snapchat-bridgev2-wsl-amd64}"
+mode="${1:-full}"
+runtime_dir="${SNAPCHAT_BRIDGE_RUNTIME_DIR:-${repo_dir}/data/runtime}"
+runtime_env="${SNAPCHAT_BRIDGE_RUNTIME_ENV:-${runtime_dir}/local-stack.env}"
+connector_pid_file="${SNAPCHAT_CONNECTOR_PID_FILE:-${runtime_dir}/connector.pid}"
+bridge_pid_file="${SNAPCHAT_BRIDGE_PID_FILE:-${runtime_dir}/bridge.pid}"
+connector_log="${SNAPCHAT_CONNECTOR_LOG:-${repo_dir}/logs/connector.log}"
+connector_stdout="${SNAPCHAT_CONNECTOR_STDOUT:-${repo_dir}/logs/connector.out.log}"
+connector_stderr="${SNAPCHAT_CONNECTOR_STDERR:-${repo_dir}/logs/connector.err.log}"
+bridge_log="${SNAPCHAT_BRIDGE_LOG:-${repo_dir}/logs/bridge.log}"
+startup_timeout_seconds="${SNAPCHAT_CONNECTOR_STARTUP_TIMEOUT_SECONDS:-180}"
 
-if [[ ! -f "${config_path}" ]]; then
-    echo "Beeper bridge config not found at ${config_path}" >&2
-    exit 1
-fi
-if [[ ! -x "${bridge_binary}" ]]; then
-    echo "WSL bridge binary not found at ${bridge_binary}" >&2
-    exit 1
-fi
+usage() {
+    cat >&2 <<EOF
+Usage: $0 [full|bridge-only|stop]
 
-python3 - "${config_path}" <<'PY'
+  full         Start a fresh local stack: Windows connector/Chrome, then WSL bridge.
+  bridge-only Rebuild/restart only the WSL bridge using the existing connector session.
+  stop         Stop the bridge and connector processes tracked by this runner.
+EOF
+}
+
+require_paths() {
+    if [[ ! -f "${config_path}" ]]; then
+        echo "Beeper bridge config not found at ${config_path}" >&2
+        exit 1
+    fi
+    if [[ ! -x "${bridge_binary}" ]]; then
+        echo "WSL bridge binary not found at ${bridge_binary}" >&2
+        exit 1
+    fi
+}
+
+configure_bridge_runtime() {
+    python3 - "${config_path}" <<'PY'
 import re
 import sys
 from pathlib import Path
@@ -32,49 +55,243 @@ for key, value in replacements.items():
     text = re.sub(rf"^(\s*{re.escape(key)}\s*:\s*).*$", rf"\g<1>{value}", text, flags=re.MULTILINE)
 path.write_text(text)
 PY
+}
 
-runtime_secret="$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')"
-windows_host="${SNAPCHAT_CONNECTOR_HOST:-$(ip route show default | awk '{ print $3; exit }')}"
-if [[ -z "${windows_host}" ]]; then
-    echo "Could not determine the Windows host gateway from WSL" >&2
-    exit 1
-fi
+windows_gateway() {
+    ip route show default | awk '{ print $3; exit }'
+}
+
+write_runtime_env() {
+    local runtime_secret windows_host
+    runtime_secret="$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')"
+    windows_host="${SNAPCHAT_CONNECTOR_HOST:-$(windows_gateway)}"
+    if [[ -z "${windows_host}" ]]; then
+        echo "Could not determine the Windows host gateway from WSL" >&2
+        exit 1
+    fi
+
+    mkdir -p "${runtime_dir}" "${repo_dir}/logs"
+    umask 077
+    cat >"${runtime_env}" <<EOF
 export SNAPCHAT_BRIDGE_CONFIG="${config_path}"
 export SNAPCHAT_SHARED_SECRET="${runtime_secret}"
 export SNAPCHAT_CONNECTOR_SHARED_SECRET="${runtime_secret}"
 export SNAPCHAT_CONNECTOR_BASE_URL="${SNAPCHAT_CONNECTOR_BASE_URL:-http://${windows_host}:3101}"
-
-# Text-only baseline. Experimental read/open and media paths stay disabled until
-# they pass isolated live tests.
-export SNAPCHAT_READ_RECEIPTS_ENABLED=false
+export SNAPCHAT_READ_RECEIPTS_ENABLED="${SNAPCHAT_READ_RECEIPTS_ENABLED:-false}"
 export SNAPCHAT_SNAP_MEDIA_ENABLED=false
 export SNAPCHAT_SNAP_MEDIA_ON_READ=false
 export SNAPCHAT_SEND_MEDIA_ENABLED=false
-
-connector_pid=""
-cleanup() {
-    if [[ -n "${connector_pid}" ]] && kill -0 "${connector_pid}" 2>/dev/null; then
-        kill "${connector_pid}" 2>/dev/null || true
-        wait "${connector_pid}" 2>/dev/null || true
-    fi
+EOF
+    chmod 600 "${runtime_env}"
 }
-trap cleanup EXIT INT TERM
 
-"${repo_dir}/scripts/run_connector_windows_browser_from_wsl.sh" &
-connector_pid=$!
-
-for _ in $(seq 1 30); do
-    if "${repo_dir}/scripts/check_connector_local_wsl.sh" >/dev/null 2>&1; then
-        break
+load_runtime_env() {
+    if [[ ! -f "${runtime_env}" ]]; then
+        echo "Runtime env file not found at ${runtime_env}" >&2
+        echo "Run '$0 full' first to create a connector session, or restart the full stack." >&2
+        exit 1
     fi
-    if ! kill -0 "${connector_pid}" 2>/dev/null; then
-        echo "Snapchat connector exited during startup" >&2
-        wait "${connector_pid}"
+    # shellcheck disable=SC1090
+    source "${runtime_env}"
+    if [[ -z "${SNAPCHAT_SHARED_SECRET:-}" || -z "${SNAPCHAT_CONNECTOR_BASE_URL:-}" ]]; then
+        echo "Runtime env file ${runtime_env} is incomplete" >&2
+        exit 1
     fi
-    sleep 1
-done
+    export SNAPCHAT_BRIDGE_CONFIG SNAPCHAT_SHARED_SECRET SNAPCHAT_CONNECTOR_SHARED_SECRET SNAPCHAT_CONNECTOR_BASE_URL
+    export SNAPCHAT_READ_RECEIPTS_ENABLED SNAPCHAT_SNAP_MEDIA_ENABLED SNAPCHAT_SNAP_MEDIA_ON_READ SNAPCHAT_SEND_MEDIA_ENABLED
+}
 
-"${repo_dir}/scripts/check_connector_local_wsl.sh"
-"${repo_dir}/scripts/ensure_beeper_snapchat_registration_wsl.sh"
-cd "${repo_dir}"
-"${bridge_binary}" -c "${config_path}"
+tracked_pid_alive() {
+    local pid_file="$1"
+    [[ -f "${pid_file}" ]] || return 1
+    local pid
+    pid="$(cat "${pid_file}" 2>/dev/null || true)"
+    [[ "${pid}" =~ ^[0-9]+$ ]] || return 1
+    kill -0 "${pid}" 2>/dev/null
+}
+
+windows_pid_alive() {
+    local pid_file="$1"
+    [[ -f "${pid_file}" ]] || return 1
+    local pid
+    pid="$(cat "${pid_file}" 2>/dev/null || true)"
+    [[ "${pid}" =~ ^[0-9]+$ ]] || return 1
+    powershell.exe -NoProfile -Command "\$p = Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if (\$p) { exit 0 } else { exit 1 }" >/dev/null 2>&1
+}
+
+stop_pid_file() {
+    local pid_file="$1" label="$2"
+    if ! [[ -f "${pid_file}" ]]; then
+        return
+    fi
+    local pid
+    pid="$(cat "${pid_file}" 2>/dev/null || true)"
+    if [[ "${pid}" =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null; then
+        echo "Stopping ${label} pid ${pid}"
+        kill "${pid}" 2>/dev/null || true
+        for _ in $(seq 1 10); do
+            if ! kill -0 "${pid}" 2>/dev/null; then
+                break
+            fi
+            sleep 1
+        done
+        if kill -0 "${pid}" 2>/dev/null; then
+            echo "${label} pid ${pid} did not stop after SIGTERM; sending SIGKILL" >&2
+            kill -9 "${pid}" 2>/dev/null || true
+        fi
+    fi
+    rm -f "${pid_file}"
+}
+
+stop_windows_pid_file() {
+    local pid_file="$1" label="$2"
+    if ! [[ -f "${pid_file}" ]]; then
+        return
+    fi
+    local pid
+    pid="$(cat "${pid_file}" 2>/dev/null || true)"
+    if [[ "${pid}" =~ ^[0-9]+$ ]]; then
+        echo "Stopping ${label} Windows pid ${pid}"
+        powershell.exe -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { \$_.ParentProcessId -eq ${pid} } | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force -ErrorAction SilentlyContinue }" >/dev/null 2>&1 || true
+        powershell.exe -NoProfile -Command "Stop-Process -Id ${pid} -Force -ErrorAction SilentlyContinue" >/dev/null 2>&1 || true
+    fi
+    rm -f "${pid_file}"
+}
+
+stop_stack() {
+    stop_pid_file "${bridge_pid_file}" "bridge"
+    stop_windows_pid_file "${connector_pid_file}" "connector"
+}
+
+connector_health() {
+    "${repo_dir}/scripts/check_connector_local_wsl.sh"
+}
+
+start_connector() {
+    if windows_pid_alive "${connector_pid_file}"; then
+        echo "Connector already tracked as running with Windows pid $(cat "${connector_pid_file}")"
+        return
+    fi
+
+    : >"${connector_stdout}"
+    : >"${connector_stderr}"
+    : >"${connector_log}"
+    echo "Starting detached Windows connector/Chrome"
+    echo "Connector stdout: ${connector_stdout}"
+    echo "Connector stderr: ${connector_stderr}"
+
+    local ps_script="${runtime_dir}/start-connector.ps1"
+    local repo_windows node_windows connector_stdout_windows connector_stderr_windows connector_pid_windows
+    repo_windows="$(wslpath -w "${repo_dir}")"
+    node_windows="$(wslpath -w "/mnt/c/Program Files/nodejs/node.exe")"
+    connector_stdout_windows="$(wslpath -w "${connector_stdout}")"
+    connector_stderr_windows="$(wslpath -w "${connector_stderr}")"
+    connector_pid_windows="$(wslpath -w "${connector_pid_file}")"
+    cat >"${ps_script}" <<EOF
+\$ErrorActionPreference = "Stop"
+\$env:PORT = "3101"
+\$env:SNAPCHAT_BROWSER_EXECUTABLE_PATH = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+\$env:SNAPCHAT_PROFILE_DIR = "${repo_windows}\\data\\snapchat-profile"
+\$env:SNAPCHAT_TRACE_DIR = "${repo_windows}\\data\\debug"
+\$env:SNAPCHAT_HEADLESS = "true"
+\$env:SNAPCHAT_SAFE_NO_OPEN = "1"
+\$env:SNAPCHAT_SHARED_SECRET = "${SNAPCHAT_SHARED_SECRET}"
+\$process = Start-Process -FilePath "${node_windows}" -ArgumentList "src/index.mjs" -WorkingDirectory "${repo_windows}\\connector" -RedirectStandardOutput "${connector_stdout_windows}" -RedirectStandardError "${connector_stderr_windows}" -WindowStyle Hidden -PassThru
+Set-Content -LiteralPath "${connector_pid_windows}" -Value ([string]\$process.Id) -Encoding ascii
+EOF
+    cmd.exe /c start "" /min powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(wslpath -w "${ps_script}")" >/dev/null 2>&1 </dev/null &
+    for _ in $(seq 1 50); do
+        if [[ -s "${connector_pid_file}" ]]; then
+            break
+        fi
+        sleep 0.1
+    done
+    local connector_pid
+    connector_pid="$(tr -dc '0-9' <"${connector_pid_file}" 2>/dev/null || true)"
+    if [[ -z "${connector_pid}" ]]; then
+        echo "Failed to start Windows connector. PowerShell launcher did not return a pid." >&2
+        exit 1
+    fi
+    echo "${connector_pid}" >"${connector_pid_file}"
+    {
+        echo "Started Windows connector pid ${connector_pid}"
+        echo "stdout: ${connector_stdout}"
+        echo "stderr: ${connector_stderr}"
+    } >"${connector_log}"
+}
+
+wait_for_connector() {
+    local deadline=$((SECONDS + startup_timeout_seconds))
+    local last_error=""
+    while (( SECONDS < deadline )); do
+        if ! windows_pid_alive "${connector_pid_file}"; then
+            echo "Snapchat connector exited during startup. Connector stdout/stderr:" >&2
+            tail -80 "${connector_stdout}" >&2 || true
+            tail -80 "${connector_stderr}" >&2 || true
+            exit 1
+        fi
+        if output="$(connector_health 2>&1)"; then
+            echo "${output}"
+            return
+        fi
+        last_error="${output}"
+        sleep 2
+    done
+
+    echo "Timed out after ${startup_timeout_seconds}s waiting for Snapchat connector health at ${SNAPCHAT_CONNECTOR_BASE_URL}" >&2
+    echo "Last health-check error:" >&2
+    printf '%s\n' "${last_error}" >&2
+    echo "Last connector log lines:" >&2
+    tail -120 "${connector_stdout}" >&2 || true
+    tail -120 "${connector_stderr}" >&2 || true
+    exit 1
+}
+
+start_bridge() {
+    echo "Starting WSL bridge: ${bridge_binary}"
+    echo "Bridge log: ${bridge_log}"
+    (
+        echo "==== bridge start $(date -Is) ===="
+        exec "${bridge_binary}" -c "${config_path}"
+    ) >>"${bridge_log}" 2>&1 &
+    local bridge_pid=$!
+    echo "${bridge_pid}" >"${bridge_pid_file}"
+    wait "${bridge_pid}"
+}
+
+case "${mode}" in
+    full)
+        require_paths
+        configure_bridge_runtime
+        stop_stack
+        write_runtime_env
+        load_runtime_env
+        start_connector
+        wait_for_connector
+        "${repo_dir}/scripts/ensure_beeper_snapchat_registration_wsl.sh"
+        cd "${repo_dir}"
+        start_bridge
+        ;;
+    bridge-only)
+        require_paths
+        configure_bridge_runtime
+        load_runtime_env
+        if ! connector_health; then
+            echo "Connector is not healthy; use '$0 full' to restart connector/Chrome and regenerate the runtime secret." >&2
+            exit 1
+        fi
+        stop_pid_file "${bridge_pid_file}" "bridge"
+        cd "${repo_dir}"
+        start_bridge
+        ;;
+    stop)
+        stop_stack
+        ;;
+    -h|--help|help)
+        usage
+        ;;
+    *)
+        usage
+        exit 2
+        ;;
+esac
