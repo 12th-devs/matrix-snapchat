@@ -14,6 +14,8 @@ import (
 	"maunium.net/go/mautrix/bridgev2/networkid"
 )
 
+const apiAuthRetryWindow = 45 * time.Second
+
 func (sa *SnapchatAPI) isSeen(chatName, messageID string) bool {
 	sa.mu.Lock()
 	defer sa.mu.Unlock()
@@ -502,6 +504,10 @@ func (sa *SnapchatAPI) ensureSnapClient(ctx context.Context) (*snapapi.Client, e
 	if err != nil {
 		return nil, fmt.Errorf("get Snapchat API auth: %w", err)
 	}
+	auth, err = sa.waitForCompleteAPIAuth(ctx, auth)
+	if err != nil {
+		return nil, err
+	}
 	sa.updateLoginState(&sidecar.SessionStatus{
 		State:         auth.State,
 		Authenticated: auth.Authenticated,
@@ -574,6 +580,54 @@ func (sa *SnapchatAPI) ensureSnapClient(ctx context.Context) (*snapapi.Client, e
 	sa.apiAuthCheckedAt = time.Now()
 	sa.apiMu.Unlock()
 	return client, nil
+}
+
+func (sa *SnapchatAPI) waitForCompleteAPIAuth(ctx context.Context, auth *sidecar.APIAuth) (*sidecar.APIAuth, error) {
+	deadline := time.Now().Add(apiAuthRetryWindow)
+	for {
+		missing := missingAPIAuthFields(auth)
+		if len(missing) == 0 {
+			return auth, nil
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("connector API auth incomplete after warmup: missing %s", strings.Join(missing, ", "))
+		}
+		timer := time.NewTimer(3 * time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+		next, err := sa.Client.APIAuth(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("get Snapchat API auth: %w", err)
+		}
+		auth = next
+	}
+}
+
+func missingAPIAuthFields(auth *sidecar.APIAuth) []string {
+	if auth == nil {
+		return []string{"response"}
+	}
+	missing := make([]string, 0, 5)
+	if !auth.Authenticated {
+		missing = append(missing, "authenticated")
+	}
+	if strings.TrimSpace(auth.CookieString) == "" {
+		missing = append(missing, "cookies")
+	}
+	if strings.TrimSpace(auth.SelfUserID) == "" {
+		missing = append(missing, "self_user_id")
+	}
+	if strings.TrimSpace(auth.SSOToken) == "" {
+		missing = append(missing, "sso_token")
+	}
+	if strings.TrimSpace(auth.MCSCOFIDsBin) == "" {
+		missing = append(missing, "mcs_cof_ids_bin")
+	}
+	return missing
 }
 
 func (sa *SnapchatAPI) invalidateSnapClient() {

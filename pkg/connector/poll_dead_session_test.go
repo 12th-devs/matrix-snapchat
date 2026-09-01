@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	sidecar "github.com/colej/mautrix-snapchat/internal/connector"
 	"github.com/colej/mautrix-snapchat/internal/snapapi"
 )
 
@@ -15,6 +16,34 @@ func unauthorizedErr() error {
 
 func unrelatedErr() error {
 	return errors.New("POST .../SyncConversations returned 500 internal server error")
+}
+
+func TestMissingAPIAuthFieldsRequiresMessengerHeaders(t *testing.T) {
+	missing := missingAPIAuthFields(nil)
+	if len(missing) != 1 || missing[0] != "response" {
+		t.Fatalf("nil auth missing fields = %v, want [response]", missing)
+	}
+
+	missing = missingAPIAuthFields(&sidecar.APIAuth{
+		Authenticated: true,
+		CookieString:  "cookie=value",
+		SSOToken:      "sso",
+		SelfUserID:    "11111111-1111-1111-1111-111111111111",
+	})
+	if len(missing) != 1 || missing[0] != "mcs_cof_ids_bin" {
+		t.Fatalf("missing fields = %v, want [mcs_cof_ids_bin]", missing)
+	}
+
+	missing = missingAPIAuthFields(&sidecar.APIAuth{
+		Authenticated: true,
+		CookieString:  "cookie=value",
+		SSOToken:      "sso",
+		SelfUserID:    "11111111-1111-1111-1111-111111111111",
+		MCSCOFIDsBin:  "header",
+	})
+	if len(missing) != 0 {
+		t.Fatalf("complete auth missing fields = %v, want none", missing)
+	}
 }
 
 // TestSingleUnauthorizedDoesNotMarkDead verifies a single/transient messaging

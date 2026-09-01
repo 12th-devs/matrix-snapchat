@@ -339,6 +339,9 @@ func (c *Client) resolveEntryNames(ctx context.Context, entries []*protos.Conver
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for id, profile := range profiles {
+		if profile.Username != "" {
+			c.usernamesByUserID[id] = profile.Username
+		}
 		if profile.Name != "" {
 			c.namesByUserID[id] = profile.Name
 		}

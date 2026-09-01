@@ -440,3 +440,27 @@ func TestSyncConversationListingUsesFreshToken(t *testing.T) {
 		t.Fatalf("listing request carried sync token %q, want empty", listingRequests[0].GetSyncToken())
 	}
 }
+
+func TestChatFromEntryUsesCachedUsernameWhenDisplayNameMissing(t *testing.T) {
+	selfID := "99999999-9999-9999-9999-999999999999"
+	otherID := "11111111-1111-1111-1111-111111111111"
+	c := &Client{
+		selfUserID:        selfID,
+		namesByUserID:     map[string]string{},
+		usernamesByUserID: map[string]string{otherID: "snapuser"},
+		avatarsByUserID:   map[string]string{},
+	}
+	entry := mustEntry(t, "55555555-5555-5555-5555-555555555555")
+	entry.Participants = []*protos.UUID{mustUUID(t, selfID), mustUUID(t, otherID)}
+
+	chat := c.chatFromEntry(entry)
+	if chat.Name != "snapuser" {
+		t.Fatalf("chat name = %q, want username fallback", chat.Name)
+	}
+	if chat.Username != "snapuser" {
+		t.Fatalf("chat username = %q, want cached username", chat.Username)
+	}
+	if chat.OtherUserID != otherID {
+		t.Fatalf("other user ID = %q, want %q", chat.OtherUserID, otherID)
+	}
+}

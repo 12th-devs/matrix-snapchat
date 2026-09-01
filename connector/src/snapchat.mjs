@@ -956,6 +956,35 @@ function findKnownChat(chatID, chatName) {
   return null;
 }
 
+function pickWarmupChat(attempt = 1) {
+  const chats = Array.from(knownChatsByKey.values())
+    .filter((chat) => chat?.url && isSnapchatURL(chat.url) && chat.name);
+  const ranked = [
+    ...chats.filter((chat) => /^Delivered\b/i.test(String(chat.preview || chat.lastMessage || "")) && /^[\x20-\x7e]+$/.test(chat.name)),
+    ...chats.filter((chat) => /^Delivered\b/i.test(String(chat.preview || chat.lastMessage || "")) && !/^[\x20-\x7e]+$/.test(chat.name)),
+    ...chats.filter((chat) => /^[\x20-\x7e]+$/.test(chat.name)),
+    ...chats,
+  ];
+  const seen = new Set();
+  const deduped = ranked.filter((chat) => {
+    const key = chatCacheKey(chat);
+    if (!key || seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
+  return deduped.length ? deduped[(Math.max(1, attempt) - 1) % deduped.length] : null;
+}
+
+async function openWarmupChat(chat, labelText) {
+  return withTimeout(
+    openChat(chat.name, chat.id || getConversationIDFromURL(chat.url), chat.url, { searchFallback: false }),
+    API_AUTH_WARMUP_TIMEOUT_MS + MESSENGER_WARMUP_CHAT_MS,
+    labelText,
+  );
+}
+
 async function readSidebarChatRows(currentPage) {
   if ((await detectState(currentPage)) === "error") {
     currentPage = await gotoSnapchat({ reload: true });
@@ -2001,16 +2030,22 @@ async function warmupMessagingSession() {
   let registered = hasMessengerHeaders();
   for (let attempt = 1; attempt <= MESSENGER_WARMUP_ATTEMPTS && !registered; attempt += 1) {
     try {
-      await withTimeout(gotoSnapchat({ reload: true }), API_AUTH_WARMUP_TIMEOUT_MS, `messenger warmup goto ${attempt}`);
+      currentPage = await withTimeout(gotoSnapchat({ reload: true }), API_AUTH_WARMUP_TIMEOUT_MS, `messenger warmup goto ${attempt}`);
       registered = await waitForMessengerHeaders(currentPage, MESSENGER_WARMUP_SETTLE_MS, `messenger warmup settle ${attempt}`);
       if (registered) {
         break;
       }
-      const safeChat = Array.from(knownChatsByKey.values())
-        .find((chat) => /^Delivered\b/i.test(String(chat.preview || chat.lastMessage || "")) && chat.url);
+      try {
+        await clearSearchBox(currentPage);
+        const sidebarChats = await extractChats(currentPage);
+        mergeKnownChats(sidebarChats);
+      } catch (error) {
+        console.error(`warmupMessagingSession: sidebar scan ${attempt} error: ${String(error)}`);
+      }
+      const safeChat = pickWarmupChat(attempt);
       if (safeChat) {
         try {
-          await withTimeout(currentPage.goto(safeChat.url, { waitUntil: "domcontentloaded" }), API_AUTH_WARMUP_TIMEOUT_MS, `messenger warmup chat ${attempt}`);
+          currentPage = await openWarmupChat(safeChat, `messenger warmup open chat ${attempt}`);
           registered = await waitForMessengerHeaders(currentPage, MESSENGER_WARMUP_CHAT_MS, `messenger warmup chat settle ${attempt}`);
         } catch (error) {
           console.error(`warmupMessagingSession: chat drive ${attempt} error: ${String(error)}`);
@@ -2023,10 +2058,16 @@ async function warmupMessagingSession() {
         } catch {
         }
       }
+      if (!registered && attempt === MESSENGER_WARMUP_ATTEMPTS - 1) {
+        await resetSession();
+        const fresh = await ensureSession();
+        currentPage = fresh.page;
+      }
     } catch (error) {
       console.error(`warmupMessagingSession: attempt ${attempt} error: ${String(error)}`);
     }
   }
+  await saveKnownChats();
   const capturedHeaders = lastSnapAPIRequestHeaders?.headers || {};
   console.log(`WARMUP ${JSON.stringify({
     result: hasMessengerHeaders() ? "captured" : `gave_up_after_${MESSENGER_WARMUP_ATTEMPTS}`,
@@ -2062,11 +2103,10 @@ export async function getAPIAuth() {
     }
     if (!capturedSelfUserID && !identityWarmupAttempted) {
       identityWarmupAttempted = true;
-      const safeChat = Array.from(knownChatsByKey.values())
-        .find((chat) => /^Delivered\b/i.test(String(chat.preview || chat.lastMessage || "")) && chat.url);
+      const safeChat = pickWarmupChat();
       if (safeChat) {
         try {
-          await withTimeout(currentPage.goto(safeChat.url, { waitUntil: "domcontentloaded" }), API_AUTH_WARMUP_TIMEOUT_MS, "Snapchat identity safe-chat warmup");
+          currentPage = await openWarmupChat(safeChat, "Snapchat identity open-chat warmup");
           await currentPage.waitForTimeout(4000);
           await withTimeout(currentPage.goto(SNAPCHAT_URL, { waitUntil: "domcontentloaded" }), API_AUTH_WARMUP_TIMEOUT_MS, "Snapchat identity return warmup");
           await currentPage.waitForTimeout(2000);

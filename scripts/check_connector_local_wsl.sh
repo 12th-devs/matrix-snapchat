@@ -69,4 +69,24 @@ captured_headers = api_auth.get("apiRequestHeaders", {}).get("headers", {})
 print("api_captured_header_names=" + ",".join(sorted(captured_headers)))
 print("api_cookie_names=" + ",".join(sorted(cookie.get("name", "") for cookie in api_auth.get("cookies", []))))
 print(f"chat_count={len(chats)}")
+
+missing = []
+if not health.get("ok"):
+    missing.append("healthz")
+if not status.get("authenticated"):
+    missing.append("authenticated_session")
+if not api_auth.get("authenticated"):
+    missing.append("api_authenticated")
+if not api_auth.get("ssoToken"):
+    missing.append("sso_token")
+if not api_auth.get("selfUserID"):
+    missing.append("self_user_id")
+if not api_auth.get("mcsCofIdsBin"):
+    missing.append("mcs_cof_ids_bin")
+if not captured_headers.get("mcs-cof-ids-bin"):
+    missing.append("captured_messenger_headers")
+if status.get("authenticated") and len(chats) == 0:
+    missing.append("visible_chats")
+if missing:
+    raise SystemExit("connector_not_ready=" + ",".join(missing))
 PY

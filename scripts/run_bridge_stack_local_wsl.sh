@@ -50,10 +50,57 @@ replacements = {
     "api_mode": "api_only",
     "dom_fallback_enabled": "false",
     "auto_fetch_messages": "true",
+    "delete_outbound_on_ack": "false",
+    "disable_device_change_key_rotation": "false",
 }
 for key, value in replacements.items():
     text = re.sub(rf"^(\s*{re.escape(key)}\s*:\s*).*$", rf"\g<1>{value}", text, flags=re.MULTILINE)
 path.write_text(text)
+PY
+}
+
+reset_outbound_megolm_sessions() {
+    if [[ "${SNAPCHAT_BRIDGE_RESET_OUTBOUND_MEGOLM_ON_START:-true}" != "true" ]]; then
+        return
+    fi
+    python3 - "${config_path}" "${repo_dir}" <<'PY'
+import re
+import sqlite3
+import sys
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+
+config_path = Path(sys.argv[1])
+repo_dir = Path(sys.argv[2])
+text = config_path.read_text()
+match = re.search(r"(?m)^\s*uri:\s*(.+?)\s*$", text)
+if not match:
+    sys.exit(0)
+
+uri = match.group(1).strip().strip('"').strip("'")
+if uri.startswith("file:"):
+    parsed = urlparse(uri)
+    db_value = unquote(parsed.path or parsed.netloc)
+else:
+    db_value = uri.split("?", 1)[0]
+if not db_value or re.match(r"^[a-z][a-z0-9+.-]*://", db_value, re.I):
+    sys.exit(0)
+
+db_path = Path(db_value)
+if not db_path.is_absolute():
+    db_path = repo_dir / db_path
+if not db_path.exists():
+    sys.exit(0)
+
+with sqlite3.connect(str(db_path)) as db:
+    present = db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='crypto_megolm_outbound_session'",
+    ).fetchone()
+    if not present:
+        sys.exit(0)
+    deleted = db.execute("DELETE FROM crypto_megolm_outbound_session").rowcount
+    db.commit()
+print(f"Reset outbound Megolm sessions in {db_path} rows={deleted}")
 PY
 }
 
@@ -193,7 +240,7 @@ start_connector() {
 \$env:SNAPCHAT_BROWSER_EXECUTABLE_PATH = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
 \$env:SNAPCHAT_PROFILE_DIR = "${repo_windows}\\data\\snapchat-profile"
 \$env:SNAPCHAT_TRACE_DIR = "${repo_windows}\\data\\debug"
-\$env:SNAPCHAT_HEADLESS = "true"
+\$env:SNAPCHAT_HEADLESS = "${SNAPCHAT_HEADLESS:-false}"
 \$env:SNAPCHAT_SAFE_NO_OPEN = "1"
 \$env:SNAPCHAT_SHARED_SECRET = "${SNAPCHAT_SHARED_SECRET}"
 \$process = Start-Process -FilePath "${node_windows}" -ArgumentList "src/index.mjs" -WorkingDirectory "${repo_windows}\\connector" -RedirectStandardOutput "${connector_stdout_windows}" -RedirectStandardError "${connector_stderr_windows}" -WindowStyle Hidden -PassThru
@@ -270,6 +317,7 @@ case "${mode}" in
         wait_for_connector
         "${repo_dir}/scripts/ensure_beeper_snapchat_registration_wsl.sh"
         cd "${repo_dir}"
+        reset_outbound_megolm_sessions
         start_bridge
         ;;
     bridge-only)
@@ -282,6 +330,7 @@ case "${mode}" in
         fi
         stop_pid_file "${bridge_pid_file}" "bridge"
         cd "${repo_dir}"
+        reset_outbound_megolm_sessions
         start_bridge
         ;;
     stop)

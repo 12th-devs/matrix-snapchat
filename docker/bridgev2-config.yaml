@@ -398,7 +398,7 @@ encryption:
     delete_keys:
         # Beeper-specific: delete outbound sessions when hungryserv confirms
         # that the user has uploaded the key to key backup.
-        delete_outbound_on_ack: true
+        delete_outbound_on_ack: false
         # Don't store outbound sessions in the inbound table.
         dont_store_outbound: false
         # Ratchet megolm sessions forward after decrypting messages.
@@ -448,7 +448,7 @@ encryption:
         messages: 10000
         # Disable rotating keys when a user's devices change?
         # You should not enable this option unless you understand all the implications.
-        disable_device_change_key_rotation: true
+        disable_device_change_key_rotation: false
 
 # Logging config. See https://github.com/tulir/zeroconfig for details.
 logging:
