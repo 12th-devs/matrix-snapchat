@@ -284,16 +284,22 @@ type TypingParticipant struct {
 
 // TypingStateResponse mirrors the connector's GET /typing-state payload.
 type TypingStateResponse struct {
-	OK            bool                          `json:"ok"`
-	HasPresence   bool                          `json:"hasPresence"`
+	OK            bool                           `json:"ok"`
+	HasPresence   bool                           `json:"hasPresence"`
 	Conversations map[string][]TypingParticipant `json:"conversations"`
 	Error         string                         `json:"error,omitempty"`
 }
 
 // TypingState fetches the current remote typing participants per conversation
 // from the connector's browser session. It never opens media and is read-only.
-func (c *Client) TypingState(ctx context.Context) (*TypingStateResponse, error) {
-	req, err := c.newRequest(ctx, http.MethodGet, "/typing-state", nil)
+func (c *Client) TypingState(ctx context.Context, chatID string) (*TypingStateResponse, error) {
+	path := "/typing-state"
+	if chatID = strings.TrimSpace(chatID); chatID != "" {
+		query := url.Values{}
+		query.Set("chatId", chatID)
+		path += "?" + query.Encode()
+	}
+	req, err := c.newRequest(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return nil, err
 	}

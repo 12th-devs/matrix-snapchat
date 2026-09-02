@@ -149,8 +149,8 @@ export function createApp({
     res.status(202).json(result);
   }));
 
-  app.get("/typing-state", asyncRoute(async (_req, res) => {
-    res.json(await bridge.getTypingState());
+  app.get("/typing-state", asyncRoute(async (req, res) => {
+    res.json(await bridge.getTypingState(String(req.query.chatId || "")));
   }));
 
   app.post("/typing", asyncRoute(async (req, res) => {

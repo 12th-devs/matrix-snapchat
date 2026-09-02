@@ -13,6 +13,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/bridgev2/simplevent"
+	"maunium.net/go/mautrix/event"
 )
 
 func (sa *SnapchatAPI) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*bridgev2.ChatInfo, error) {
@@ -255,6 +256,65 @@ func (sa *SnapchatAPI) queueChatResyncWithInfo(chatID, chatName string, force bo
 	})
 	log.Printf("bridgev2 map: queued chat resync chat_id=%s name=%q force=%t existing_match=portal_key:%s", chatID, name, force, portalKey.ID)
 	return true
+}
+
+func (sa *SnapchatAPI) repairChatMemberProfiles(ctx context.Context, portal *database.Portal, info *bridgev2.ChatInfo) {
+	if sa == nil || sa.UserLogin == nil || sa.UserLogin.Bridge == nil || portal == nil || portal.MXID == "" || info == nil || info.Members == nil {
+		return
+	}
+	for userID, member := range info.Members.MemberMap {
+		if userID == "" || member.UserInfo == nil || member.UserInfo.Name == nil {
+			continue
+		}
+		expectedName := strings.TrimSpace(*member.UserInfo.Name)
+		if expectedName == "" || strings.EqualFold(expectedName, "unknown") || snapUUIDPattern.MatchString(expectedName) {
+			continue
+		}
+		ghost, err := sa.UserLogin.Bridge.GetGhostByID(ctx, userID)
+		if err != nil {
+			log.Printf("bridgev2 profile: failed to get ghost for member repair room=%s user=%s err=%v", portal.MXID, userID, err)
+			continue
+		}
+		ghost.UpdateInfo(ctx, member.UserInfo)
+		ghostMXID := ghost.Intent.GetMXID()
+		actual, err := sa.UserLogin.Bridge.Matrix.GetMemberInfo(ctx, portal.MXID, ghostMXID)
+		if err != nil {
+			log.Printf("bridgev2 profile: failed to read member profile room=%s user=%s ghost_mxid=%s err=%v", portal.MXID, userID, ghostMXID, err)
+			continue
+		}
+		if !memberDisplayNameNeedsRepair(actual, expectedName) {
+			continue
+		}
+		previousName := ""
+		avatarURL := ghost.AvatarMXC
+		if actual != nil {
+			previousName = actual.Displayname
+			if avatarURL == "" {
+				avatarURL = actual.AvatarURL
+			}
+		}
+		content := &event.Content{Parsed: &event.MemberEventContent{
+			Membership:  event.MembershipJoin,
+			Displayname: expectedName,
+			AvatarURL:   avatarURL,
+		}}
+		if _, err = ghost.Intent.SendState(ctx, portal.MXID, event.StateMember, ghostMXID.String(), content, time.Now()); err != nil {
+			log.Printf("bridgev2 profile: failed to repair member displayname room=%s user=%s ghost_mxid=%s expected=%q actual=%q err=%v", portal.MXID, userID, ghostMXID, expectedName, previousName, err)
+			continue
+		}
+		log.Printf("bridgev2 profile: repaired member displayname room=%s user=%s ghost_mxid=%s expected=%q actual=%q", portal.MXID, userID, ghostMXID, expectedName, previousName)
+	}
+}
+
+func memberDisplayNameNeedsRepair(actual *event.MemberEventContent, expectedName string) bool {
+	expectedName = strings.TrimSpace(expectedName)
+	if expectedName == "" || strings.EqualFold(expectedName, "unknown") || snapUUIDPattern.MatchString(expectedName) {
+		return false
+	}
+	if actual == nil {
+		return true
+	}
+	return strings.TrimSpace(actual.Displayname) != expectedName
 }
 
 func (sa *SnapchatAPI) queueStoredPortalResyncs(ctx context.Context) {

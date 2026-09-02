@@ -108,9 +108,13 @@ func (sa *SnapchatAPI) syncTypingState(ctx context.Context) {
 	if sa == nil || !sa.typingEnabled() || sa.Client == nil || sa.UserLogin == nil || sa.UserLogin.Bridge == nil {
 		return
 	}
-	resp, err := sa.Client.TypingState(ctx)
+	watchChatID := sa.currentTypingPresenceChat()
+	resp, err := sa.Client.TypingState(ctx, watchChatID)
 	if err != nil {
 		return
+	}
+	if watchChatID != "" && len(resp.Conversations) > 0 {
+		zerolog.Ctx(ctx).Debug().Str("diag", "remote_typing").Str("watch_chat_id", watchChatID).Int("conversation_count", len(resp.Conversations)).Msg("typing: connector returned presence state")
 	}
 	current := make(map[string]map[string]bool)
 	for chatID, participants := range resp.Conversations {

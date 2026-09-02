@@ -22,6 +22,7 @@ func (sa *SnapchatAPI) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Ma
 		return nil, fmt.Errorf("missing Matrix message data")
 	}
 	chatID := string(msg.Portal.ID)
+	sa.noteTypingPresenceChat(chatID)
 	eventID := ""
 	if msg.Event != nil {
 		eventID = string(msg.Event.ID)
@@ -188,6 +189,7 @@ func (sa *SnapchatAPI) HandleMatrixTyping(ctx context.Context, msg *bridgev2.Mat
 	if chatID == "" {
 		return nil
 	}
+	sa.noteTypingPresenceChat(chatID)
 	if !sa.useAPI() {
 		log.Printf("bridgev2 event_class: kind=typing source=matrix chat_id=%s typing=%t action=skip reason=non_api", chatID, msg.IsTyping)
 		log.Printf("bridgev2 typing: skipping non-API typing side effects chat_id=%s typing=%t", chatID, msg.IsTyping)

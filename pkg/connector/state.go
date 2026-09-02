@@ -437,6 +437,25 @@ func (sa *SnapchatAPI) claimTypingUpdate(chatID string, typing bool, minInterval
 	return true
 }
 
+func (sa *SnapchatAPI) noteTypingPresenceChat(chatID string) {
+	chatID = strings.TrimSpace(chatID)
+	if sa == nil || chatID == "" {
+		return
+	}
+	sa.mu.Lock()
+	defer sa.mu.Unlock()
+	sa.typingPresenceChatID = chatID
+}
+
+func (sa *SnapchatAPI) currentTypingPresenceChat() string {
+	if sa == nil {
+		return ""
+	}
+	sa.mu.Lock()
+	defer sa.mu.Unlock()
+	return sa.typingPresenceChatID
+}
+
 func (sa *SnapchatAPI) isSidebarBaselineReady() bool {
 	sa.mu.Lock()
 	defer sa.mu.Unlock()

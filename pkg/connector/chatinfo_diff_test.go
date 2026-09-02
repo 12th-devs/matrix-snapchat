@@ -191,3 +191,18 @@ func TestMessagePathUnaffectedByResyncSkip(t *testing.T) {
 		t.Fatal("fresh message must not be marked seen by the resync fingerprint path")
 	}
 }
+
+func TestMemberDisplayNameNeedsRepair(t *testing.T) {
+	if !memberDisplayNameNeedsRepair(&event.MemberEventContent{Membership: event.MembershipJoin}, "Loreleiii") {
+		t.Fatal("blank Matrix member display name should be repaired")
+	}
+	if !memberDisplayNameNeedsRepair(&event.MemberEventContent{Membership: event.MembershipJoin, Displayname: "Thugg"}, "Loreleiii") {
+		t.Fatal("stale Matrix member display name should be repaired")
+	}
+	if memberDisplayNameNeedsRepair(&event.MemberEventContent{Membership: event.MembershipJoin, Displayname: "Loreleiii"}, "Loreleiii") {
+		t.Fatal("matching Matrix member display name should not be repaired")
+	}
+	if memberDisplayNameNeedsRepair(&event.MemberEventContent{Membership: event.MembershipJoin, Displayname: ""}, "336e641e-e5f3-4407-8075-f6f8913e00aa") {
+		t.Fatal("UUID-like expected display name must not be applied")
+	}
+}

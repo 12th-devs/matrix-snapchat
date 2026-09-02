@@ -2,7 +2,9 @@ package connector
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -10,8 +12,11 @@ import (
 	"github.com/colej/mautrix-snapchat/internal/store"
 	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/bridgev2/simplevent"
+	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/id"
 
 	sidecar "github.com/colej/mautrix-snapchat/internal/connector"
 )
@@ -102,19 +107,41 @@ func (sa *SnapchatAPI) syncReadWatermarks(ctx context.Context, chat sidecar.Chat
 			log.Printf("bridgev2 event_class: kind=read_receipt source=snapchat chat_id=%s participant=%s watermark=%d action=skip reason=bridge_target_unmapped", chat.ID, adv.Participant, adv.Watermark)
 			continue
 		}
-		sa.markReadWatermarkSynced(chat.ID, adv.Participant, adv.Watermark)
 		receiptSender := makeUserID(adv.Participant)
-		log.Printf("bridgev2 event_class: kind=read_receipt source=snapchat chat_id=%s participant=%s watermark=%d target_remote_id=%s target_mxid=%s target_sender=%s target_double_puppeted=%t receipt_sender=%s action=queue", chat.ID, adv.Participant, adv.Watermark, targetRemoteID, bridgeTarget.MXID, bridgeTarget.SenderID, bridgeTarget.IsDoublePuppeted, receiptSender)
+		if err := sa.emitRemoteReadReceipt(ctx, chat, adv, target, bridgeTarget, receiptSender); err != nil {
+			log.Printf("bridgev2 event_class: kind=read_receipt source=snapchat chat_id=%s participant=%s watermark=%d target_remote_id=%s target_mxid=%s target_sender=%s target_double_puppeted=%t receipt_sender=%s action=direct_receipt_failed endpoint=/receipt/m.read err=%v", chat.ID, adv.Participant, adv.Watermark, targetRemoteID, bridgeTarget.MXID, bridgeTarget.SenderID, bridgeTarget.IsDoublePuppeted, receiptSender, err)
+			continue
+		}
+		sa.markReadWatermarkSynced(chat.ID, adv.Participant, adv.Watermark)
+	}
+}
+
+func (sa *SnapchatAPI) emitRemoteReadReceipt(ctx context.Context, chat sidecar.Chat, advance watermarkAdvance, target networkid.MessageID, bridgeTarget *database.Message, receiptSender networkid.UserID) error {
+	targetRemoteID := strconv.FormatInt(advance.Watermark, 10)
+	portalKey := networkid.PortalKey{
+		ID:       networkid.PortalID(chat.ID),
+		Receiver: sa.UserLogin.ID,
+	}
+	portal, err := sa.UserLogin.Bridge.GetPortalByKey(ctx, portalKey)
+	if err != nil || portal == nil || portal.MXID == "" {
+		if err != nil {
+			return err
+		}
+		return bridgev2.ErrNoPortal
+	}
+	ghost, err := sa.UserLogin.Bridge.GetGhostByID(ctx, receiptSender)
+	if err != nil {
+		return err
+	}
+	if !intentSupportsDirectReceipt(ghost.Intent) {
+		log.Printf("bridgev2 event_class: kind=read_receipt source=snapchat chat_id=%s participant=%s watermark=%d action=queue reason=non_as_intent", chat.ID, advance.Participant, advance.Watermark)
 		sa.UserLogin.Bridge.QueueRemoteEvent(sa.UserLogin, &simplevent.Receipt{
 			EventMeta: simplevent.EventMeta{
 				Type: bridgev2.RemoteEventReadReceipt,
 				LogContext: func(c zerolog.Context) zerolog.Context {
-					return c.Str("chat", chat.Name).Str("chat_id", chat.ID).Str("participant", adv.Participant).Int64("watermark", adv.Watermark).Stringer("target_mxid", bridgeTarget.MXID).Str("target_remote_id", targetRemoteID).Str("target_sender", string(bridgeTarget.SenderID)).Bool("target_double_puppeted", bridgeTarget.IsDoublePuppeted).Str("receipt_sender", string(receiptSender))
+					return c.Str("chat", chat.Name).Str("chat_id", chat.ID).Str("participant", advance.Participant).Int64("watermark", advance.Watermark).Str("target_remote_id", targetRemoteID).Str("receipt_sender", string(receiptSender))
 				},
-				PortalKey: networkid.PortalKey{
-					ID:       networkid.PortalID(chat.ID),
-					Receiver: sa.UserLogin.ID,
-				},
+				PortalKey: portalKey,
 				Sender: bridgev2.EventSender{
 					IsFromMe:    false,
 					Sender:      receiptSender,
@@ -126,7 +153,81 @@ func (sa *SnapchatAPI) syncReadWatermarks(ctx context.Context, chat sidecar.Chat
 			Targets:    []networkid.MessageID{target},
 			ReadUpTo:   time.Now(),
 		})
+		return nil
 	}
+	receiptTS := time.Now().UnixMilli()
+	content := map[string]any{"ts": receiptTS}
+	if err := sendDirectReceipt(ctx, ghost.Intent, portal.MXID, bridgeTarget.MXID, content); err != nil {
+		return err
+	}
+	log.Printf("bridgev2 event_class: kind=read_receipt source=snapchat chat_id=%s participant=%s watermark=%d target_remote_id=%s target_mxid=%s receipt_sender=%s ghost_mxid=%s endpoint=/receipt/m.read action=direct_receipt_success ts=%d", chat.ID, advance.Participant, advance.Watermark, targetRemoteID, bridgeTarget.MXID, receiptSender, ghost.Intent.GetMXID(), receiptTS)
+	return nil
+}
+
+func intentSupportsDirectReceipt(intent bridgev2.MatrixAPI) bool {
+	if intent == nil {
+		return false
+	}
+	client, ok := reflectedIntentClient(intent)
+	if !ok {
+		return false
+	}
+	return client.MethodByName("SendReceipt").IsValid()
+}
+
+func sendDirectReceipt(ctx context.Context, intent bridgev2.MatrixAPI, roomID id.RoomID, eventID id.EventID, content any) error {
+	if err := intent.EnsureJoined(ctx, roomID); err != nil {
+		return err
+	}
+	client, ok := reflectedIntentClient(intent)
+	if !ok {
+		return fmt.Errorf("intent %T does not expose a direct Matrix client", intent)
+	}
+	method := client.MethodByName("SendReceipt")
+	if !method.IsValid() {
+		return fmt.Errorf("intent %T direct Matrix client does not expose SendReceipt", intent)
+	}
+	results := method.Call([]reflect.Value{
+		reflect.ValueOf(ctx),
+		reflect.ValueOf(roomID),
+		reflect.ValueOf(eventID),
+		reflect.ValueOf(event.ReceiptTypeRead),
+		reflect.ValueOf(content),
+	})
+	if len(results) != 1 || results[0].IsNil() {
+		return nil
+	}
+	err, ok := results[0].Interface().(error)
+	if !ok {
+		return fmt.Errorf("SendReceipt returned non-error %T", results[0].Interface())
+	}
+	return err
+}
+
+func reflectedIntentClient(intent bridgev2.MatrixAPI) (reflect.Value, bool) {
+	value := reflect.ValueOf(intent)
+	if value.Kind() == reflect.Pointer {
+		value = value.Elem()
+	}
+	if !value.IsValid() || value.Kind() != reflect.Struct {
+		return reflect.Value{}, false
+	}
+	matrixField := value.FieldByName("Matrix")
+	if !matrixField.IsValid() || matrixField.IsNil() {
+		return reflect.Value{}, false
+	}
+	matrixValue := matrixField
+	if matrixValue.Kind() == reflect.Pointer {
+		matrixValue = matrixValue.Elem()
+	}
+	if !matrixValue.IsValid() || matrixValue.Kind() != reflect.Struct {
+		return reflect.Value{}, false
+	}
+	clientField := matrixValue.FieldByName("Client")
+	if !clientField.IsValid() || clientField.IsNil() {
+		return reflect.Value{}, false
+	}
+	return clientField, true
 }
 
 func shouldSkipRemoteReadReceiptTarget(chat sidecar.Chat, advance watermarkAdvance, target *store.MessageState) bool {

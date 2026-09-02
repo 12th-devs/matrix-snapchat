@@ -3097,10 +3097,10 @@ export async function setTyping(chatID, typing, durationMs = 1500) {
   }, { priority: 1, timeoutMs: 12000, label: "setTyping" });
 }
 
-export async function getTypingState() {
+export async function getTypingState(watchChatID = "") {
   return withLock(async () => {
     const currentPage = await getReadySnapchatPageFast();
-    const result = await currentPage.evaluate(() => {
+    const result = await currentPage.evaluate(async ({ watchChatID }) => {
       function findWebpackRequire() {
         for (const key of Object.keys(globalThis)) {
           if (!/^webpackChunk/.test(key)) {
@@ -3146,7 +3146,76 @@ export async function getTypingState() {
         return undefined;
       }
 
+      function uuidBytes(uuid) {
+        const hex = String(uuid || "").replace(/-/g, "");
+        if (!/^[0-9a-f]{32}$/i.test(hex)) {
+          return undefined;
+        }
+        const bytes = new Uint8Array(16);
+        for (let i = 0; i < 16; i += 1) {
+          bytes[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+        }
+        return bytes;
+      }
+
+      function conversationIDString(conversationId) {
+        return String(conversationId?.str || conversationId?.conversationId?.str || conversationId || "");
+      }
+
+      function conversationIDArg(appState, conversationID) {
+        return appState?.messaging?.feed?.[conversationID]?.conversationId
+          || appState?.messaging?.conversations?.[conversationID]?.conversationId
+          || { id: uuidBytes(conversationID), str: conversationID };
+      }
+
+      async function ensurePresenceSession(webpackRequire, conversationID) {
+        if (!conversationID) {
+          return { requested: false };
+        }
+        let appState = resolveAppState(webpackRequire);
+        const createPresenceSession = appState?.presence?.createPresenceSession;
+        if (typeof createPresenceSession !== "function") {
+          return { requested: true, ok: false, error: "createPresenceSession_unavailable" };
+        }
+        let session = appState?.presence?.presenceSession;
+        if (conversationIDString(session?.conversationId) !== conversationID) {
+          const arg = conversationIDArg(appState, conversationID);
+          try {
+            createPresenceSession(arg);
+          } catch (error) {
+            return { requested: true, ok: false, error: String(error) };
+          }
+          for (let i = 0; i < 20; i += 1) {
+            await new Promise((resolve) => setTimeout(resolve, 50));
+            appState = resolveAppState(webpackRequire);
+            session = appState?.presence?.presenceSession;
+            if (conversationIDString(session?.conversationId) === conversationID) {
+              break;
+            }
+          }
+        }
+        if (conversationIDString(session?.conversationId) !== conversationID) {
+          return {
+            requested: true,
+            ok: false,
+            error: "presence_session_not_created",
+            sessionConversationId: conversationIDString(session?.conversationId),
+          };
+        }
+        try {
+          session.onUserAction?.({ type: "chatVisible" });
+        } catch {
+        }
+        return {
+          requested: true,
+          ok: true,
+          sessionConversationId: conversationIDString(session.conversationId),
+          sessionStateCount: Array.isArray(session.state) ? session.state.length : 0,
+        };
+      }
+
       const webpackRequire = findWebpackRequire();
+      const presenceSession = await ensurePresenceSession(webpackRequire, String(watchChatID || ""));
       const appState = resolveAppState(webpackRequire);
       const presence = appState?.presence;
       const active = appState?.presence?.activeConversationInfo;
@@ -3159,8 +3228,10 @@ export async function getTypingState() {
         activeConversationInfoType: active instanceof Map ? "map" : Array.isArray(active) ? "array" : typeof active,
         activeConversationCount: active instanceof Map ? active.size : Array.isArray(active) ? active.length : 0,
         hasPresenceSession: Boolean(presence?.presenceSession),
-        presenceSessionConversationId: String(presence?.presenceSession?.conversationId || ""),
+        presenceSessionConversationId: conversationIDString(presence?.presenceSession?.conversationId),
         presenceSessionStateCount: Array.isArray(presence?.presenceSession?.state) ? presence.presenceSession.state.length : 0,
+        watchChatID: String(watchChatID || ""),
+        presenceSession,
       };
       const collect = (key, info) => {
         if (!info) {
@@ -3180,7 +3251,7 @@ export async function getTypingState() {
         if (typers.length === 0) {
           return;
         }
-        let convID = typeof key === "string" ? key : String(key ?? "");
+        let convID = conversationIDString(key);
         const fromValue = info.conversationId?.str ?? info.feedItemId?.str ?? "";
         if (fromValue) {
           convID = String(fromValue);
@@ -3198,7 +3269,7 @@ export async function getTypingState() {
           collect(key, info);
         }
       }
-      const sessionConversationId = String(presence?.presenceSession?.conversationId || "");
+      const sessionConversationId = conversationIDString(presence?.presenceSession?.conversationId);
       const sessionState = Array.isArray(presence?.presenceSession?.state) ? presence.presenceSession.state : [];
       for (const participant of sessionState) {
         if (!participant || !sessionConversationId || participant.state !== "typing") {
@@ -3214,7 +3285,7 @@ export async function getTypingState() {
         });
       }
       return { ok: true, hasPresence: Boolean(appState?.presence), conversations, debug };
-    });
+    }, { watchChatID: String(watchChatID || "") });
     if (!result?.ok) {
       throw new Error(result?.error || "typing state unavailable");
     }

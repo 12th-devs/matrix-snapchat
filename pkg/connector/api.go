@@ -72,6 +72,7 @@ type SnapchatAPI struct {
 	messageRetryAfter        map[string]time.Time
 	lastReadReceiptSync      map[string]time.Time
 	lastTypingSent           map[string]typingUpdateState
+	typingPresenceChatID     string
 	typingSyncRunning        bool
 	remoteTyping             map[string]map[string]bool
 	ghostAvatarCheckedAt     map[string]time.Time

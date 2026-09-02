@@ -150,7 +150,11 @@ func (sa *SnapchatAPI) chatResyncUnchanged(ctx context.Context, chatID string, i
 	if err != nil || portal == nil || portal.MXID == "" {
 		return false
 	}
-	return current.matchesPortal(portal)
+	if !current.matchesPortal(portal) {
+		return false
+	}
+	sa.repairChatMemberProfiles(ctx, portal, info)
+	return true
 }
 
 // noteChatResyncSkipped records the skipped state and logs the first skip per
