@@ -7,20 +7,31 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rs/zerolog"
 	sidecar "github.com/colej/mautrix-snapchat/internal/connector"
 	"github.com/colej/mautrix-snapchat/internal/snapapi"
 	"github.com/colej/mautrix-snapchat/internal/store"
+	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/event"
 )
 
 func (sa *SnapchatAPI) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMessage) (*bridgev2.MatrixMessageResponse, error) {
+	started := time.Now()
 	if msg == nil || msg.Portal == nil || msg.Content == nil {
 		return nil, fmt.Errorf("missing Matrix message data")
 	}
 	chatID := string(msg.Portal.ID)
+	eventID := ""
+	if msg.Event != nil {
+		eventID = string(msg.Event.ID)
+	}
+	zerolog.Ctx(ctx).Info().
+		Str("diag", "send_latency").
+		Str("stage", "handle_matrix_message_start").
+		Str("chat_id", chatID).
+		Str("event_id", eventID).
+		Msg("send-latency: HandleMatrixMessage start")
 	if media, caption, ok, err := sa.matrixMediaToSend(ctx, msg); ok || err != nil {
 		if err != nil {
 			return nil, err
@@ -45,6 +56,15 @@ func (sa *SnapchatAPI) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Ma
 		}, nil
 	}
 	body, ok := sa.matrixTextToSend(msg)
+	textDone := time.Now()
+	zerolog.Ctx(ctx).Info().
+		Str("diag", "send_latency").
+		Str("stage", "matrix_text_to_send_done").
+		Str("chat_id", chatID).
+		Str("event_id", eventID).
+		Bool("accepted", ok).
+		Dur("duration", textDone.Sub(started)).
+		Msg("send-latency: matrixTextToSend done")
 	if !ok {
 		log.Printf("bridgev2 send: ignored non-chat Matrix message chat_id=%s msgtype=%s", chatID, msg.Content.MsgType)
 		return sa.ignoredMatrixMessageResponse(msg), nil
@@ -53,6 +73,17 @@ func (sa *SnapchatAPI) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Ma
 		return nil, fmt.Errorf("send snapchat message: api_mode=%s is unsafe in no-open mode; API sending is required", sa.Connector.apiMode())
 	}
 	messageID, err := sa.sendTextAPI(ctx, chatID, body, sa.matrixReplyTarget(chatID, msg))
+	sendDone := time.Now()
+	zerolog.Ctx(ctx).Info().
+		Str("diag", "send_latency").
+		Str("stage", "handle_matrix_message_send_done").
+		Str("chat_id", chatID).
+		Str("event_id", eventID).
+		Str("message_id", messageID).
+		Dur("send_text_api_duration", sendDone.Sub(textDone)).
+		Dur("total_handle_matrix_message_duration", sendDone.Sub(started)).
+		Err(err).
+		Msg("send-latency: HandleMatrixMessage send done")
 	if err != nil {
 		return nil, fmt.Errorf("send snapchat message via API (DOM fallback disabled): %w", err)
 	}
@@ -87,37 +118,60 @@ func (sa *SnapchatAPI) HandleMatrixReadReceipt(ctx context.Context, receipt *bri
 		sa.hydrateSnapMediaFromReadReceipt(ctx, chatID, receipt)
 	}
 
+	diagBase := func() *zerolog.Event {
+		evt := zerolog.Ctx(ctx).Debug().Str("diag", "beeper_to_snapchat_receipt").Str("chat_id", chatID).Bool("implicit", receipt.Implicit).Bool("enabled", sa.readReceiptsEnabled()).Bool("has_exact_target", hasExactTarget).Str("receipt_event_id", string(receipt.EventID))
+		if receipt.ExactMessage != nil {
+			evt = evt.Str("exact_target_row", string(receipt.ExactMessage.ID))
+		}
+		return evt
+	}
+	diagBase().Bool("allowed_sync", allowedSync).Msg("receipt-diag: handler entry")
+
 	if receipt.Implicit || !sa.readReceiptsEnabled() {
 		log.Printf("bridgev2 event_class: kind=read_receipt source=matrix chat_id=%s enabled=%t implicit=%t action=skip", chatID, sa.readReceiptsEnabled(), receipt.Implicit)
+		diagBase().Str("stop", "implicit_or_disabled").Msg("receipt-diag: skipped")
 		return nil
 	}
 	if !allowedSync {
 		log.Printf("bridgev2 event_class: kind=read_receipt source=matrix chat_id=%s action=skip reason=unsafe_sync", chatID)
+		diagBase().Str("stop", "unsafe_sync").Msg("receipt-diag: skipped")
 		return nil
 	}
 	if !sa.useAPI() {
 		log.Printf("bridgev2 receipts: skipping DOM read receipt side effects chat_id=%s read_up_to=%s", chatID, receipt.ReadUpTo.Format(time.RFC3339))
+		diagBase().Str("stop", "non_api").Msg("receipt-diag: skipped")
 		return nil
 	}
 	messageID, version := sa.readReceiptTarget(chatID, receipt)
 	if messageID <= 0 {
 		log.Printf("bridgev2 receipts: no API message id available chat_id=%s read_up_to=%s", chatID, receipt.ReadUpTo.Format(time.RFC3339))
+		diagBase().Int64("resolved_message_id", messageID).Str("stop", "no_message_id").Msg("receipt-diag: skipped")
 		return nil
+	}
+	state := sa.lookupStoredMessage(chatID, fmt.Sprintf("%d", messageID))
+	stateKind := ""
+	if state != nil {
+		stateKind = state.Kind
 	}
 	if !sa.shouldSendReadReceiptToSnapchat(chatID, messageID, hasExactTarget) {
 		log.Printf("bridgev2 receipts: skipping unsafe/non-chat read receipt chat_id=%s message_id=%d exact=%t", chatID, messageID, hasExactTarget)
+		diagBase().Int64("resolved_message_id", messageID).Str("state_kind", stateKind).Str("stop", "guard_rejected").Msg("receipt-diag: skipped")
 		return nil
 	}
+	diagBase().Int64("resolved_message_id", messageID).Int64("stored_version", version).Str("state_kind", stateKind).Msg("receipt-diag: target resolved, calling MarkRead")
 	client, err := sa.ensureSnapClient(ctx)
 	if err != nil {
 		log.Printf("bridgev2 receipts: API client unavailable chat_id=%s message_id=%d: %v", chatID, messageID, err)
+		zerolog.Ctx(ctx).Error().Err(err).Str("diag", "beeper_to_snapchat_receipt").Int64("resolved_message_id", messageID).Msg("receipt-diag: client unavailable")
 		return nil
 	}
 	if err = client.MarkRead(ctx, chatID, messageID, version); err != nil {
 		sa.invalidateSnapClient()
 		log.Printf("bridgev2 receipts: API read update failed chat_id=%s message_id=%d version=%d: %v", chatID, messageID, version, err)
+		zerolog.Ctx(ctx).Error().Err(err).Str("diag", "beeper_to_snapchat_receipt").Int64("resolved_message_id", messageID).Int64("version", version).Msg("receipt-diag: MarkRead returned error")
 		return nil
 	}
+	zerolog.Ctx(ctx).Info().Str("diag", "beeper_to_snapchat_receipt").Int64("resolved_message_id", messageID).Int64("version", version).Msg("receipt-diag: MarkRead returned success")
 	log.Printf("bridgev2 event_class: kind=read_receipt source=matrix chat_id=%s message_id=%d version=%d action=sent", chatID, messageID, version)
 	log.Printf("bridgev2 receipts: marked Snapchat read via API chat_id=%s message_id=%d version=%d", chatID, messageID, version)
 	return nil
@@ -333,7 +387,7 @@ func (sa *SnapchatAPI) matrixTextToSend(msg *bridgev2.MatrixMessage) (string, bo
 	default:
 		return "", false
 	}
-	if isGeneratedSnapchatNotice(body) {
+	if isBridgeGeneratedSnapchatMarker(body) {
 		return "", false
 	}
 	return body, true

@@ -10,6 +10,7 @@ import (
 	sidecar "github.com/colej/mautrix-snapchat/internal/connector"
 	"github.com/colej/mautrix-snapchat/internal/snapapi"
 	"github.com/colej/mautrix-snapchat/internal/store"
+	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 )
@@ -104,10 +105,10 @@ func (sa *SnapchatAPI) rememberChatDetails(chat sidecar.Chat) {
 	}
 }
 
-func (sa *SnapchatAPI) rememberChatDisappear(chatID string, seconds int64) {
+func (sa *SnapchatAPI) rememberChatDisappear(chatID string, seconds int64) bool {
 	chatID = strings.TrimSpace(chatID)
 	if chatID == "" {
-		return
+		return false
 	}
 	sa.mu.Lock()
 	defer sa.mu.Unlock()
@@ -117,14 +118,34 @@ func (sa *SnapchatAPI) rememberChatDisappear(chatID string, seconds int64) {
 	ref := sa.chatsByID[chatID]
 	ref.ID = chatID
 	if seconds <= 0 {
-		delete(sa.chatDisappearAfter, chatID)
-		ref.DisappearAfterSeconds = 0
-		sa.chatsByID[chatID] = ref
-		return
+		return false
 	}
+	changed := sa.chatDisappearAfter[chatID] != seconds || ref.DisappearAfterSeconds != seconds
 	sa.chatDisappearAfter[chatID] = seconds
 	ref.DisappearAfterSeconds = seconds
 	sa.chatsByID[chatID] = ref
+	return changed
+}
+
+func (sa *SnapchatAPI) forgetChatDisappear(chatID string) bool {
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return false
+	}
+	sa.mu.Lock()
+	defer sa.mu.Unlock()
+	hadMapValue := false
+	if sa.chatDisappearAfter != nil {
+		_, hadMapValue = sa.chatDisappearAfter[chatID]
+		delete(sa.chatDisappearAfter, chatID)
+	}
+	ref := sa.chatsByID[chatID]
+	hadRefValue := ref.DisappearAfterSeconds != 0
+	if hadRefValue {
+		ref.DisappearAfterSeconds = 0
+		sa.chatsByID[chatID] = ref
+	}
+	return hadMapValue || hadRefValue
 }
 
 func (sa *SnapchatAPI) rememberGhostName(userID networkid.UserID, name string) {
@@ -136,10 +157,34 @@ func (sa *SnapchatAPI) rememberGhostName(userID networkid.UserID, name string) {
 func (sa *SnapchatAPI) rememberGhostNameLocked(userID networkid.UserID, name string) {
 	id := strings.TrimSpace(string(userID))
 	name = strings.TrimSpace(name)
-	if id == "" || name == "" || strings.EqualFold(name, "unknown") {
+	if id == "" || name == "" || strings.EqualFold(name, "unknown") || snapUUIDPattern.MatchString(name) {
 		return
 	}
 	sa.ghostNames[id] = name
+}
+
+func (sa *SnapchatAPI) bestGhostDisplayName(userID networkid.UserID, fallback string) string {
+	name := strings.TrimSpace(sa.lookupGhostName(userID))
+	if name == "" {
+		name = strings.TrimSpace(sa.lookupGhostNameFromStore(userID))
+	}
+	username := strings.TrimSpace(sa.lookupGhostUsername(userID))
+	if name == "" || snapUUIDPattern.MatchString(name) {
+		name = username
+	}
+	if name == "" {
+		fallback = strings.TrimSpace(fallback)
+		if fallback != "" && !snapUUIDPattern.MatchString(fallback) {
+			name = fallback
+		}
+	}
+	if name == "" {
+		name = username
+	}
+	if name == "" {
+		name = string(userID)
+	}
+	return name
 }
 
 func (sa *SnapchatAPI) lookupGhostName(userID networkid.UserID) string {
@@ -642,16 +687,47 @@ func (sa *SnapchatAPI) invalidateSnapClient() {
 }
 
 func (sa *SnapchatAPI) sendTextAPI(ctx context.Context, chatID, body string, replyToMessageID int64) (string, error) {
+	started := time.Now()
+	zerolog.Ctx(ctx).Info().
+		Str("diag", "send_latency").
+		Str("stage", "send_text_api_start").
+		Str("chat_id", chatID).
+		Int64("reply_to_message_id", replyToMessageID).
+		Msg("send-latency: SendText API start")
 	client, err := sa.ensureSnapClient(ctx)
 	if err != nil {
 		return "", err
 	}
+	clientReady := time.Now()
 	messageID, err := client.SendText(ctx, chatID, body, replyToMessageID)
 	if err != nil {
 		sa.invalidateSnapClient()
-	} else if seconds := int64(client.RetentionDuration(chatID) / time.Second); seconds > 0 {
-		sa.rememberChatDisappear(chatID, seconds)
+	} else if retention, ok := client.RetentionDurationKnown(chatID); ok {
+		seconds := int64(retention / time.Second)
+		changed := false
+		if seconds > 0 {
+			changed = sa.rememberChatDisappear(chatID, seconds)
+		} else {
+			changed = sa.forgetChatDisappear(chatID)
+		}
+		if changed {
+			chatName := sa.lookupChatName(chatID)
+			if chatName == "" {
+				chatName = chatID
+			}
+			sa.queueChatResync(ctx, chatID, chatName)
+		}
 	}
+	zerolog.Ctx(ctx).Info().
+		Str("diag", "send_latency").
+		Str("stage", "send_text_api_done").
+		Str("chat_id", chatID).
+		Str("message_id", messageID).
+		Dur("ensure_client_duration", clientReady.Sub(started)).
+		Dur("snapchat_send_duration", time.Since(clientReady)).
+		Dur("total_send_text_api_duration", time.Since(started)).
+		Err(err).
+		Msg("send-latency: SendText API done")
 	return messageID, err
 }
 

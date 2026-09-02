@@ -267,13 +267,47 @@ func (c *Client) ListChats(ctx context.Context) ([]Chat, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	var chats []Chat
 	if err = c.doJSON(req, &chats); err != nil {
 		return nil, err
 	}
 
 	return chats, nil
+}
+
+// TypingParticipant is one remote user currently typing in a conversation, as
+// reported by the Snapchat web client's presence store.
+type TypingParticipant struct {
+	UserID string `json:"userId"`
+	State  string `json:"state"`
+}
+
+// TypingStateResponse mirrors the connector's GET /typing-state payload.
+type TypingStateResponse struct {
+	OK            bool                          `json:"ok"`
+	HasPresence   bool                          `json:"hasPresence"`
+	Conversations map[string][]TypingParticipant `json:"conversations"`
+	Error         string                         `json:"error,omitempty"`
+}
+
+// TypingState fetches the current remote typing participants per conversation
+// from the connector's browser session. It never opens media and is read-only.
+func (c *Client) TypingState(ctx context.Context) (*TypingStateResponse, error) {
+	req, err := c.newRequest(ctx, http.MethodGet, "/typing-state", nil)
+	if err != nil {
+		return nil, err
+	}
+	var result TypingStateResponse
+	if err = c.doJSON(req, &result); err != nil {
+		return nil, err
+	}
+	if !result.OK {
+		if result.Error == "" {
+			result.Error = "typing state was not available"
+		}
+		return nil, errors.New(result.Error)
+	}
+	return &result, nil
 }
 
 func (c *Client) Messages(ctx context.Context, chatID, chatName, chatURL string) ([]Message, error) {

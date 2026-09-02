@@ -38,6 +38,30 @@ func TestRetentionDurationFromConversationFallsBackToUnreadTimer(t *testing.T) {
 	}
 }
 
+func TestRetentionDurationKnownReportsCachedConversation(t *testing.T) {
+	client := &Client{conversations: map[string]*protos.Conversation{
+		"chat-1": {
+			RetentionPolicy: &protos.RetentionPolicy{
+				Policy: &protos.RetentionPolicy_Dynamic{
+					Dynamic: &protos.DynamicRetentionPolicy{
+						ReadRetentionTimeSeconds: 24 * 60 * 60,
+					},
+				},
+			},
+		},
+		"chat-2": {},
+	}}
+	if got, ok := client.RetentionDurationKnown("chat-1"); !ok || got != 24*time.Hour {
+		t.Fatalf("known retention = %s %v, want 24h true", got, ok)
+	}
+	if got, ok := client.RetentionDurationKnown("chat-2"); !ok || got != 0 {
+		t.Fatalf("known no-retention = %s %v, want 0 true", got, ok)
+	}
+	if got, ok := client.RetentionDurationKnown("missing"); ok || got != 0 {
+		t.Fatalf("missing retention = %s %v, want 0 false", got, ok)
+	}
+}
+
 func TestMessageIsSaved(t *testing.T) {
 	if !messageIsSaved(&protos.ContentMessage{
 		Contents: &protos.ContentEnvelope{

@@ -124,6 +124,23 @@ export SNAPCHAT_BRIDGE_CONFIG="${config_path}"
 export SNAPCHAT_SHARED_SECRET="${runtime_secret}"
 export SNAPCHAT_CONNECTOR_SHARED_SECRET="${runtime_secret}"
 export SNAPCHAT_CONNECTOR_BASE_URL="${SNAPCHAT_CONNECTOR_BASE_URL:-http://${windows_host}:3101}"
+export SNAPCHAT_READ_RECEIPTS_ENABLED="${SNAPCHAT_READ_RECEIPTS_ENABLED:-true}"
+export SNAPCHAT_SNAP_MEDIA_ENABLED=false
+export SNAPCHAT_SNAP_MEDIA_ON_READ=false
+export SNAPCHAT_SEND_MEDIA_ENABLED=false
+EOF
+    chmod 600 "${runtime_env}"
+}
+
+write_runtime_env_values() {
+    local runtime_secret="$1" connector_base_url="$2"
+    mkdir -p "${runtime_dir}" "${repo_dir}/logs"
+    umask 077
+    cat >"${runtime_env}" <<EOF
+export SNAPCHAT_BRIDGE_CONFIG="${SNAPCHAT_BRIDGE_CONFIG:-${config_path}}"
+export SNAPCHAT_SHARED_SECRET="${runtime_secret}"
+export SNAPCHAT_CONNECTOR_SHARED_SECRET="${runtime_secret}"
+export SNAPCHAT_CONNECTOR_BASE_URL="${connector_base_url}"
 export SNAPCHAT_READ_RECEIPTS_ENABLED="${SNAPCHAT_READ_RECEIPTS_ENABLED:-false}"
 export SNAPCHAT_SNAP_MEDIA_ENABLED=false
 export SNAPCHAT_SNAP_MEDIA_ON_READ=false
@@ -146,6 +163,30 @@ load_runtime_env() {
     fi
     export SNAPCHAT_BRIDGE_CONFIG SNAPCHAT_SHARED_SECRET SNAPCHAT_CONNECTOR_SHARED_SECRET SNAPCHAT_CONNECTOR_BASE_URL
     export SNAPCHAT_READ_RECEIPTS_ENABLED SNAPCHAT_SNAP_MEDIA_ENABLED SNAPCHAT_SNAP_MEDIA_ON_READ SNAPCHAT_SEND_MEDIA_ENABLED
+}
+
+sync_runtime_env_from_running_bridge() {
+	if ! tracked_pid_alive "${bridge_pid_file}"; then
+		return 1
+	fi
+	local pid proc_env runtime_secret connector_base_url value
+	pid="$(cat "${bridge_pid_file}" 2>/dev/null || true)"
+	proc_env="$(tr '\0' '\n' <"/proc/${pid}/environ" 2>/dev/null || true)"
+	runtime_secret="$(printf '%s\n' "${proc_env}" | sed -n 's/^SNAPCHAT_CONNECTOR_SHARED_SECRET=//p' | head -n 1)"
+	if [[ -z "${runtime_secret}" ]]; then
+		runtime_secret="$(printf '%s\n' "${proc_env}" | sed -n 's/^SNAPCHAT_SHARED_SECRET=//p' | head -n 1)"
+	fi
+	connector_base_url="$(printf '%s\n' "${proc_env}" | sed -n 's/^SNAPCHAT_CONNECTOR_BASE_URL=//p' | head -n 1)"
+	if [[ -z "${runtime_secret}" || -z "${connector_base_url}" ]]; then
+		return 1
+	fi
+	for value in SNAPCHAT_BRIDGE_CONFIG SNAPCHAT_READ_RECEIPTS_ENABLED SNAPCHAT_SNAP_MEDIA_ENABLED SNAPCHAT_SNAP_MEDIA_ON_READ SNAPCHAT_SEND_MEDIA_ENABLED; do
+		if proc_value="$(printf '%s\n' "${proc_env}" | sed -n "s/^${value}=//p" | head -n 1)" && [[ -n "${proc_value}" ]]; then
+			export "${value}=${proc_value}"
+		fi
+	done
+	echo "Runtime env is stale; rewriting ${runtime_env} from running bridge pid ${pid}"
+	write_runtime_env_values "${runtime_secret}" "${connector_base_url}"
 }
 
 tracked_pid_alive() {
@@ -325,8 +366,16 @@ case "${mode}" in
         configure_bridge_runtime
         load_runtime_env
         if ! connector_health; then
-            echo "Connector is not healthy; use '$0 full' to restart connector/Chrome and regenerate the runtime secret." >&2
-            exit 1
+            if sync_runtime_env_from_running_bridge; then
+                load_runtime_env
+                connector_health || {
+                    echo "Connector is not healthy after syncing runtime env from the running bridge; use '$0 full' to restart connector/Chrome and regenerate the runtime secret." >&2
+                    exit 1
+                }
+            else
+                echo "Connector is not healthy and no running bridge secret could be recovered; use '$0 full' to restart connector/Chrome and regenerate the runtime secret." >&2
+                exit 1
+            fi
         fi
         stop_pid_file "${bridge_pid_file}" "bridge"
         cd "${repo_dir}"

@@ -76,7 +76,6 @@ func (sa *SnapchatAPI) syncChatMessagesAPI(ctx context.Context, chat sidecar.Cha
 	if sa.UserLogin == nil || sa.UserLogin.Bridge == nil || chat.ID == "" {
 		return nil
 	}
-	sa.rememberChatDisappear(chat.ID, chat.DisappearAfterSeconds)
 	if requireAutoFetch && !sa.autoFetchMessagesEnabled() {
 		log.Printf("bridgev2 sync: refusing API message fetch in no-open mode chat=%q id=%s reason=%s", chat.Name, chat.ID, reason)
 		return nil
@@ -89,11 +88,27 @@ func (sa *SnapchatAPI) syncChatMessagesAPI(ctx context.Context, chat sidecar.Cha
 	if err != nil {
 		return err
 	}
+	if retention, ok := client.RetentionDurationKnown(chat.ID); ok {
+		seconds := int64(retention / time.Second)
+		chat.DisappearAfterSeconds = seconds
+		changed := false
+		if seconds > 0 {
+			changed = sa.rememberChatDisappear(chat.ID, seconds)
+		} else {
+			changed = sa.forgetChatDisappear(chat.ID)
+		}
+		if changed {
+			sa.queueChatResync(ctx, chat.ID, chat.Name)
+		}
+	}
 	log.Printf("bridgev2 sync: API fetched %d messages for chat=%q id=%s reason=%s", len(messages), chat.Name, chat.ID, reason)
 	states := make([]store.MessageState, 0, len(messages))
 	for _, apiMessage := range messages {
 		apiMessage = sa.normalizeAPIMessageDirection(chat.ID, apiMessage)
 		message := connectorMessageFromAPI(apiMessage)
+		if message.DisappearAfterSeconds <= 0 && chat.DisappearAfterSeconds > 0 {
+			message.DisappearAfterSeconds = chat.DisappearAfterSeconds
+		}
 		message = sa.normalizeRemoteMessageDirection(chat.ID, message)
 		if message.ID == "" {
 			continue
@@ -101,6 +116,10 @@ func (sa *SnapchatAPI) syncChatMessagesAPI(ctx context.Context, chat sidecar.Cha
 		baseRemoteID := baseSnapchatMessageID(message.ID)
 		if baseRemoteID == "" {
 			baseRemoteID = message.ID
+		}
+		if shouldSuppressAPIMessage(apiMessage, message) {
+			log.Printf("bridgev2 sync: suppressing passive API message chat_id=%s message_id=%s content_type=%s", chat.ID, baseRemoteID, apiMessage.ContentType)
+			continue
 		}
 		if includeMedia && sa.snapMediaEnabled() && len(apiMessage.Media) > 0 {
 			log.Printf("bridgev2 media: rendering API media chat_id=%s message_id=%s content_type=%s is_snap=%t attachment_count=%d", chat.ID, apiMessage.ID, apiMessage.ContentType, apiMessage.IsSnap, len(apiMessage.Media))
@@ -157,6 +176,16 @@ func (sa *SnapchatAPI) syncChatMessagesAPI(ctx context.Context, chat sidecar.Cha
 		_ = sa.Connector.store.UpsertMessages(states)
 	}
 	return nil
+}
+
+func shouldSuppressAPIMessage(apiMessage snapapi.Message, message sidecar.Message) bool {
+	contentType := strings.ToUpper(strings.TrimSpace(apiMessage.ContentType))
+	switch contentType {
+	case "STATUS", "STATUS_SAVE_TO_CAMERA_ROLL", "STATUS_CONVERSATION_CAPTURE_SCREENSHOT",
+		"STATUS_CONVERSATION_CAPTURE_RECORD", "STATUS_CALL_MISSED_VIDEO", "STATUS_CALL_MISSED_AUDIO":
+		return true
+	}
+	return strings.HasPrefix(strings.TrimSpace(message.Text), "[Snapchat status]")
 }
 
 func restoreStoredDecryptedText(existing *store.MessageState, message sidecar.Message, apiMessage snapapi.Message) (string, bool) {
@@ -222,10 +251,19 @@ func (sa *SnapchatAPI) queueRemoteMessage(chat sidecar.Chat, message sidecar.Mes
 		return
 	}
 	message = sa.normalizeRemoteMessageDirection(chat.ID, message)
-	sa.rememberChatDisappear(chat.ID, chat.DisappearAfterSeconds)
+	if chat.DisappearAfterSeconds > 0 {
+		if message.DisappearAfterSeconds <= 0 && !message.Saved {
+			message.DisappearAfterSeconds = chat.DisappearAfterSeconds
+		}
+		sa.rememberChatDisappear(chat.ID, chat.DisappearAfterSeconds)
+	} else if message.DisappearAfterSeconds <= 0 && !message.Saved {
+		if chatSetting := sa.disappearingSettingForChat(chat.ID); chatSetting != nil {
+			message.DisappearAfterSeconds = int64(chatSetting.Timer / time.Second)
+		}
+	}
 	if sa.shouldSuppressOutgoingEcho(chat.ID, message) {
 		sa.markSeen(chat.ID, message.ID)
-		log.Printf("bridgev2 echo: suppressed outgoing API echo chat_id=%s message_id=%s content_type=%s", chat.ID, message.ID, message.ContentType)
+		log.Printf("bridgev2 echo: suppressed outgoing API echo chat_id=%s message_id=%s content_type=%s disappear_after=%d", chat.ID, message.ID, message.ContentType, message.DisappearAfterSeconds)
 		return
 	}
 	if sa.isSeen(chat.ID, message.ID) {

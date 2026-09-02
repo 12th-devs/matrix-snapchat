@@ -277,8 +277,13 @@ func (sc *SnapchatConnector) resetSyncState() error {
 
 func (sc *SnapchatConnector) chatCapabilities() *event.RoomFeatures {
 	features := &event.RoomFeatures{
-		ID:            "fi.mau.snapchat.capabilities.2026_05_21",
+		ID:            "fi.mau.snapchat.capabilities.2026_08_30_2",
 		MaxTextLength: 5000,
+		// Replies are real Snapchat protocol operations: outbound replies attach
+		// FeatureAttachment.ReplyMessageInfo (QuotedMessageId) on
+		// CreateContentMessage, and inbound replies carry QuotedMetadata that is
+		// resolved through the local message mapping.
+		Reply: event.CapLevelFullySupported,
 		// Snapchat has no edit operation, so edits stay rejected (explicitly
 		// handled by HandleMatrixEdit). Unsend/delete IS supported via
 		// UpdateAction_Erase.

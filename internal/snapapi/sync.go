@@ -261,6 +261,7 @@ var (
 	deltaSyncURL            = paths.DELTA_SYNC_CONVERSATIONS
 	updateContentMessageURL = paths.UPDATE_CONTENT_MESSAGE
 	createContentMessageURL = paths.CREATE_CONTENT_MESSAGE
+	updateConversationURL   = paths.UPDATE_CONVERSATION
 )
 
 func (c *Client) queryAllConversations(ctx context.Context, syncToken []byte, pageSize int) ([]*protos.ConversationEntry, []byte, error) {

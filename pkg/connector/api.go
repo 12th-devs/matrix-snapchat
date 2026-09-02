@@ -72,6 +72,8 @@ type SnapchatAPI struct {
 	messageRetryAfter        map[string]time.Time
 	lastReadReceiptSync      map[string]time.Time
 	lastTypingSent           map[string]typingUpdateState
+	typingSyncRunning        bool
+	remoteTyping             map[string]map[string]bool
 	ghostAvatarCheckedAt     map[string]time.Time
 	avatarURLBySnapID        map[string]string
 	queuedPortalResyncs      map[string]struct{}
@@ -136,6 +138,7 @@ func NewSnapchatAPI(sc *SnapchatConnector, login *bridgev2.UserLogin, label stri
 		messageRetryAfter:        make(map[string]time.Time),
 		lastReadReceiptSync:      make(map[string]time.Time),
 		lastTypingSent:           make(map[string]typingUpdateState),
+		remoteTyping:             make(map[string]map[string]bool),
 		ghostAvatarCheckedAt:     make(map[string]time.Time),
 		avatarURLBySnapID:        make(map[string]string),
 		queuedPortalResyncs:      make(map[string]struct{}),
@@ -464,6 +467,15 @@ func mediaUploadIntent(portal *bridgev2.Portal, fallback bridgev2.MatrixAPI) bri
 		return portal.Bridge.Bot
 	}
 	return fallback
+}
+
+// isBridgeGeneratedSnapchatMarker reports whether a Matrix-authored body is
+// unmistakably a bridge-generated synthetic notice. This is intentionally
+// narrow: it is the only body check allowed to drop outgoing Matrix messages,
+// so ordinary user-authored words must never match.
+func isBridgeGeneratedSnapchatMarker(body string) bool {
+	trimmed := strings.TrimSpace(body)
+	return strings.HasPrefix(trimmed, "[Snapchat") || strings.HasPrefix(trimmed, "[Unsupported Snapchat")
 }
 
 func isGeneratedSnapchatNotice(body string) bool {

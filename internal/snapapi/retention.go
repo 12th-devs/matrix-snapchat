@@ -22,6 +22,20 @@ func (c *Client) RetentionDuration(chatID string) time.Duration {
 	return c.retentionDurationForChat(chatID)
 }
 
+func (c *Client) RetentionDurationKnown(chatID string) (time.Duration, bool) {
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return 0, false
+	}
+	c.mu.Lock()
+	conv := c.conversations[chatID]
+	c.mu.Unlock()
+	if conv == nil {
+		return 0, false
+	}
+	return retentionDurationFromConversation(conv), true
+}
+
 func retentionDurationFromConversation(conv *protos.Conversation) time.Duration {
 	if conv == nil {
 		return 0

@@ -149,6 +149,10 @@ export function createApp({
     res.status(202).json(result);
   }));
 
+  app.get("/typing-state", asyncRoute(async (_req, res) => {
+    res.json(await bridge.getTypingState());
+  }));
+
   app.post("/typing", asyncRoute(async (req, res) => {
     const { chatId, typing, durationMs } = req.body || {};
     if (!chatId || typeof typing !== "boolean") {

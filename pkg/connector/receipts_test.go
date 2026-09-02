@@ -2,6 +2,9 @@ package connector
 
 import (
 	"testing"
+
+	sidecar "github.com/colej/mautrix-snapchat/internal/connector"
+	"github.com/colej/mautrix-snapchat/internal/store"
 )
 
 // TestDiffReadWatermarksFirstSyncEmitsReceipts verifies that on the first sync
@@ -62,5 +65,46 @@ func TestDiffReadWatermarksSkipsZeroAndEmpty(t *testing.T) {
 	}
 	if advances := sa.diffReadWatermarks("chat-1", nil, "self"); len(advances) != 0 {
 		t.Fatalf("empty map emitted %d receipts, want 0", len(advances))
+	}
+}
+
+func TestPendingReadWatermarksDoesNotMarkUntilQueued(t *testing.T) {
+	sa := &SnapchatAPI{readWatermarks: make(map[string]map[string]int64)}
+	if advances := sa.pendingReadWatermarkAdvances("chat-1", map[string]int64{"other-1": 42}, "self"); len(advances) != 1 {
+		t.Fatalf("pending advances = %d, want 1", len(advances))
+	}
+	if _, ok := sa.readWatermarks["chat-1"]; ok {
+		t.Fatal("pending read watermark should not be marked as synced before it is queued")
+	}
+	sa.markReadWatermarkSynced("chat-1", "other-1", 42)
+	if got := sa.pendingReadWatermarkAdvances("chat-1", map[string]int64{"other-1": 42}, "self"); len(got) != 0 {
+		t.Fatalf("synced watermark re-emitted %d advances, want 0", len(got))
+	}
+}
+
+func TestShouldSkipRemoteReadReceiptTargetSkipsDMSenderOwnMessage(t *testing.T) {
+	chat := sidecar.Chat{ID: "chat-1", OtherUserID: "other-1"}
+	advance := watermarkAdvance{Participant: "other-1", Watermark: 42}
+	target := &store.MessageState{RemoteID: "42", Outgoing: false}
+	if !shouldSkipRemoteReadReceiptTarget(chat, advance, target) {
+		t.Fatal("remote DM participant's watermark to their own message should be a no-op")
+	}
+}
+
+func TestShouldSkipRemoteReadReceiptTargetKeepsOutgoingMessageReceipts(t *testing.T) {
+	chat := sidecar.Chat{ID: "chat-1", OtherUserID: "other-1"}
+	advance := watermarkAdvance{Participant: "other-1", Watermark: 42}
+	target := &store.MessageState{RemoteID: "42", Outgoing: true}
+	if shouldSkipRemoteReadReceiptTarget(chat, advance, target) {
+		t.Fatal("remote participant reading an outgoing bridge message must still queue a Matrix receipt")
+	}
+}
+
+func TestShouldSkipRemoteReadReceiptTargetKeepsGroupReceipts(t *testing.T) {
+	chat := sidecar.Chat{ID: "chat-1", IsGroup: true}
+	advance := watermarkAdvance{Participant: "other-1", Watermark: 42}
+	target := &store.MessageState{RemoteID: "42", Outgoing: false}
+	if shouldSkipRemoteReadReceiptTarget(chat, advance, target) {
+		t.Fatal("group read receipts should not be suppressed without sender identity")
 	}
 }

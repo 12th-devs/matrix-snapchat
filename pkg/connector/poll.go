@@ -44,6 +44,9 @@ func (sa *SnapchatAPI) pollOnce(ctx context.Context) {
 		log.Printf("bridgev2 sync: skipping poll because user login is not fully initialized label=%s", sa.Label)
 		return
 	}
+	// Remote typing state comes from the browser session's presence store and
+	// is independent of the messaging API poll outcome.
+	sa.scheduleTypingStateSync(ctx)
 	if sa.Connector.apiMode() == "hybrid" {
 		sa.pollOnceDOM(ctx)
 		return
@@ -276,11 +279,11 @@ func (sa *SnapchatAPI) pollOnceAPI(ctx context.Context) error {
 	for idx, apiChat := range result.Chats {
 		chat := connectorChatFromAPI(apiChat)
 		sa.rememberChatDetails(chat)
-		sa.rememberChatDisappear(chat.ID, chat.DisappearAfterSeconds)
+		retentionChanged := sa.rememberChatDisappear(chat.ID, chat.DisappearAfterSeconds)
 		sa.persistChat(chat)
-		sa.syncReadWatermarks(chat)
+		sa.syncReadWatermarks(ctx, chat)
 		_, changed := result.ChangedChatIDs[chat.ID]
-		if (!baselineReady || changed) && portalResyncs < maxPortalResyncsPerPoll {
+		if (!baselineReady || changed || retentionChanged) && portalResyncs < maxPortalResyncsPerPoll {
 			sa.queueChatResync(ctx, chat.ID, chat.Name)
 			portalResyncs++
 		}

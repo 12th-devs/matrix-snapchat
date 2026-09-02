@@ -1,6 +1,7 @@
 package connector
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 	"time"
@@ -8,6 +9,9 @@ import (
 	sidecar "github.com/colej/mautrix-snapchat/internal/connector"
 	"github.com/colej/mautrix-snapchat/internal/snapapi"
 	"github.com/colej/mautrix-snapchat/internal/store"
+	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/bridgev2/database"
+	"maunium.net/go/mautrix/bridgev2/networkid"
 )
 
 func TestBaseSnapchatMessageID(t *testing.T) {
@@ -100,6 +104,15 @@ func TestConnectorMessageFromAPIKeepsExternalMediaVisible(t *testing.T) {
 	}
 	if msg.Text != "Media" {
 		t.Fatalf("message text = %q, want Media", msg.Text)
+	}
+}
+
+func TestShouldSuppressAPIMessageSkipsStatusEvents(t *testing.T) {
+	if !shouldSuppressAPIMessage(snapapi.Message{ContentType: "STATUS"}, sidecar.Message{Text: "[Snapchat status] STATUS"}) {
+		t.Fatal("status API message should be suppressed")
+	}
+	if shouldSuppressAPIMessage(snapapi.Message{ContentType: "CHAT"}, sidecar.Message{Text: "hello"}) {
+		t.Fatal("normal chat API message should not be suppressed")
 	}
 }
 
@@ -235,6 +248,142 @@ func TestDisappearingSettingForMessageSkipsSavedMessages(t *testing.T) {
 	})
 	if got.Timer != 10*time.Second {
 		t.Fatalf("chat disappearing timer = %s, want 10s", got.Timer)
+	}
+}
+
+func TestRememberChatDisappearKeepsKnownTimerWhenInputMissing(t *testing.T) {
+	sa := &SnapchatAPI{
+		chatsByID:          map[string]chatRef{"chat-1": {ID: "chat-1", DisappearAfterSeconds: 10}},
+		chatDisappearAfter: map[string]int64{"chat-1": 10},
+	}
+	if changed := sa.rememberChatDisappear("chat-1", 0); changed {
+		t.Fatal("zero retention should not report a changed timer")
+	}
+	if got := sa.disappearingSettingForChat("chat-1"); got == nil || got.Timer != 10*time.Second {
+		t.Fatalf("known disappearing timer was cleared: %#v", got)
+	}
+}
+
+func TestRememberChatDisappearReportsTimerChangeForPortalResync(t *testing.T) {
+	sa := &SnapchatAPI{
+		chatsByID:          map[string]chatRef{},
+		chatDisappearAfter: map[string]int64{},
+	}
+	if changed := sa.rememberChatDisappear("chat-1", 60); !changed {
+		t.Fatal("new retention timer should report a change")
+	}
+	if changed := sa.rememberChatDisappear("chat-1", 60); changed {
+		t.Fatal("same retention timer should not report a change")
+	}
+}
+
+func TestForgetChatDisappearClearsKnownTimer(t *testing.T) {
+	sa := &SnapchatAPI{
+		chatsByID:          map[string]chatRef{"chat-1": {ID: "chat-1", DisappearAfterSeconds: 60}},
+		chatDisappearAfter: map[string]int64{"chat-1": 60},
+	}
+	if changed := sa.forgetChatDisappear("chat-1"); !changed {
+		t.Fatal("clearing a known timer should report a change")
+	}
+	if got := sa.disappearingSettingForChat("chat-1"); got != nil {
+		t.Fatalf("disappearing timer was not cleared: %#v", got)
+	}
+	if changed := sa.forgetChatDisappear("chat-1"); changed {
+		t.Fatal("clearing an already empty timer should not report a change")
+	}
+}
+
+func TestChatInfoUsesRememberedRetention(t *testing.T) {
+	sa := &SnapchatAPI{
+		Label:              "browser-session",
+		chatsByID:          map[string]chatRef{"chat-1": {ID: "chat-1", Name: "Emerson"}},
+		ghostNames:         map[string]string{},
+		ghostUsernames:     map[string]string{},
+		chatDisappearAfter: map[string]int64{"chat-1": 86400},
+	}
+	info := sa.chatInfoFor("chat-1", "Emerson")
+	if info == nil || info.Disappear == nil {
+		t.Fatal("chat info should include disappearing settings")
+	}
+	if info.Disappear.Timer != 24*time.Hour {
+		t.Fatalf("chat disappear timer = %s, want 24h", info.Disappear.Timer)
+	}
+}
+
+func TestConnectorMessageFromAPIPreservesDisappearForTextAndReply(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		quoted int64
+	}{
+		{name: "normal text"},
+		{name: "reply", quoted: 123},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := connectorMessageFromAPI(snapapi.Message{
+				ID:              "456",
+				AuthorID:        "emerson",
+				Author:          "Emerson",
+				Text:            "hello",
+				ContentType:     "CHAT",
+				DisappearAfter:  24 * time.Hour,
+				QuotedMessageID: tc.quoted,
+			})
+			if msg.DisappearAfterSeconds != 86400 {
+				t.Fatalf("disappear after = %d, want 86400", msg.DisappearAfterSeconds)
+			}
+			if tc.quoted > 0 && msg.QuotedMessageID != "123" {
+				t.Fatalf("quoted id = %q, want 123", msg.QuotedMessageID)
+			}
+		})
+	}
+}
+
+func TestConvertMessageAppliesDisappearToTextReplyAndSelfEcho(t *testing.T) {
+	sa := &SnapchatAPI{
+		Label:              "browser-session",
+		chatsByID:          map[string]chatRef{"chat-1": {ID: "chat-1", Name: "Emerson"}},
+		ghostNames:         map[string]string{},
+		chatDisappearAfter: map[string]int64{"chat-1": 86400},
+	}
+	portal := &bridgev2.Portal{Portal: &database.Portal{
+		PortalKey: networkid.PortalKey{ID: networkid.PortalID("chat-1")},
+	}}
+	for _, tc := range []struct {
+		name    string
+		message sidecar.Message
+	}{
+		{name: "incoming text", message: sidecar.Message{ID: "1", Author: "Emerson", Text: "hello"}},
+		{name: "incoming reply", message: sidecar.Message{ID: "2", Author: "Emerson", Text: "reply", QuotedMessageID: "1"}},
+		{name: "self sync echo", message: sidecar.Message{ID: "3", Author: "You", Text: "from snapchat", Outgoing: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			converted, err := sa.convertMessage(context.Background(), portal, nil, tc.message)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if converted.Disappear.Timer != 24*time.Hour {
+				t.Fatalf("converted disappear timer = %s, want 24h", converted.Disappear.Timer)
+			}
+		})
+	}
+}
+
+func TestConvertMessageSuppressesDisappearForSavedMessages(t *testing.T) {
+	sa := &SnapchatAPI{chatDisappearAfter: map[string]int64{"chat-1": 86400}}
+	portal := &bridgev2.Portal{Portal: &database.Portal{
+		PortalKey: networkid.PortalKey{ID: networkid.PortalID("chat-1")},
+	}}
+	converted, err := sa.convertMessage(context.Background(), portal, nil, sidecar.Message{
+		ID:     "1",
+		Author: "Emerson",
+		Text:   "saved",
+		Saved:  true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if converted.Disappear.Timer != 0 {
+		t.Fatalf("saved converted message got disappearing timer %s", converted.Disappear.Timer)
 	}
 }
 

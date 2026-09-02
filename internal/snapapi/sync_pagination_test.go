@@ -80,12 +80,14 @@ func overrideListingURL(t *testing.T, srv *httptest.Server) {
 	origDelta := deltaSyncURL
 	origUpdate := updateContentMessageURL
 	origCreate := createContentMessageURL
+	origUpdateConv := updateConversationURL
 	syncConversationsURL = atSrv(srv, paths.SYNC_CONVERSATIONS)
 	queryConversationsURL = atSrv(srv, paths.QUERY_CONVERSATIONS)
 	batchDeltaSyncURL = atSrv(srv, paths.BATCH_DELTA_SYNC_CONVERSATIONS)
 	deltaSyncURL = atSrv(srv, paths.DELTA_SYNC_CONVERSATIONS)
 	updateContentMessageURL = atSrv(srv, paths.UPDATE_CONTENT_MESSAGE)
 	createContentMessageURL = atSrv(srv, paths.CREATE_CONTENT_MESSAGE)
+	updateConversationURL = atSrv(srv, paths.UPDATE_CONVERSATION)
 	t.Cleanup(func() {
 		syncConversationsURL = origSync
 		queryConversationsURL = origQuery
@@ -93,6 +95,7 @@ func overrideListingURL(t *testing.T, srv *httptest.Server) {
 		deltaSyncURL = origDelta
 		updateContentMessageURL = origUpdate
 		createContentMessageURL = origCreate
+		updateConversationURL = origUpdateConv
 	})
 }
 

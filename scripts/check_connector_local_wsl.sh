@@ -3,9 +3,15 @@ set -euo pipefail
 
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 config_path="${SNAPCHAT_BRIDGE_CONFIG:-${repo_dir}/docker/bridgev2-config.yaml}"
+runtime_env="${SNAPCHAT_BRIDGE_RUNTIME_ENV:-${repo_dir}/data/runtime/local-stack.env}"
 windows_host="${SNAPCHAT_CONNECTOR_HOST:-$(ip route show default | awk '{ print $3; exit }')}"
 
-shared_secret="${SNAPCHAT_SHARED_SECRET:-}"
+if [[ -f "${runtime_env}" && -z "${SNAPCHAT_SHARED_SECRET:-}" && -z "${SNAPCHAT_CONNECTOR_SHARED_SECRET:-}" ]]; then
+    # shellcheck disable=SC1090
+    source "${runtime_env}"
+fi
+
+shared_secret="${SNAPCHAT_CONNECTOR_SHARED_SECRET:-${SNAPCHAT_SHARED_SECRET:-}}"
 if [[ -z "${shared_secret}" ]]; then
     shared_secret="$({
         awk '
@@ -25,7 +31,7 @@ if [[ -z "${shared_secret}" ]]; then
     exit 1
 fi
 
-export SNAPCHAT_CHECK_BASE_URL="http://${windows_host}:3101"
+export SNAPCHAT_CHECK_BASE_URL="${SNAPCHAT_CONNECTOR_BASE_URL:-http://${windows_host}:3101}"
 export SNAPCHAT_CHECK_SECRET="${shared_secret}"
 
 python3 - <<'PY'

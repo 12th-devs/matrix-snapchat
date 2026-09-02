@@ -149,5 +149,15 @@ export function createApp({
     res.status(202).json(result);
   }));
 
+  app.post("/typing", asyncRoute(async (req, res) => {
+    const { chatId, typing, durationMs } = req.body || {};
+    if (!chatId || typeof typing !== "boolean") {
+      res.status(400).json({ ok: false, error: "chatId and typing are required" });
+      return;
+    }
+    const result = await bridge.setTyping(String(chatId), Boolean(typing), Number(durationMs || 1500));
+    res.status(result.ok ? 202 : 501).json(result);
+  }));
+
   return app;
 }

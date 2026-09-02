@@ -1,2 +1,0 @@
-(globalThis.webpackChunk_snapchat_web_calling_app=globalThis.webpackChunk_snapchat_web_calling_app||[]).push([[6302],{66302(e,a,l){Object.defineProperty(a,"__esModule",{value:!0});var t=l(31635).__importDefault(l(16313));(0,l(73424).shouldPolyfill)()&&Object.defineProperty(Intl,"ListFormat",{value:t.default,writable:!0,enumerable:!1,configurable:!0})}}]);
-//# sourceMappingURL=polyfills-c5f68234e7fa51fce630.js.map

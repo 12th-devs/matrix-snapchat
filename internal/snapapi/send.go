@@ -12,16 +12,20 @@ import (
 	"github.com/0xzer/snapper/data/paths"
 	"github.com/0xzer/snapper/protos"
 	"github.com/google/uuid"
+	"github.com/rs/zerolog"
 )
 
 func (c *Client) SendText(ctx context.Context, chatID, text string, replyToMessageID int64) (string, error) {
+	started := time.Now()
 	if err := c.ensureAuthenticated(ctx); err != nil {
 		return "", err
 	}
+	authDone := time.Now()
 	conv, err := c.conversationFresh(ctx, chatID)
 	if err != nil {
 		return "", err
 	}
+	conversationDone := time.Now()
 	content := &protos.Contents{
 		Content: &protos.Contents_Text{
 			Text: &protos.Text{Text: text},
@@ -70,9 +74,21 @@ func (c *Client) SendText(ctx context.Context, chatID, text string, replyToMessa
 		}}
 	}
 	var resp protos.CreateContentMessageResponse
+	requestStarted := time.Now()
+	zerolog.Ctx(ctx).Info().
+		Str("diag", "send_latency").
+		Str("stage", "create_content_request").
+		Str("chat_id", chatID).
+		Int64("conversation_version", conv.GetVersion()).
+		Int64("reply_to_message_id", replyToMessageID).
+		Dur("since_send_text_start", time.Since(started)).
+		Dur("ensure_auth_duration", authDone.Sub(started)).
+		Dur("conversation_fresh_duration", conversationDone.Sub(authDone)).
+		Msg("send-latency: CreateContentMessage request")
 	if err = c.doGRPC(ctx, createContentMessageURL, req, &resp); err != nil {
 		return "", err
 	}
+	responseDone := time.Now()
 	for _, result := range resp.GetResult() {
 		if !result.GetSuccess() {
 			return "", fmt.Errorf("snapchat api send failed")
@@ -80,8 +96,24 @@ func (c *Client) SendText(ctx context.Context, chatID, text string, replyToMessa
 	}
 	c.forgetConversation(chatID)
 	if createdID := createdMessageIDFromResponse(&resp); createdID != "" {
+		zerolog.Ctx(ctx).Info().
+			Str("diag", "send_latency").
+			Str("stage", "snapchat_response").
+			Str("chat_id", chatID).
+			Str("created_message_id", createdID).
+			Dur("create_content_duration", responseDone.Sub(requestStarted)).
+			Dur("total_send_text_duration", responseDone.Sub(started)).
+			Msg("send-latency: Snapchat response")
 		return createdID, nil
 	}
+	zerolog.Ctx(ctx).Info().
+		Str("diag", "send_latency").
+		Str("stage", "snapchat_response").
+		Str("chat_id", chatID).
+		Uint64("client_resolution_id", resp.GetClientResolutionId()).
+		Dur("create_content_duration", responseDone.Sub(requestStarted)).
+		Dur("total_send_text_duration", responseDone.Sub(started)).
+		Msg("send-latency: Snapchat response")
 	return fmt.Sprintf("%d", resp.GetClientResolutionId()), nil
 }
 
@@ -176,34 +208,55 @@ func (c *Client) MarkRead(ctx context.Context, chatID string, messageID int64, v
 	if err != nil {
 		return err
 	}
-	// UpdateContentMessage requires the conversation's CURRENT version. The
-	// version carried by receipt metadata was captured when the message was
-	// received and is stale by read time, which made Snapchat reject the read
-	// update (success=false). Prefer the version from the freshly synced
-	// conversation; the receipt version is only a fallback.
+	// Reading a chat is a conversation-level watermark update: Snapchat Web
+	// uses UpdateConversation with the UpdateConversationRead action (read up
+	// to lastMessageId), which is what maintains the participant
+	// ReadHighWatermark. UpdateContentMessage with UpdateAction_Read is
+	// rejected by the server with UPDATE_NOT_APPLICABLE (verified live), so
+	// this must stay a conversation update.
 	currentVersion := conv.GetVersion()
 	if currentVersion <= 0 {
 		currentVersion = version
 	}
-	req := &protos.UpdateContentMessageRequest{
+	if selfReadHighWatermark(conv, c.SelfUserID()) >= messageID {
+		zerolog.Ctx(ctx).Debug().Str("diag", "markread_already_current").Str("chat_id", chatID).Int64("last_message_id", messageID).Int64("fresh_conversation_version", conv.GetVersion()).Msg("receipt-diag: Snapchat read watermark already covers target")
+		return nil
+	}
+	zerolog.Ctx(ctx).Debug().Str("diag", "markread_request").Str("chat_id", chatID).Int64("last_message_id", messageID).Int64("fresh_conversation_version", conv.GetVersion()).Int64("fallback_version", version).Int64("used_version", currentVersion).Msg("receipt-diag: UpdateConversation(read) request prepared")
+	req := &protos.UpdateConversationRequest{
+		ConversationId:     conv.GetConversationId(),
 		ClientResolutionId: randomUint64(),
 		CurrentVersion:     currentVersion,
-		Update: &protos.UpdateAction{
-			MessageId:       messageID,
-			SenderId:        c.selfUUID(),
-			ConversationId:  conv.GetConversationId(),
-			UpdateTimestamp: time.Now().UnixMilli(),
-			Update:          &protos.UpdateAction_Read{Read: &protos.Read{}},
+		UpdateConversationAction: &protos.UpdateConversationRequest_Read{
+			Read: &protos.UpdateConversationRead{
+				SelfUserId: c.selfUUID(),
+				ReadConversationMessageData: &protos.ReadConversationMessageData{
+					LastMessageId: messageID,
+				},
+			},
 		},
 	}
-	var resp protos.UpdateContentMessageResponse
-	if err = c.doGRPC(ctx, updateContentMessageURL, req, &resp); err != nil {
+	var resp protos.UpdateConversationResponse
+	if err = c.doGRPC(ctx, updateConversationURL, req, &resp); err != nil {
 		return err
 	}
-	if !resp.GetSuccess() && !resp.GetRetryable() {
-		return fmt.Errorf("snapchat api read receipt failed")
+	zerolog.Ctx(ctx).Debug().Str("diag", "markread_response").Str("chat_id", chatID).Int64("last_message_id", messageID).Bool("success", resp.GetUpdateData().GetSuccess()).Int64("response_conversation_version", resp.GetUpdateData().GetCurrentVersion()).Str("failure_reason", resp.GetResult().String()).Msg("receipt-diag: UpdateConversation(read) response")
+	if !resp.GetUpdateData().GetSuccess() {
+		return fmt.Errorf("snapchat api read receipt failed: %s", resp.GetResult().String())
 	}
 	return nil
+}
+
+func selfReadHighWatermark(conv *protos.Conversation, selfUserID string) int64 {
+	if conv == nil || selfUserID == "" {
+		return 0
+	}
+	for _, participant := range conv.GetParticipants() {
+		if strings.EqualFold(uuidToString(participant.GetUserId()), selfUserID) {
+			return participant.GetReadHighWatermark()
+		}
+	}
+	return 0
 }
 
 // EraseMessage unsends/deletes a Snapchat message (UpdateAction_Erase, the

@@ -29,13 +29,7 @@ func (sa *SnapchatAPI) GetChatInfo(ctx context.Context, portal *bridgev2.Portal)
 }
 
 func (sa *SnapchatAPI) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bridgev2.UserInfo, error) {
-	name := sa.lookupGhostName(ghost.ID)
-	if name == "" {
-		name = sa.lookupGhostNameFromStore(ghost.ID)
-	}
-	if name == "" {
-		name = string(ghost.ID)
-	}
+	name := sa.bestGhostDisplayName(ghost.ID, "")
 	identifier := fmt.Sprintf("snapchat:%s", ghost.ID)
 	if username := sa.lookupGhostUsername(ghost.ID); username != "" {
 		identifier = fmt.Sprintf("snapchat:%s", username)
@@ -149,10 +143,11 @@ func (sa *SnapchatAPI) chatInfoForWithAvatar(ctx context.Context, chatID, chatNa
 	if roomType == database.RoomTypeDM {
 		remoteUserID := sa.remoteUserIDForChat(chatID, name)
 		otherUserID = remoteUserID
-		sa.rememberGhostName(remoteUserID, name)
 		if ref.Username != "" {
 			sa.rememberGhostUsername(remoteUserID, ref.Username)
 		}
+		name = sa.bestGhostDisplayName(remoteUserID, name)
+		sa.rememberGhostName(remoteUserID, name)
 		avatar = sa.cachedAvatarForGhost(remoteUserID)
 		if avatar == nil && fetchAvatar {
 			avatar = sa.avatarForGhost(ctx, remoteUserID)
@@ -178,13 +173,7 @@ func (sa *SnapchatAPI) chatInfoForWithAvatar(ctx context.Context, chatID, chatNa
 				continue
 			}
 			userID := makeUserID(participantID)
-			display := sa.lookupGhostName(userID)
-			if display == "" {
-				display = sa.lookupGhostNameFromStore(userID)
-			}
-			if display == "" {
-				display = string(userID)
-			}
+			display := sa.bestGhostDisplayName(userID, "")
 			memberMap[userID] = bridgev2.ChatMember{
 				EventSender: bridgev2.EventSender{
 					Sender: userID,
