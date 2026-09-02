@@ -217,7 +217,12 @@ func (sa *SnapchatAPI) chatInfoForWithAvatar(ctx context.Context, chatID, chatNa
 }
 
 func (sa *SnapchatAPI) queueChatResync(ctx context.Context, chatID, chatName string) bool {
-	return sa.queueChatResyncWithAvatar(ctx, chatID, chatName, true)
+	info := sa.chatInfoForWithAvatar(ctx, chatID, chatName, true)
+	if sa.chatResyncUnchanged(ctx, chatID, info) {
+		sa.noteChatResyncSkipped(chatID, chatName, info)
+		return false
+	}
+	return sa.queueChatResyncWithInfo(chatID, chatName, true, info)
 }
 
 func (sa *SnapchatAPI) queueChatResyncWithAvatar(ctx context.Context, chatID, chatName string, fetchAvatar bool) bool {
@@ -241,6 +246,7 @@ func (sa *SnapchatAPI) queueChatResyncWithInfo(chatID, chatName string, force bo
 	}
 	sa.queuedPortalResyncs[chatID] = struct{}{}
 	sa.mu.Unlock()
+	sa.recordQueuedChatResync(chatID, info)
 
 	portalKey := networkid.PortalKey{
 		ID:       networkid.PortalID(chatID),

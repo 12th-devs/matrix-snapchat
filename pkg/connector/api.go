@@ -50,37 +50,39 @@ type SnapchatAPI struct {
 	Label     string
 	Client    *sidecar.Client
 
-	apiMu                   sync.Mutex
-	apiClient               *snapapi.Client
-	apiCookieString         string
-	apiAuthCheckedAt        time.Time
-	consecutiveUnauthorized int
-	reLoginRequired         bool
-	nextRecoveryCheckAt     time.Time
-	readWatermarks          map[string]map[string]int64
-	apiSelfUserID           string
-	mu                      sync.Mutex
-	seenByChat              map[string]map[string]struct{}
-	chatsByID               map[string]chatRef
-	ghostNames              map[string]string
-	ghostUsernames          map[string]string
-	chatState               map[string]string
-	lastMessageID           map[string]int64
-	lastMessageVersion      map[string]int64
-	messageVersions         map[string]map[int64]int64
-	messageFailures         map[string]int
-	messageRetryAfter       map[string]time.Time
-	lastReadReceiptSync     map[string]time.Time
-	lastTypingSent          map[string]typingUpdateState
-	ghostAvatarCheckedAt    map[string]time.Time
-	avatarURLBySnapID       map[string]string
-	queuedPortalResyncs     map[string]struct{}
-	recentOutgoing          map[string][]pendingOutgoing
-	chatDisappearAfter      map[string]int64
-	avatarBootstrapDone     bool
-	sidebarBaselineReady    bool
-	sidebarBaselineAt       time.Time
-	hybridBackfillStarted   bool
+	apiMu                    sync.Mutex
+	apiClient                *snapapi.Client
+	apiCookieString          string
+	apiAuthCheckedAt         time.Time
+	consecutiveUnauthorized  int
+	reLoginRequired          bool
+	nextRecoveryCheckAt      time.Time
+	readWatermarks           map[string]map[string]int64
+	apiSelfUserID            string
+	mu                       sync.Mutex
+	seenByChat               map[string]map[string]struct{}
+	chatsByID                map[string]chatRef
+	ghostNames               map[string]string
+	ghostUsernames           map[string]string
+	chatState                map[string]string
+	lastMessageID            map[string]int64
+	lastMessageVersion       map[string]int64
+	messageVersions          map[string]map[int64]int64
+	messageFailures          map[string]int
+	messageRetryAfter        map[string]time.Time
+	lastReadReceiptSync      map[string]time.Time
+	lastTypingSent           map[string]typingUpdateState
+	ghostAvatarCheckedAt     map[string]time.Time
+	avatarURLBySnapID        map[string]string
+	queuedPortalResyncs      map[string]struct{}
+	appliedChatInfoState     map[string]chatInfoState
+	lastSkippedChatInfoState map[string]chatInfoState
+	recentOutgoing           map[string][]pendingOutgoing
+	chatDisappearAfter       map[string]int64
+	avatarBootstrapDone      bool
+	sidebarBaselineReady     bool
+	sidebarBaselineAt        time.Time
+	hybridBackfillStarted    bool
 }
 
 type connectorEELDecrypter struct {
@@ -118,28 +120,30 @@ var sidebarRelativeAgePattern = regexp.MustCompile(`(?i)(^|[\s\-·|:])\d+\s*[mhd
 
 func NewSnapchatAPI(sc *SnapchatConnector, login *bridgev2.UserLogin, label string) *SnapchatAPI {
 	return &SnapchatAPI{
-		Connector:            sc,
-		UserLogin:            login,
-		Label:                label,
-		Client:               sc.newClient(),
-		seenByChat:           make(map[string]map[string]struct{}),
-		chatsByID:            make(map[string]chatRef),
-		ghostNames:           make(map[string]string),
-		ghostUsernames:       make(map[string]string),
-		chatState:            make(map[string]string),
-		lastMessageID:        make(map[string]int64),
-		lastMessageVersion:   make(map[string]int64),
-		messageVersions:      make(map[string]map[int64]int64),
-		messageFailures:      make(map[string]int),
-		messageRetryAfter:    make(map[string]time.Time),
-		lastReadReceiptSync:  make(map[string]time.Time),
-		lastTypingSent:       make(map[string]typingUpdateState),
-		ghostAvatarCheckedAt: make(map[string]time.Time),
-		avatarURLBySnapID:    make(map[string]string),
-		queuedPortalResyncs:  make(map[string]struct{}),
-		recentOutgoing:       make(map[string][]pendingOutgoing),
-		chatDisappearAfter:   make(map[string]int64),
-		readWatermarks:       make(map[string]map[string]int64),
+		Connector:                sc,
+		UserLogin:                login,
+		Label:                    label,
+		Client:                   sc.newClient(),
+		seenByChat:               make(map[string]map[string]struct{}),
+		chatsByID:                make(map[string]chatRef),
+		ghostNames:               make(map[string]string),
+		ghostUsernames:           make(map[string]string),
+		chatState:                make(map[string]string),
+		lastMessageID:            make(map[string]int64),
+		lastMessageVersion:       make(map[string]int64),
+		messageVersions:          make(map[string]map[int64]int64),
+		messageFailures:          make(map[string]int),
+		messageRetryAfter:        make(map[string]time.Time),
+		lastReadReceiptSync:      make(map[string]time.Time),
+		lastTypingSent:           make(map[string]typingUpdateState),
+		ghostAvatarCheckedAt:     make(map[string]time.Time),
+		avatarURLBySnapID:        make(map[string]string),
+		queuedPortalResyncs:      make(map[string]struct{}),
+		appliedChatInfoState:     make(map[string]chatInfoState),
+		lastSkippedChatInfoState: make(map[string]chatInfoState),
+		recentOutgoing:           make(map[string][]pendingOutgoing),
+		chatDisappearAfter:       make(map[string]int64),
+		readWatermarks:           make(map[string]map[string]int64),
 	}
 }
 
