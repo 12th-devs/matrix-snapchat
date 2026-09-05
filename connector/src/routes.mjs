@@ -84,7 +84,11 @@ export function createApp({
   }));
 
   app.post("/debug/media-resolve", asyncRoute(async (req, res) => {
-    res.json(await bridge.debugMediaResolve(String((req.body || {}).descriptorHex || "")));
+    res.json(await bridge.debugMediaResolve(req.body || {}));
+  }));
+
+  app.post("/debug/media-signed-download", asyncRoute(async (req, res) => {
+    res.json(await bridge.debugMediaSignedDownload(req.body || {}));
   }));
 
   app.get("/debug/conversation-messages", asyncRoute(async (req, res) => {

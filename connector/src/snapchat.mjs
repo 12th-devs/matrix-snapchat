@@ -2716,6 +2716,7 @@ export async function debugMediaResolve(payload) {
     snapClientUserAgent: lastSnapAPIRequestHeaders?.snapClientUserAgent || "",
   });
 }
+export const debugMediaSignedDownload = debugTools.debugMediaSignedDownload;
 export const getBrowserConversationMessages = debugTools.getBrowserConversationMessages;
 export const getBrowserE2EESummary = debugTools.getBrowserE2EESummary;
 export const deriveBrowserE2EESharedSecret = debugTools.deriveBrowserE2EESharedSecret;

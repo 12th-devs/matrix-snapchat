@@ -1392,6 +1392,186 @@ async function debugMediaResolve(payload) {
   }, { priority: 0 });
 }
 
+// debugMediaSignedDownload follows Snapchat Web's ordinary DownloadMedia path:
+// 24977.hB(contentObject, metricsContext) -> signed URL -> browser fetch blob,
+// with the ARROYO_MESSAGING 404 fallback through 24977.NA(contentObject).
+// It returns only structural URL diagnostics and byte/container sniffing.
+async function debugMediaSignedDownload(payload) {
+  const descriptorHex = String(payload?.descriptorHex || "").replace(/[^0-9a-fA-F]/g, "");
+  const metricsContext = String(payload?.metricsContext || "chat_media");
+  if (!descriptorHex || descriptorHex.length < 8 || descriptorHex.length % 2 !== 0) {
+    return { ok: false, error: "descriptor hex required" };
+  }
+  return withLock(async () => {
+    const { page: currentPage } = await ensureSession();
+    if (!currentPage || currentPage.isClosed()) {
+      return { ok: false, error: "no active page" };
+    }
+    return await currentPage.evaluate(async ({ descriptorHex, metricsContext }) => {
+      function findWebpackRequire() {
+        for (const key of Object.keys(globalThis)) {
+          if (!/^webpackChunk/.test(key)) {
+            continue;
+          }
+          const chunk = globalThis[key];
+          if (!Array.isArray(chunk) || typeof chunk.push !== "function") {
+            continue;
+          }
+          let webpackRequire;
+          try {
+            chunk.push([[`codex-media-download-${Date.now()}`], {}, (req) => {
+              webpackRequire = req;
+            }]);
+          } catch {
+            continue;
+          }
+          if (webpackRequire?.m) {
+            return webpackRequire;
+          }
+        }
+        return undefined;
+      }
+
+      function contentObjectFromHex(hex) {
+        return new Uint8Array(hex.match(/.{2}/g).map((pair) => Number.parseInt(pair, 16)));
+      }
+
+      function summarizeUrl(value) {
+        const url = new URL(value);
+        return {
+          host: url.host,
+          pathShape: url.pathname.replace(/[A-Za-z0-9_-]{12,}/g, ":id"),
+          queryParamNames: Array.from(url.searchParams.keys()).sort(),
+          uc: url.searchParams.get("uc") || "",
+        };
+      }
+
+      function sniff(bytes, contentType) {
+        const head = Array.from(bytes.slice(0, 16));
+        const ascii = String.fromCharCode(...bytes.slice(0, 16)).replace(/[^\x20-\x7e]/g, ".");
+        let container = "unknown";
+        if (head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff) {
+          container = "jpeg";
+        } else if (head[0] === 0x89 && head[1] === 0x50 && head[2] === 0x4e && head[3] === 0x47) {
+          container = "png";
+        } else if (ascii.startsWith("GIF8")) {
+          container = "gif";
+        } else if (ascii.slice(4, 8) === "ftyp") {
+          container = "mp4";
+        } else if (head[0] === 0x52 && head[1] === 0x49 && head[2] === 0x46 && head[3] === 0x46) {
+          container = "riff";
+        }
+        const clear = ["jpeg", "png", "gif", "mp4", "riff"].includes(container)
+          || /^image\/|^video\/|^audio\//i.test(contentType || "");
+        return { container, appearsClear: clear, headHex: head.map((b) => b.toString(16).padStart(2, "0")).join("") };
+      }
+
+      const webpackRequire = findWebpackRequire();
+      if (!webpackRequire?.m) {
+        return { ok: false, error: "webpack modules not found", url: location.href };
+      }
+      const resolver = webpackRequire(24977);
+      if (typeof resolver?.hB !== "function" || typeof resolver?.NA !== "function") {
+        return { ok: false, error: "media resolver exports missing", exportKeys: Object.keys(resolver || {}) };
+      }
+
+      const contentObject = contentObjectFromHex(descriptorHex);
+      let signedUrl = "";
+      let fallbackUsed = false;
+      let first = {};
+      try {
+        signedUrl = await resolver.hB(contentObject, metricsContext);
+        first = summarizeUrl(signedUrl);
+      } catch (error) {
+        return { ok: false, stage: "hB", errorName: error?.name || "", errorMessage: String(error?.message || error).slice(0, 180) };
+      }
+
+      const downloader = webpackRequire(76993);
+      const requestHelper = webpackRequire(17196);
+      async function fetchBytes(url) {
+        if (typeof requestHelper?.u9 === "function") {
+          const response = await requestHelper.u9(new Request(url), 60000, `media_download_for_${metricsContext}_codex_probe`);
+          const buffer = await response.arrayBuffer();
+          return {
+            via: "17196.u9",
+            bytes: new Uint8Array(buffer),
+            status: response.status,
+            ok: response.ok,
+            contentType: response.headers.get("content-type") || "",
+          };
+        }
+        if (typeof downloader?.e === "function") {
+          return {
+            via: "76993.e",
+            bytes: new Uint8Array(await downloader.e(url, metricsContext)),
+            status: 200,
+            contentType: "",
+          };
+        }
+        const response = await fetch(url, { credentials: "include" });
+        const buffer = await response.arrayBuffer();
+        return {
+          via: "fetch",
+          bytes: new Uint8Array(buffer),
+          status: response.status,
+          ok: response.ok,
+          contentType: response.headers.get("content-type") || "",
+        };
+      }
+
+      let downloaded;
+      try {
+        downloaded = await fetchBytes(signedUrl);
+      } catch (error) {
+        return {
+          ok: false,
+          stage: "fetch",
+          contentObjectBytes: contentObject.byteLength,
+          firstUrl: first,
+          fallbackUsed,
+          errorName: error?.name || "",
+          errorMessage: String(error?.message || error).slice(0, 180),
+        };
+      }
+      if ((downloaded.status === 404 || /status_404/.test(downloaded.errorMessage || "")) && first.uc === "4") {
+        signedUrl = `${await resolver.NA(contentObject)}&forceRefresh=True`;
+        fallbackUsed = true;
+        try {
+          downloaded = await fetchBytes(signedUrl);
+        } catch (error) {
+          return {
+            ok: false,
+            stage: "fallback_fetch",
+            contentObjectBytes: contentObject.byteLength,
+            firstUrl: first,
+            finalUrl: summarizeUrl(signedUrl),
+            fallbackUsed,
+            errorName: error?.name || "",
+            errorMessage: String(error?.message || error).slice(0, 180),
+          };
+        }
+      }
+
+      const finalUrl = summarizeUrl(signedUrl);
+      const contentType = downloaded.contentType || "";
+      const bytes = downloaded.bytes || new Uint8Array(0);
+      return {
+        ok: downloaded.ok ?? downloaded.status === 200,
+        pageOrigin: location.origin,
+        via: downloaded.via,
+        contentObjectBytes: contentObject.byteLength,
+        firstUrl: first,
+        finalUrl,
+        fallbackUsed,
+        httpStatus: downloaded.status,
+        contentType,
+        byteCount: bytes.byteLength,
+        sniff: sniff(bytes, contentType),
+      };
+    }, { descriptorHex, metricsContext });
+  }, { priority: 0 });
+}
+
   return {
     getBrowserStorageSummary,
     searchBrowserBundle,
@@ -1400,5 +1580,6 @@ async function debugMediaResolve(payload) {
     getBrowserE2EESummary,
     deriveBrowserE2EESharedSecret,
     debugMediaResolve,
+    debugMediaSignedDownload,
   };
 }
