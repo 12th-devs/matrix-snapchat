@@ -125,7 +125,7 @@ export SNAPCHAT_SHARED_SECRET="${runtime_secret}"
 export SNAPCHAT_CONNECTOR_SHARED_SECRET="${runtime_secret}"
 export SNAPCHAT_CONNECTOR_BASE_URL="${SNAPCHAT_CONNECTOR_BASE_URL:-http://${windows_host}:3101}"
 export SNAPCHAT_READ_RECEIPTS_ENABLED="${SNAPCHAT_READ_RECEIPTS_ENABLED:-true}"
-export SNAPCHAT_SNAP_MEDIA_ENABLED=false
+export SNAPCHAT_SNAP_MEDIA_ENABLED="${SNAPCHAT_SNAP_MEDIA_ENABLED:-true}"
 export SNAPCHAT_SNAP_MEDIA_ON_READ=false
 export SNAPCHAT_SEND_MEDIA_ENABLED=false
 EOF
@@ -142,7 +142,7 @@ export SNAPCHAT_SHARED_SECRET="${runtime_secret}"
 export SNAPCHAT_CONNECTOR_SHARED_SECRET="${runtime_secret}"
 export SNAPCHAT_CONNECTOR_BASE_URL="${connector_base_url}"
 export SNAPCHAT_READ_RECEIPTS_ENABLED="${SNAPCHAT_READ_RECEIPTS_ENABLED:-false}"
-export SNAPCHAT_SNAP_MEDIA_ENABLED=false
+export SNAPCHAT_SNAP_MEDIA_ENABLED=true
 export SNAPCHAT_SNAP_MEDIA_ON_READ=false
 export SNAPCHAT_SEND_MEDIA_ENABLED=false
 EOF
@@ -338,13 +338,41 @@ wait_for_connector() {
 start_bridge() {
     echo "Starting WSL bridge: ${bridge_binary}"
     echo "Bridge log: ${bridge_log}"
-    (
-        echo "==== bridge start $(date -Is) ===="
-        exec "${bridge_binary}" -c "${config_path}"
-    ) >>"${bridge_log}" 2>&1 &
-    local bridge_pid=$!
+    rm -f "${bridge_pid_file}"
+
+    local sh_script="${runtime_dir}/start-bridge.sh"
+    cat >"${sh_script}" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+cd "${repo_dir}"
+source "${runtime_env}"
+echo "\$\$" >"${bridge_pid_file}"
+echo "==== bridge start \$(date -Is) ====" >>"${bridge_log}"
+exec "${bridge_binary}" -c "\${SNAPCHAT_BRIDGE_CONFIG}" >>"${bridge_log}" 2>&1
+EOF
+    chmod +x "${sh_script}"
+
+    local ps_script="${runtime_dir}/start-bridge.ps1"
+    cat >"${ps_script}" <<EOF
+\$ErrorActionPreference = "Stop"
+Start-Process -FilePath "wsl.exe" -ArgumentList @("-d", "Ubuntu", "-e", "bash", "${sh_script}") -WindowStyle Hidden
+EOF
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(wslpath -w "${ps_script}")" >/dev/null 2>&1
+
+    for _ in $(seq 1 50); do
+        if [[ -s "${bridge_pid_file}" ]]; then
+            break
+        fi
+        sleep 0.1
+    done
+    local bridge_pid
+    bridge_pid="$(tr -dc '0-9' <"${bridge_pid_file}" 2>/dev/null || true)"
+    if [[ -z "${bridge_pid}" ]]; then
+        echo "Failed to start WSL bridge. Detached WSL launcher did not return a pid." >&2
+        exit 1
+    fi
     echo "${bridge_pid}" >"${bridge_pid_file}"
-    wait "${bridge_pid}"
+    echo "Bridge started in background with pid ${bridge_pid}"
 }
 
 case "${mode}" in
@@ -364,6 +392,12 @@ case "${mode}" in
     bridge-only)
         require_paths
         configure_bridge_runtime
+        load_runtime_env
+        SNAPCHAT_SNAP_MEDIA_ENABLED=true
+        SNAPCHAT_SNAP_MEDIA_ON_READ=false
+        SNAPCHAT_SEND_MEDIA_ENABLED=false
+        export SNAPCHAT_SNAP_MEDIA_ENABLED SNAPCHAT_SNAP_MEDIA_ON_READ SNAPCHAT_SEND_MEDIA_ENABLED
+        write_runtime_env_values "${SNAPCHAT_SHARED_SECRET}" "${SNAPCHAT_CONNECTOR_BASE_URL}"
         load_runtime_env
         if ! connector_health; then
             if sync_runtime_env_from_running_bridge; then

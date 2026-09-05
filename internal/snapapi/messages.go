@@ -84,6 +84,15 @@ func (c *Client) messageFromProto(ctx context.Context, chatID string, msg *proto
 	contentType := envelope.GetContentType()
 	body, isSnap := c.messageBody(ctx, chatID, msg)
 	media := mediaAttachmentsFromEnvelope(envelope, id)
+	if contentType == protos.ContentType_EXTERNAL_MEDIA && len(media) == 1 {
+		decoded := c.envelopeContentsForDecode(ctx, chatID, id, envelope)
+		key, iv, err := ExternalMediaEncryptionKeys(decoded)
+		if err != nil {
+			log.Printf("snapapi media: external encryption metadata unavailable message_id=%s: %v", id, err)
+		} else if len(key) > 0 {
+			media[0].Key, media[0].IV = key, iv
+		}
+	}
 	if body == "" && len(media) > 0 {
 		if isSnap {
 			body = "New Snap"

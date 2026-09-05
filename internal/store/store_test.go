@@ -3,6 +3,7 @@ package store
 import (
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestMessageStateMetadataPersists(t *testing.T) {
@@ -45,6 +46,46 @@ func TestMessageStateMetadataPersists(t *testing.T) {
 	}
 	if state == nil || state.HydratedAt == nil {
 		t.Fatalf("hydrated state was not marked: %#v", state)
+	}
+}
+
+func TestMessageHydratedAtSurvivesNilUpsert(t *testing.T) {
+	db, err := New(filepath.Join(t.TempDir(), "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	hydratedAt := time.Date(2026, 9, 4, 15, 0, 0, 0, time.UTC)
+	if err = db.UpsertMessages([]MessageState{{
+		PortalKey:  "chat-1",
+		RemoteID:   "123",
+		Text:       "Media",
+		Kind:       "media",
+		HasMedia:   true,
+		HydratedAt: &hydratedAt,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.UpsertMessages([]MessageState{{
+		PortalKey: "chat-1",
+		RemoteID:  "123",
+		Text:      "Media",
+		Kind:      "media",
+		HasMedia:  true,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	state, err := db.GetMessage("chat-1", "123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state == nil || state.HydratedAt == nil {
+		t.Fatalf("hydrated_at was not preserved: %#v", state)
+	}
+	if !state.HydratedAt.Equal(hydratedAt) {
+		t.Fatalf("hydrated_at = %s, want %s", state.HydratedAt.Format(time.RFC3339Nano), hydratedAt.Format(time.RFC3339Nano))
 	}
 }
 

@@ -2,6 +2,8 @@ package connector
 
 import (
 	"context"
+	"encoding/hex"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -9,10 +11,74 @@ import (
 	sidecar "github.com/colej/mautrix-snapchat/internal/connector"
 	"github.com/colej/mautrix-snapchat/internal/snapapi"
 	"github.com/colej/mautrix-snapchat/internal/store"
+	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
+	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/id"
 )
+
+func testHexBytes(t *testing.T, value string) []byte {
+	t.Helper()
+	data, err := hex.DecodeString(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+type recordingMatrixAPI struct {
+	uploadCalls int
+}
+
+func (api *recordingMatrixAPI) GetMXID() id.UserID   { return "" }
+func (api *recordingMatrixAPI) IsDoublePuppet() bool { return false }
+func (api *recordingMatrixAPI) SendMessage(context.Context, id.RoomID, event.Type, *event.Content, *bridgev2.MatrixSendExtra) (*mautrix.RespSendEvent, error) {
+	return nil, nil
+}
+func (api *recordingMatrixAPI) SendState(context.Context, id.RoomID, event.Type, string, *event.Content, time.Time) (*mautrix.RespSendEvent, error) {
+	return nil, nil
+}
+func (api *recordingMatrixAPI) MarkRead(context.Context, id.RoomID, id.EventID, time.Time) error {
+	return nil
+}
+func (api *recordingMatrixAPI) MarkUnread(context.Context, id.RoomID, bool) error { return nil }
+func (api *recordingMatrixAPI) MarkTyping(context.Context, id.RoomID, bridgev2.TypingType, time.Duration) error {
+	return nil
+}
+func (api *recordingMatrixAPI) DownloadMedia(context.Context, id.ContentURIString, *event.EncryptedFileInfo) ([]byte, error) {
+	return nil, nil
+}
+func (api *recordingMatrixAPI) DownloadMediaToFile(context.Context, id.ContentURIString, *event.EncryptedFileInfo, bool, func(*os.File) error) error {
+	return nil
+}
+func (api *recordingMatrixAPI) UploadMedia(context.Context, id.RoomID, []byte, string, string) (id.ContentURIString, *event.EncryptedFileInfo, error) {
+	api.uploadCalls++
+	return id.ContentURIString("mxc://example/media"), nil, nil
+}
+func (api *recordingMatrixAPI) UploadMediaStream(context.Context, id.RoomID, int64, bool, bridgev2.FileStreamCallback) (id.ContentURIString, *event.EncryptedFileInfo, error) {
+	return "", nil, nil
+}
+func (api *recordingMatrixAPI) SetDisplayName(context.Context, string) error            { return nil }
+func (api *recordingMatrixAPI) SetAvatarURL(context.Context, id.ContentURIString) error { return nil }
+func (api *recordingMatrixAPI) SetExtraProfileMeta(context.Context, any) error          { return nil }
+func (api *recordingMatrixAPI) SetProfile(context.Context, any) error                   { return nil }
+func (api *recordingMatrixAPI) CreateRoom(context.Context, *mautrix.ReqCreateRoom) (id.RoomID, error) {
+	return "", nil
+}
+func (api *recordingMatrixAPI) DeleteRoom(context.Context, id.RoomID, bool) error { return nil }
+func (api *recordingMatrixAPI) EnsureJoined(context.Context, id.RoomID, ...bridgev2.EnsureJoinedParams) error {
+	return nil
+}
+func (api *recordingMatrixAPI) EnsureInvited(context.Context, id.RoomID, id.UserID) error { return nil }
+func (api *recordingMatrixAPI) TagRoom(context.Context, id.RoomID, event.RoomTag, bool) error {
+	return nil
+}
+func (api *recordingMatrixAPI) MuteRoom(context.Context, id.RoomID, time.Time) error { return nil }
+func (api *recordingMatrixAPI) GetEvent(context.Context, id.RoomID, id.EventID) (*event.Event, error) {
+	return nil, nil
+}
 
 func TestBaseSnapchatMessageID(t *testing.T) {
 	cases := map[string]string{
@@ -408,7 +474,7 @@ func TestShouldQueueMessageEditSkipsDuplicatesAndEmptyBodies(t *testing.T) {
 	}
 }
 
-func TestShouldQueueMessageEditSkipsSnapAndMediaRows(t *testing.T) {
+func TestShouldQueueMessageEditSkipsSnapAndMediaTextOnlyRows(t *testing.T) {
 	for _, state := range []*store.MessageState{
 		{Text: "New Snap", Kind: "snap"},
 		{Text: "photo.jpg", Kind: "media"},
@@ -417,6 +483,155 @@ func TestShouldQueueMessageEditSkipsSnapAndMediaRows(t *testing.T) {
 		if shouldQueueMessageEdit(state, sidecar.Message{Text: "decoded"}) {
 			t.Fatalf("state %+v should not queue an ordinary text edit", state)
 		}
+	}
+}
+
+func TestIsSnapRowClassifiesViewOnceSnaps(t *testing.T) {
+	cases := []struct {
+		message snapapi.Message
+		want    bool
+	}{
+		{snapapi.Message{IsSnap: true}, true},
+		{snapapi.Message{ContentType: "SNAP"}, true},
+		{snapapi.Message{ContentType: "SNAP_NOT_VIEWABLE"}, true},
+		{snapapi.Message{ContentType: "EXTERNAL_MEDIA", Media: []snapapi.MediaAttachment{{URL: "https://cf.staging.snap/1.jpg"}}}, false},
+		{snapapi.Message{ContentType: "CHAT"}, false},
+	}
+	for _, tc := range cases {
+		if got := isSnapRow(tc.message); got != tc.want {
+			t.Fatalf("isSnapRow(content_type=%q is_snap=%t) = %t, want %t", tc.message.ContentType, tc.message.IsSnap, got, tc.want)
+		}
+	}
+}
+
+func TestShouldQueueMessageEditAllowsMediaHydrationOnce(t *testing.T) {
+	if !shouldQueueMessageEdit(&store.MessageState{
+		Text:     "Media",
+		Kind:     "media",
+		HasMedia: true,
+	}, sidecar.Message{
+		Text: "Media",
+		Media: []sidecar.MediaAttachment{{
+			ID:       "media-1",
+			FileName: "photo.jpg",
+			MimeType: "image/jpeg",
+			Data:     []byte{0xff, 0xd8, 0xff},
+		}},
+	}) {
+		t.Fatal("expected media placeholder to queue one hydration edit")
+	}
+
+	now := time.Now()
+	if shouldQueueMessageEdit(&store.MessageState{
+		Text:       "Media",
+		Kind:       "media",
+		HasMedia:   true,
+		HydratedAt: &now,
+	}, sidecar.Message{
+		Text: "Media",
+		Media: []sidecar.MediaAttachment{{
+			ID:       "media-1",
+			FileName: "photo.jpg",
+			MimeType: "image/jpeg",
+			Data:     []byte{0xff, 0xd8, 0xff},
+		}},
+	}) {
+		t.Fatal("hydrated media should not queue repeated edits")
+	}
+}
+
+func TestClassifyMessageSyncSkipsAlreadyHydratedMedia(t *testing.T) {
+	now := time.Now()
+	got := classifyMessageSync(&store.MessageState{
+		Text:       "Media",
+		Kind:       "media",
+		HasMedia:   true,
+		HydratedAt: &now,
+	}, sidecar.Message{
+		ID:   "123",
+		Text: "Media",
+		Media: []sidecar.MediaAttachment{{
+			ID:       "media-1",
+			FileName: "photo.jpg",
+			MimeType: "image/jpeg",
+			Data:     []byte{0xff, 0xd8, 0xff},
+		}},
+	})
+	if got != messageSyncUnchanged {
+		t.Fatalf("already-hydrated media classify = %s, want %s", got, messageSyncUnchanged)
+	}
+}
+
+func TestMediaScopedMessageIDKeepsBaseMappingStable(t *testing.T) {
+	hydrated := mediaMessageID("123", []sidecar.MediaAttachment{{
+		ID:       "media-1",
+		FileName: "photo.jpg",
+		MimeType: "image/jpeg",
+		Data:     []byte{0xff, 0xd8, 0xff},
+	}})
+	if hydrated == "123" {
+		t.Fatal("hydrated media event ID should be media-scoped")
+	}
+	if got := baseSnapchatMessageID(hydrated); got != "123" {
+		t.Fatalf("baseSnapchatMessageID(%q) = %q, want 123", hydrated, got)
+	}
+
+	scopedHydrated := mediaMessageID(scopedSnapchatMessageID("chat-1", "123"), []sidecar.MediaAttachment{{ID: "media-1"}})
+	if got := baseSnapchatMessageID(scopedHydrated); got != "123" {
+		t.Fatalf("baseSnapchatMessageID(%q) = %q, want 123", scopedHydrated, got)
+	}
+}
+
+func TestConvertMessageRejectsDescriptorBeforeMatrixUpload(t *testing.T) {
+	const descriptorHex = "0a17753930436a34386878644b733968576c794a734b635f3112221215753930436a34386878644b733968576c794a734b633201034801500460017002"
+	matrix := &recordingMatrixAPI{}
+	portal := &bridgev2.Portal{Portal: &database.Portal{
+		MXID: id.RoomID("!room:example.com"),
+	}}
+	converted, err := (&SnapchatAPI{}).convertMessage(context.Background(), portal, matrix, sidecar.Message{
+		ID:   "123-media-attempt",
+		Text: "Media",
+		Media: []sidecar.MediaAttachment{{
+			ID:       "media-1",
+			FileName: "photo.jpg",
+			MimeType: "image/jpeg",
+			Data:     testHexBytes(t, descriptorHex),
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if matrix.uploadCalls != 0 {
+		t.Fatalf("descriptor reached Matrix upload %d time(s)", matrix.uploadCalls)
+	}
+	if len(converted.Parts) != 1 || converted.Parts[0].Content.MsgType != event.MsgText {
+		t.Fatalf("descriptor should fall back to text placeholder, got %#v", converted.Parts)
+	}
+}
+
+func TestConvertMessageDoesNotClassifyTinyBlobAsImageFromMimeOnly(t *testing.T) {
+	matrix := &recordingMatrixAPI{}
+	portal := &bridgev2.Portal{Portal: &database.Portal{
+		MXID: id.RoomID("!room:example.com"),
+	}}
+	converted, err := (&SnapchatAPI{}).convertMessage(context.Background(), portal, matrix, sidecar.Message{
+		ID:   "124-media-attempt",
+		Text: "Media",
+		Media: []sidecar.MediaAttachment{{
+			ID:       "media-2",
+			FileName: "photo.jpg",
+			MimeType: "image/jpeg",
+			Data:     []byte("tiny protobuf-ish descriptor bytes, not jpeg"),
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if matrix.uploadCalls != 0 {
+		t.Fatalf("tiny MIME-only image reached Matrix upload %d time(s)", matrix.uploadCalls)
+	}
+	if len(converted.Parts) != 1 || converted.Parts[0].Content.MsgType != event.MsgText {
+		t.Fatalf("tiny MIME-only media should fall back to text placeholder, got %#v", converted.Parts)
 	}
 }
 
@@ -432,6 +647,11 @@ func TestClassifyMessageSync(t *testing.T) {
 	}
 	if got := classifyMessageSync(&store.MessageState{Text: "photo.jpg", Kind: "media"}, sidecar.Message{ID: "1", Text: "caption changed"}); got != messageSyncUnchanged {
 		t.Fatalf("media text classify = %s, want %s", got, messageSyncUnchanged)
+	}
+	if got := classifyMessageSync(&store.MessageState{Text: "Media", Kind: "media", HasMedia: true}, sidecar.Message{
+		ID: "1", Text: "Media", Media: []sidecar.MediaAttachment{{ID: "m1", Data: []byte{1}}},
+	}); got != messageSyncEdit {
+		t.Fatalf("media hydration classify = %s, want %s", got, messageSyncEdit)
 	}
 }
 

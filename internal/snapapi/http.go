@@ -150,29 +150,63 @@ func chromeMajorFromUserAgent(userAgent string) string {
 	return ""
 }
 
-func (c *Client) doHTTP(ctx context.Context, endpoint, method string, header http.Header, body []byte) ([]byte, error) {
+// HTTPCallMeta carries safe transport facts for diagnostics: no header values,
+// cookies, tokens, or body contents.
+type HTTPCallMeta struct {
+	Status        int
+	FinalURLPath  string
+	Redirects     int
+	ContentType   string
+	ContentLength int64
+	BodyLen       int
+}
+
+func (m HTTPCallMeta) String() string {
+	return fmt.Sprintf("status=%d final_path=%s redirects=%d content_type=%q content_length=%d resp_bytes=%d",
+		m.Status, m.FinalURLPath, m.Redirects, m.ContentType, m.ContentLength, m.BodyLen)
+}
+
+func (c *Client) doHTTPDetailed(ctx context.Context, endpoint, method string, header http.Header, body []byte) ([]byte, HTTPCallMeta, error) {
+	var meta HTTPCallMeta
 	req, err := http.NewRequestWithContext(ctx, method, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return nil, err
+		return nil, meta, err
 	}
 	req.Header = header
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, meta, err
 	}
 	defer resp.Body.Close()
+	meta.Status = resp.StatusCode
+	if resp.Request != nil {
+		if resp.Request.URL != nil {
+			meta.FinalURLPath = resp.Request.URL.Path
+		}
+		for prev := resp.Request.Response; prev != nil; prev = prev.Request.Response {
+			meta.Redirects++
+		}
+	}
+	meta.ContentType = resp.Header.Get("Content-Type")
+	meta.ContentLength = resp.ContentLength
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
 	if err != nil {
-		return nil, err
+		return nil, meta, err
 	}
+	meta.BodyLen = len(data)
 	if resp.StatusCode >= 300 {
 		msg := fmt.Sprintf("%s %s returned %s: %s", method, endpoint, resp.Status, strings.TrimSpace(string(data[:min(len(data), 500)])))
 		if isMessagingEndpoint(endpoint) && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
-			return nil, fmt.Errorf("%w: %s", ErrUnauthorized, msg)
+			return nil, meta, fmt.Errorf("%w: %s", ErrUnauthorized, msg)
 		}
-		return nil, fmt.Errorf("%s", msg)
+		return nil, meta, fmt.Errorf("%s", msg)
 	}
-	return data, nil
+	return data, meta, nil
+}
+
+func (c *Client) doHTTP(ctx context.Context, endpoint, method string, header http.Header, body []byte) ([]byte, error) {
+	data, _, err := c.doHTTPDetailed(ctx, endpoint, method, header, body)
+	return data, err
 }
 
 func (c *Client) selfUUID() *protos.UUID {

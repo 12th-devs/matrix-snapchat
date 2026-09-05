@@ -2704,6 +2704,18 @@ const debugTools = createDebugTools({ withLock, ensureSession });
 export const getBrowserStorageSummary = debugTools.getBrowserStorageSummary;
 export const searchBrowserBundle = debugTools.searchBrowserBundle;
 export const getBrowserBundleModule = debugTools.getBrowserBundleModule;
+// debugMediaResolve injects the connector's current captured auth state (the
+// exact Bearer token observed on live browser traffic plus the exact
+// x-snap-client-user-agent the app sent) into the browser differential probe.
+// Token values are only passed into the page; never returned or logged.
+export async function debugMediaResolve(payload) {
+  const base = typeof payload === "string" ? { descriptorHex: payload } : (payload || {});
+  return debugTools.debugMediaResolve({
+    ...base,
+    token: capturedSSOToken,
+    snapClientUserAgent: lastSnapAPIRequestHeaders?.snapClientUserAgent || "",
+  });
+}
 export const getBrowserConversationMessages = debugTools.getBrowserConversationMessages;
 export const getBrowserE2EESummary = debugTools.getBrowserE2EESummary;
 export const deriveBrowserE2EESharedSecret = debugTools.deriveBrowserE2EESharedSecret;

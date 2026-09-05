@@ -28,3 +28,17 @@ Read `CURRENT_BRIDGE_STATE.md` first.
 ## Paused Feature Work
 
 Do not continue Snapchat delete/unsend reverse engineering, reply capability, message editing, disappearing-message metadata, usernames/chat secondary text, or snap/media decryption until the runtime is stable and documented.
+
+CONTEXT BUDGET RULES
+
+- Minimize token usage aggressively.
+- Do not recursively explore the repository.
+- Prefer grep/glob before reading files.
+- Read only the smallest relevant portions of files.
+- Do not reread files already inspected unless necessary.
+- Do not dump large logs or entire files into context.
+- Limit initial investigation to 5-8 files.
+- If the task expands substantially, stop and summarize instead.
+- Avoid repeated retries when the provider returns rate-limit errors.
+- Keep tool outputs concise.
+- After making a change, run only targeted tests/checks.

@@ -83,6 +83,10 @@ export function createApp({
     res.json(await bridge.getBrowserBundleModule(String(req.params.moduleID || "")));
   }));
 
+  app.post("/debug/media-resolve", asyncRoute(async (req, res) => {
+    res.json(await bridge.debugMediaResolve(String((req.body || {}).descriptorHex || "")));
+  }));
+
   app.get("/debug/conversation-messages", asyncRoute(async (req, res) => {
     res.json(await bridge.getBrowserConversationMessages(
       String(req.query.chatId || ""),

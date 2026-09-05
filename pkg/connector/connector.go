@@ -164,6 +164,7 @@ func (sc *SnapchatConnector) GetConfig() (example string, data any, upgrader con
 
 func (sc *SnapchatConnector) GetDBMetaTypes() database.MetaTypes {
 	return database.MetaTypes{
+		Message: func() any { return &MediaDeliveryMetadata{} },
 		UserLogin: func() any {
 			return &UserLoginMetadata{}
 		},

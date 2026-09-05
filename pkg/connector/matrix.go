@@ -317,7 +317,7 @@ func (sa *SnapchatAPI) hydrateSnapMediaFromReadReceipt(ctx context.Context, chat
 		message.ID = mediaMessageID(targetID, media)
 		sa.queueRemoteMessage(chat, message)
 	}
-	sa.markStoredMessageHydrated(chat.ID, targetID, apiMessage, message)
+	// Hydration is committed by the event completion hook after Matrix delivery.
 }
 
 func readReceiptRemoteID(receipt *bridgev2.MatrixReadReceipt) (string, bool) {

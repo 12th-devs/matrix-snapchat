@@ -2,6 +2,7 @@ package connector
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"strings"
 	"time"
@@ -121,15 +122,60 @@ func (sa *SnapchatAPI) syncChatMessagesAPI(ctx context.Context, chat sidecar.Cha
 			log.Printf("bridgev2 sync: suppressing passive API message chat_id=%s message_id=%s content_type=%s", chat.ID, baseRemoteID, apiMessage.ContentType)
 			continue
 		}
+		existing := sa.lookupStoredMessage(chat.ID, baseRemoteID)
 		if includeMedia && sa.snapMediaEnabled() && len(apiMessage.Media) > 0 {
-			log.Printf("bridgev2 media: rendering API media chat_id=%s message_id=%s content_type=%s is_snap=%t attachment_count=%d", chat.ID, apiMessage.ID, apiMessage.ContentType, apiMessage.IsSnap, len(apiMessage.Media))
-			message.Media = sa.downloadAPIMessageMedia(ctx, client, apiMessage)
-			if len(message.Media) > 0 {
-				message.ID = mediaMessageID(message.ID, message.Media)
+			if existing != nil && existing.HydratedAt != nil {
+				zerolog.Ctx(ctx).Debug().
+					Str("diag", "snapchat_media").
+					Str("chat_id", chat.ID).
+					Str("message_id", apiMessage.ID).
+					Str("content_type", apiMessage.ContentType).
+					Bool("is_snap", apiMessage.IsSnap).
+					Msg("media: skipping already hydrated attachment")
+			} else if isSnapRow(apiMessage) {
+				// View-once snaps are never fetched or rendered from passive
+				// polling: the inline payload is a placeholder thumbnail and the
+				// real media requires an open/read action we must not trigger.
+				logMediaEvidence(ctx, "media: snap placeholder retained (view-once not auto-opened)", chat.ID, apiMessage)
+			} else {
+				zerolog.Ctx(ctx).Info().
+					Str("diag", "snapchat_media").
+					Str("chat_id", chat.ID).
+					Str("message_id", apiMessage.ID).
+					Str("content_type", apiMessage.ContentType).
+					Bool("is_snap", apiMessage.IsSnap).
+					Int("attachment_count", len(apiMessage.Media)).
+					Msg("media: rendering API media")
+				message.Media = sa.downloadAPIMessageMedia(ctx, client, apiMessage)
+				if len(message.Media) > 0 {
+					message.ID = mediaMessageID(message.ID, message.Media)
+					if sa.reconcileMediaDelivery(ctx, chat.ID, message.ID, baseRemoteID, len(message.Media)) || sa.reconcileMediaDelivery(ctx, chat.ID, baseRemoteID, baseRemoteID, len(message.Media)) {
+						continue
+					}
+					// The state row may precede a failed first Matrix send. An edit
+					// needs an actual placeholder mapping, not just that state row.
+					if existing != nil && sa.UserLogin.Bridge.DB != nil {
+						parts, lookupErr := sa.UserLogin.Bridge.DB.Message.GetAllPartsByID(ctx, sa.UserLogin.ID, makeMessageID(scopedSnapchatMessageID(chat.ID, baseRemoteID)))
+						if lookupErr == nil && len(parts) == 0 {
+							existing = nil
+						}
+					}
+				}
 			}
+		} else if len(apiMessage.Media) > 0 {
+			zerolog.Ctx(ctx).Info().
+				Str("diag", "snapchat_media").
+				Str("chat_id", chat.ID).
+				Str("message_id", apiMessage.ID).
+				Str("content_type", apiMessage.ContentType).
+				Bool("is_snap", apiMessage.IsSnap).
+				Bool("include_media", includeMedia).
+				Bool("snap_media_enabled", sa.snapMediaEnabled()).
+				Bool("snap_media_on_read", sa.snapMediaOnReadEnabled()).
+				Int("attachment_count", len(apiMessage.Media)).
+				Msg("media: API media metadata present but render disabled")
 		}
 		sa.rememberAPIMessage(chat.ID, apiMessage)
-		existing := sa.lookupStoredMessage(chat.ID, baseRemoteID)
 		if apiMessage.Tombstone {
 			// Erased/unsent on Snapchat: remove the bridged message instead of
 			// displaying it. A tombstone for an unknown message is skipped.
@@ -155,6 +201,13 @@ func (sa *SnapchatAPI) syncChatMessagesAPI(ctx context.Context, chat sidecar.Cha
 			log.Printf("bridgev2 event_class: kind=%s source=api chat_id=%s message_id=%s api_kind=%s old_len=%d new_len=%d", action, chat.ID, baseRemoteID, messageKindFromAPI(apiMessage), len(existing.Text), len(message.Text))
 			sa.queueRemoteMessageEdit(chat, baseRemoteID, message)
 		case messageSyncNew:
+			if len(message.Media) > 0 && sa.UserLogin.Bridge.DB != nil {
+				parts, lookupErr := sa.UserLogin.Bridge.DB.Message.GetAllPartsByID(ctx, sa.UserLogin.ID, makeMessageID(scopedSnapchatMessageID(chat.ID, message.ID)))
+				if lookupErr == nil && len(parts) > 0 {
+					sa.queueRemoteMessageEdit(chat, message.ID, message)
+					break
+				}
+			}
 			log.Printf("bridgev2 event_class: kind=%s source=api chat_id=%s message_id=%s api_kind=%s sender_id=%s outgoing=%t", action, chat.ID, baseRemoteID, messageKindFromAPI(apiMessage), message.AuthorID, message.Outgoing)
 			sa.queueRemoteMessage(chat, message)
 		case messageSyncUnchanged:
@@ -176,6 +229,38 @@ func (sa *SnapchatAPI) syncChatMessagesAPI(ctx context.Context, chat sidecar.Cha
 		_ = sa.Connector.store.UpsertMessages(states)
 	}
 	return nil
+}
+
+func isSnapRow(message snapapi.Message) bool {
+	if message.IsSnap {
+		return true
+	}
+	switch strings.ToUpper(strings.TrimSpace(message.ContentType)) {
+	case "SNAP", "SNAP_NOT_VIEWABLE":
+		return true
+	}
+	return false
+}
+
+func logMediaEvidence(ctx context.Context, decision, chatID string, apiMessage snapapi.Message) {
+	var media snapapi.MediaAttachment
+	if len(apiMessage.Media) > 0 {
+		media = apiMessage.Media[0]
+	}
+	zerolog.Ctx(ctx).Info().
+		Str("diag", "snapchat_media").
+		Str("chat_id", chatID).
+		Str("message_id", apiMessage.ID).
+		Str("content_type", apiMessage.ContentType).
+		Bool("is_snap", apiMessage.IsSnap).
+		Str("kind", string(media.Kind)).
+		Bool("url_present", media.URL != "").
+		Int("inline_bytes", len(media.Data)).
+		Int("key_bytes", len(media.Key)).
+		Int("iv_bytes", len(media.IV)).
+		Str("mime_hint", media.MimeType).
+		Int("attachment_count", len(apiMessage.Media)).
+		Msg(decision)
 }
 
 func shouldSuppressAPIMessage(apiMessage snapapi.Message, message sidecar.Message) bool {
@@ -232,6 +317,9 @@ func shouldQueueMessageEdit(existing *store.MessageState, message sidecar.Messag
 	if existing == nil {
 		return false
 	}
+	if (existing.HasMedia || existing.Kind == "media" || existing.Kind == "snap") && len(message.Media) > 0 {
+		return existing.HydratedAt == nil
+	}
 	oldText := strings.TrimSpace(existing.Text)
 	newText := strings.TrimSpace(message.Text)
 	if oldText == "" || newText == "" || oldText == newText {
@@ -266,11 +354,13 @@ func (sa *SnapchatAPI) queueRemoteMessage(chat sidecar.Chat, message sidecar.Mes
 		log.Printf("bridgev2 echo: suppressed outgoing API echo chat_id=%s message_id=%s content_type=%s disappear_after=%d", chat.ID, message.ID, message.ContentType, message.DisappearAfterSeconds)
 		return
 	}
-	if sa.isSeen(chat.ID, message.ID) {
+	if len(message.Media) == 0 && sa.isSeen(chat.ID, message.ID) {
 		log.Printf("bridgev2 dedupe: already saw message chat_id=%s message_id=%s", chat.ID, message.ID)
 		return
 	}
-	sa.markSeen(chat.ID, message.ID)
+	if len(message.Media) == 0 {
+		sa.markSeen(chat.ID, message.ID)
+	}
 	copyMsg := message
 	sa.rememberChatDetails(chat)
 	if !message.Outgoing {
@@ -311,10 +401,11 @@ func (sa *SnapchatAPI) queueRemoteMessage(chat sidecar.Chat, message sidecar.Mes
 			LogContext: func(c zerolog.Context) zerolog.Context {
 				return c.Str("chat", chat.Name).Str("chat_id", chat.ID).Str("message_id", message.ID).Str("event_id", eventID)
 			},
-			PortalKey:    portalKey,
-			CreatePortal: true,
-			Sender:       sender,
-			Timestamp:    parseMessageTimestamp(message.Timestamp),
+			PortalKey:      portalKey,
+			CreatePortal:   true,
+			Sender:         sender,
+			Timestamp:      parseMessageTimestamp(message.Timestamp),
+			PostHandleFunc: sa.mediaDeliveryPostHandle(chat, message.ID, message),
 		},
 		ID:                 makeMessageID(eventID),
 		Data:               copyMsg,
@@ -394,10 +485,11 @@ func (sa *SnapchatAPI) queueRemoteMessageEdit(chat sidecar.Chat, targetMessageID
 			LogContext: func(c zerolog.Context) zerolog.Context {
 				return c.Str("chat", chat.Name).Str("chat_id", chat.ID).Str("message_id", message.ID).Str("target_message_id", targetMessageID).Str("target_event_id", targetEventID)
 			},
-			PortalKey:    portalKey,
-			CreatePortal: true,
-			Sender:       sender,
-			Timestamp:    parseMessageTimestamp(message.Timestamp),
+			PortalKey:      portalKey,
+			CreatePortal:   true,
+			Sender:         sender,
+			Timestamp:      parseMessageTimestamp(message.Timestamp),
+			PostHandleFunc: sa.mediaDeliveryPostHandle(chat, targetMessageID, message),
 		},
 		ID:                 makeMessageID(editID),
 		TargetMessage:      makeMessageID(targetEventID),
@@ -417,10 +509,24 @@ func (sa *SnapchatAPI) convertMessage(ctx context.Context, portal *bridgev2.Port
 		portalID = string(portal.ID)
 	}
 	if len(message.Media) > 0 && portal != nil {
+		if state := sa.lookupStoredMessage(portalID, baseSnapchatMessageID(message.ID)); state != nil && state.HydratedAt != nil {
+			return nil, bridgev2.ErrIgnoringRemoteEvent
+		}
 		parts := make([]*bridgev2.ConvertedMessagePart, 0, len(message.Media))
 		uploadIntent := mediaUploadIntent(portal, intent)
 		for _, media := range message.Media {
 			if len(media.Data) == 0 {
+				continue
+			}
+			if err := snapapi.ValidateRenderableMediaPayload(media.Data, media.MimeType, snapapi.MediaKindFile); err != nil {
+				zerolog.Ctx(ctx).Warn().
+					Err(err).
+					Str("diag", "snapchat_media").
+					Str("message_id", message.ID).
+					Str("media_id", media.ID).
+					Int("size", len(media.Data)).
+					Str("mime", media.MimeType).
+					Msg("media: rejected unsafe Snapchat media before Matrix upload")
 				continue
 			}
 			mimeType := normalizeMediaMIME(media.Data, media.MimeType)
@@ -428,10 +534,22 @@ func (sa *SnapchatAPI) convertMessage(ctx context.Context, portal *bridgev2.Port
 			fileName := mediaFileNameForMIME(media.FileName, msgType, mimeType)
 			mxc, file, err := uploadIntent.UploadMedia(ctx, portal.MXID, media.Data, fileName, mimeType)
 			if err != nil {
-				log.Printf("bridgev2 sync: failed to upload Snapchat media message_id=%s media_id=%s: %v", message.ID, media.ID, err)
-				continue
+				zerolog.Ctx(ctx).Warn().
+					Err(err).
+					Str("diag", "snapchat_media").
+					Str("message_id", message.ID).
+					Str("media_id", media.ID).
+					Msg("media: failed to upload Snapchat media")
+				return nil, fmt.Errorf("upload Snapchat attachment %s: %w", media.ID, err)
 			}
-			log.Printf("bridgev2 sync: uploaded Snapchat media message_id=%s media_id=%s msgtype=%s mime=%s size=%d", message.ID, media.ID, msgType, mimeType, len(media.Data))
+			zerolog.Ctx(ctx).Info().
+				Str("diag", "snapchat_media").
+				Str("message_id", message.ID).
+				Str("media_id", media.ID).
+				Str("matrix_msgtype", string(msgType)).
+				Str("mime", mimeType).
+				Int("size", len(media.Data)).
+				Msg("media: uploaded Snapchat media")
 			partBody := body
 			if partBody == "" || isGeneratedSnapchatNotice(partBody) {
 				// Some Matrix clients use body as the displayed/downloaded filename
@@ -439,7 +557,9 @@ func (sa *SnapchatAPI) convertMessage(ctx context.Context, portal *bridgev2.Port
 				partBody = fileName
 			}
 			parts = append(parts, &bridgev2.ConvertedMessagePart{
-				Type: event.EventMessage,
+				ID:         mediaPartID(len(parts)),
+				DBMetadata: &MediaDeliveryMetadata{MediaDelivered: true, AttachmentCount: len(message.Media)},
+				Type:       event.EventMessage,
 				Content: &event.MessageEventContent{
 					MsgType:  msgType,
 					Body:     partBody,
@@ -454,6 +574,9 @@ func (sa *SnapchatAPI) convertMessage(ctx context.Context, portal *bridgev2.Port
 			})
 		}
 		if len(parts) > 0 {
+			if len(parts) != len(message.Media) {
+				return nil, fmt.Errorf("incomplete Snapchat media conversion: %d/%d attachments", len(parts), len(message.Media))
+			}
 			return &bridgev2.ConvertedMessage{
 				ReplyTo:   sa.resolveReplyTarget(portalID, message.QuotedMessageID),
 				Parts:     parts,
@@ -505,8 +628,22 @@ func (sa *SnapchatAPI) convertMessageEdit(ctx context.Context, portal *bridgev2.
 	edit := &bridgev2.ConvertedEdit{}
 	var added []*bridgev2.ConvertedMessagePart
 	for idx, part := range converted.Parts {
-		if idx < len(existing) {
-			edit.ModifiedParts = append(edit.ModifiedParts, part.ToEditPart(existing[idx]))
+		var target *database.Message
+		if len(message.Media) > 0 {
+			for _, candidate := range existing {
+				if candidate.PartID == part.ID {
+					target = candidate
+					break
+				}
+			}
+		} else if idx < len(existing) {
+			target = existing[idx]
+		}
+		if target != nil {
+			if meta, ok := target.Metadata.(*MediaDeliveryMetadata); len(message.Media) > 0 && ok && meta.MediaDelivered && meta.AttachmentCount == len(message.Media) && target.MXID != "" && !target.HasFakeMXID() {
+				continue
+			}
+			edit.ModifiedParts = append(edit.ModifiedParts, part.ToEditPart(target))
 		} else {
 			added = append(added, part)
 		}
@@ -517,23 +654,68 @@ func (sa *SnapchatAPI) convertMessageEdit(ctx context.Context, portal *bridgev2.
 	return edit, nil
 }
 
+func truncateDescriptorID(id string) string {
+	if len(id) > 16 {
+		return id[:16] + "..."
+	}
+	return id
+}
+
 func (sa *SnapchatAPI) downloadAPIMessageMedia(ctx context.Context, client *snapapi.Client, message snapapi.Message) []sidecar.MediaAttachment {
 	attachments := make([]sidecar.MediaAttachment, 0, len(message.Media))
 	for _, media := range message.Media {
-		data, mimeType, err := client.DownloadMedia(ctx, media)
+		zerolog.Ctx(ctx).Info().
+			Str("diag", "snapchat_media").
+			Str("message_id", message.ID).
+			Str("media_id", media.ID).
+			Str("content_type", message.ContentType).
+			Bool("is_snap", message.IsSnap).
+			Str("kind", string(media.Kind)).
+			Bool("url_present", media.URL != "").
+			Int("inline_bytes", len(media.Data)).
+			Int("key_bytes", len(media.Key)).
+			Int("iv_bytes", len(media.IV)).
+			Str("mime_hint", media.MimeType).
+			Msg("media: classify incoming attachment")
+		data, mimeType, info, err := client.DownloadMediaWithInfo(ctx, media)
 		if err != nil {
-			log.Printf("bridgev2 sync: Snapchat media unavailable message_id=%s media_id=%s url=%t data=%d: %v", message.ID, media.ID, media.URL != "", len(media.Data), err)
+			zerolog.Ctx(ctx).Warn().
+				Err(err).
+				Str("diag", "snapchat_media").
+				Str("message_id", message.ID).
+				Str("media_id", media.ID).
+				Str("content_type", message.ContentType).
+				Bool("is_snap", message.IsSnap).
+				Str("source", info.Source).
+				Bool("url_present", media.URL != "").
+				Int("inline_bytes", len(media.Data)).
+				Int("key_bytes", len(media.Key)).
+				Int("iv_bytes", len(media.IV)).
+				Msg("media: incoming attachment unavailable")
 			continue
 		}
 		fileName := strings.TrimSpace(media.FileName)
 		mimeType = normalizeMediaMIME(data, mimeType)
 		fileName = mediaFileNameForMIME(fileName, matrixMsgTypeForMedia(mimeType), mimeType)
+		zerolog.Ctx(ctx).Info().
+			Str("diag", "snapchat_media").
+			Str("message_id", message.ID).
+			Str("media_id", media.ID).
+			Str("source", info.Source).
+			Str("decrypt_path", info.DecryptPath).
+			Str("mime", mimeType).
+			Int("size", len(data)).
+			Str("matrix_msgtype", string(matrixMsgTypeForMedia(mimeType))).
+			Msg("media: downloaded incoming attachment")
 		attachments = append(attachments, sidecar.MediaAttachment{
 			ID:       media.ID,
 			FileName: fileName,
 			MimeType: mimeType,
 			Data:     data,
 		})
+	}
+	if len(attachments) != len(message.Media) {
+		return nil
 	}
 	return attachments
 }

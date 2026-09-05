@@ -1124,6 +1124,274 @@ async function deriveBrowserE2EESharedSecret(senderPublicKeyBase64, senderVersio
 }
 
 
+// debugMediaResolve replays a resolveContentObjects request from inside the
+// authenticated Snapchat Web page so the browser's own cookies, headers, and
+// transport are used. Responses are summarized structurally only: field
+// numbers, wire types, lengths, and HTTPS hostnames. No URL, token, or cookie
+// values are returned.
+async function debugMediaResolve(payload) {
+  const descriptorHex = String(payload?.descriptorHex || "").replace(/[^0-9a-fA-F]/g, "");
+  const token = String(payload?.token || "");
+  const snapClientUserAgent = String(payload?.snapClientUserAgent || "");
+  if (!descriptorHex || descriptorHex.length < 8 || descriptorHex.length % 2 !== 0) {
+    return { ok: false, error: "descriptor hex required" };
+  }
+  return withLock(async () => {
+    const { page: currentPage } = await ensureSession();
+    if (!currentPage || currentPage.isClosed()) {
+      return { ok: false, error: "no active page" };
+    }
+    return await currentPage.evaluate(async (probe) => {
+      const endpoint = "https://web.snapchat.com/snapchat.content.v2.MediaDeliveryService/resolveContentObjects";
+      const descriptor = new Uint8Array(probe.descriptorHex.match(/.{2}/g).map((h) => parseInt(h, 16)));
+
+      function varint(value) {
+        const out = [];
+        let n = value;
+        do {
+          let byte = n & 127;
+          n >>>= 7;
+          if (n) byte |= 128;
+          out.push(byte);
+        } while (n);
+        return out;
+      }
+      function bytesField(fieldNumber, payload) {
+        const head = varint((fieldNumber << 3) | 2);
+        return new Uint8Array([...head, ...varint(payload.length), ...payload]);
+      }
+      function grpcFrame(message) {
+        const out = new Uint8Array(5 + message.length);
+        new DataView(out.buffer).setUint32(1, message.length);
+        out.set(message, 5);
+        return out;
+      }
+      function parseFrames(buffer) {
+        const view = new Uint8Array(buffer);
+        const frames = [];
+        let offset = 0;
+        while (offset < view.length) {
+          if (view.length - offset < 5) {
+            frames.push({ truncated: true, remaining: view.length - offset });
+            break;
+          }
+          const flags = view[offset];
+          const size = new DataView(buffer, offset, 5).getUint32(1);
+          if (size > view.length - offset - 5) {
+            frames.push({ flags, size, truncated: true });
+            break;
+          }
+          frames.push({ flags, size });
+          offset += 5 + size;
+        }
+        return frames;
+      }
+      function safeWalk(bytes, depth) {
+        // Shallow protobuf walk: field numbers, wire types, lengths, and
+        // HTTPS URL hostnames only.
+        const out = [];
+        let offset = 0;
+        while (offset < bytes.length && out.length < 24) {
+          let tag = 0;
+          let shift = 0;
+          for (;;) {
+            if (offset >= bytes.length) return out;
+            const b = bytes[offset++];
+            tag |= (b & 127) << shift;
+            shift += 7;
+            if (b < 128) break;
+          }
+          const fieldNumber = tag >>> 3;
+          const wireType = tag & 7;
+          if (fieldNumber === 0 || fieldNumber > 100) return out;
+          if (wireType === 0) {
+            let value = 0;
+            shift = 0;
+            for (;;) {
+              if (offset >= bytes.length) return out;
+              const b = bytes[offset++];
+              value |= (b & 127) << shift;
+              shift += 7;
+              if (b < 128) break;
+            }
+            out.push(`f${fieldNumber}:varint=${value}`);
+          } else if (wireType === 2) {
+            let length = 0;
+            shift = 0;
+            for (;;) {
+              if (offset >= bytes.length) return out;
+              const b = bytes[offset++];
+              length |= (b & 127) << shift;
+              shift += 7;
+              if (b < 128) break;
+            }
+            if (offset + length > bytes.length) {
+              out.push(`f${fieldNumber}:bytes_len=${length}:truncated`);
+              return out;
+            }
+            const value = bytes.subarray(offset, offset + length);
+            offset += length;
+            let entry = `f${fieldNumber}:bytes_len=${length}`;
+            const text = new TextDecoder("utf-8", { fatal: false }).decode(value);
+            if (/^https:\/\//.test(text)) {
+              try {
+                entry += ` https_url_host=${new URL(text).hostname}`;
+              } catch {}
+            } else if (depth < 4 && value.length > 1) {
+              const nested = safeWalk(value, depth + 1);
+              if (nested.length) {
+                out.push(entry);
+                out.push(...nested.map((line) => ` f${fieldNumber}.${line}`));
+                continue;
+              }
+            }
+            out.push(entry);
+          } else {
+            out.push(`f${fieldNumber}:wire=${wireType}`);
+            return out;
+          }
+        }
+        return out;
+      }
+
+      async function probeVariant(name, requestBytes, extraHeaders) {
+        try {
+          const response = await fetch(endpoint, {
+            method: "POST",
+            credentials: "include",
+            headers: {
+              "accept": "*/*",
+              "content-type": "application/grpc-web+proto",
+              "x-grpc-web": "1",
+              "x-user-agent": "grpc-web-javascript/0.1",
+              ...Object.fromEntries(Object.entries(extraHeaders || {}).filter(([, v]) => v)),
+            },
+            body: requestBytes,
+          });
+          const buffer = await response.arrayBuffer();
+          const frames = parseFrames(buffer);
+          const view = new Uint8Array(buffer);
+          let payloadWalk = [];
+          if (frames.length && frames[0].flags === 0 && !frames[0].truncated) {
+            const payload = view.subarray(5, 5 + frames[0].size);
+            payloadWalk = safeWalk(payload, 0);
+          }
+          return {
+            name,
+            status: response.status,
+            contentType: response.headers.get("content-type") || "",
+            contentLength: response.headers.get("content-length"),
+            grpcStatus: response.headers.get("grpc-status") || "",
+            grpcMessage: response.headers.get("grpc-message") || "",
+            respBytes: buffer.byteLength,
+            frames,
+            payloadWalk,
+          };
+        } catch (error) {
+          return { name, error: String(error).slice(0, 200) };
+        }
+      }
+
+      // Confirmed request shape only:
+      // requests[0].reference.v2ContentObject = raw descriptor bytes
+      // (ResolveContentObjectsRequest field 1 -> request item field 3).
+      const requestBytes = grpcFrame(bytesField(1, bytesField(3, descriptor)));
+
+      // Resolve the exact auth pair the app's own MediaDeliveryService fetch
+      // path uses: 96789 wires 37308.W(34010.s); 34010.s is default-authed-fetch
+      // whose request interceptor Tl(85997.c) sets authorization from the app
+      // auth state and setSnapchatWebUserAgent uses 6755.Ay(). Only
+      // lengths/fingerprints/equality are reported, never token values.
+      function findWebpackRequire() {
+        for (const key of Object.keys(globalThis)) {
+          if (!/^webpackChunk/.test(key)) {
+            continue;
+          }
+          const chunk = globalThis[key];
+          if (!Array.isArray(chunk) || typeof chunk.push !== "function") {
+            continue;
+          }
+          let req;
+          try {
+            chunk.push([[`codex-media-resolve-${Date.now()}`], {}, (r) => {
+              req = r;
+            }]);
+          } catch {
+            continue;
+          }
+          if (req?.m) {
+            return req;
+          }
+        }
+        return undefined;
+      }
+
+      async function fingerprint(value) {
+        if (!value) return "";
+        const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+        return Array.from(new Uint8Array(digest)).slice(0, 6).map((b) => b.toString(16).padStart(2, "0")).join("");
+      }
+
+      const req = findWebpackRequire();
+      let tokenB = "";
+      let tokenBError = "";
+      let uaB = "";
+      let uaBError = "";
+      if (req) {
+        try {
+          tokenB = (await req(85997).c()) || "";
+        } catch (error) {
+          tokenBError = String(error).slice(0, 140);
+        }
+        try {
+          uaB = req(6755).Ay() || "";
+        } catch (error) {
+          uaBError = String(error).slice(0, 140);
+        }
+      } else {
+        tokenBError = "webpack modules not found";
+      }
+
+      const variants = [];
+      if (probe.token) {
+        variants.push(await probeVariant("authA-captured", requestBytes, {
+          authorization: `Bearer ${probe.token}`,
+          ...(probe.snapClientUserAgent ? { "x-snap-client-user-agent": probe.snapClientUserAgent } : {}),
+        }));
+      }
+      if (tokenB && tokenB !== probe.token) {
+        variants.push(await probeVariant("authB-appstate", requestBytes, {
+          authorization: `Bearer ${tokenB}`,
+          ...(uaB ? { "x-snap-client-user-agent": uaB } : {}),
+        }));
+      }
+
+      return {
+        ok: true,
+        pageOrigin: location.origin,
+        pagePath: location.pathname,
+        auth: {
+          capturedPresent: Boolean(probe.token),
+          capturedLength: probe.token ? probe.token.length : 0,
+          capturedFingerprint: await fingerprint(probe.token),
+          appStatePresent: Boolean(tokenB),
+          appStateLength: tokenB ? tokenB.length : 0,
+          appStateFingerprint: await fingerprint(tokenB),
+          tokensEqual: Boolean(probe.token) && Boolean(tokenB) && probe.token === tokenB,
+          appStateError: tokenBError,
+          uaCapturedLength: probe.snapClientUserAgent ? probe.snapClientUserAgent.length : 0,
+          uaCapturedFingerprint: await fingerprint(probe.snapClientUserAgent),
+          uaAppStateLength: uaB ? uaB.length : 0,
+          uaAppStateFingerprint: await fingerprint(uaB),
+          uaEqual: Boolean(probe.snapClientUserAgent) && Boolean(uaB) && probe.snapClientUserAgent === uaB,
+          uaAppStateError: uaBError,
+        },
+        variants,
+      };
+    }, { descriptorHex, token, snapClientUserAgent });
+  }, { priority: 0 });
+}
+
   return {
     getBrowserStorageSummary,
     searchBrowserBundle,
@@ -1131,5 +1399,6 @@ async function deriveBrowserE2EESharedSecret(senderPublicKeyBase64, senderVersio
     getBrowserConversationMessages,
     getBrowserE2EESummary,
     deriveBrowserE2EESharedSecret,
+    debugMediaResolve,
   };
 }

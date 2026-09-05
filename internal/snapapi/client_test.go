@@ -417,22 +417,22 @@ func TestDetectMediaMimeUsesSnapchatMagicBytes(t *testing.T) {
 		},
 		{
 			name: "png",
-			data: []byte{0x89, 0x50, 0x4e, 0x47},
+			data: []byte("\x89PNG\r\n\x1a\n"),
 			want: "image/png",
 		},
 		{
 			name: "mp4-ftyp",
-			data: []byte{0x00, 0x00, 0x00, 0x18, 'f', 't', 'y', 'p'},
+			data: []byte("\x00\x00\x00\x18ftypisom\x00\x00\x00\x00"),
 			want: "video/mp4",
 		},
 		{
 			name: "snap-video-header",
 			data: []byte{0x00, 0x00, 0x00, 0x1c, 0x12, 0x34},
-			want: "video/mp4",
+			want: "application/octet-stream",
 		},
 		{
 			name: "wav",
-			data: []byte{'R', 'I', 'F', 'F', 0x24, 0x00},
+			data: []byte("RIFF\x24\x00\x00\x00WAVE"),
 			want: "audio/wav",
 		},
 		{
