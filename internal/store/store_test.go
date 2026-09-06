@@ -89,6 +89,81 @@ func TestMessageHydratedAtSurvivesNilUpsert(t *testing.T) {
 	}
 }
 
+func TestBeginMessageRehydrationDemotesStaleHydrationOnce(t *testing.T) {
+	db, err := New(filepath.Join(t.TempDir(), "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	hydratedAt := time.Date(2026, 9, 4, 15, 0, 0, 0, time.UTC)
+	if err = db.UpsertMessages([]MessageState{{
+		PortalKey:  "chat-1",
+		RemoteID:   "123",
+		Text:       "Media",
+		Kind:       "media",
+		HasMedia:   true,
+		HydratedAt: &hydratedAt,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Stale hydrated state: exactly one transition to the retryable state.
+	started, err := db.BeginMessageRehydration("chat-1", "123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !started {
+		t.Fatal("rehydration transition should have run")
+	}
+	state, err := db.GetMessage("chat-1", "123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state == nil || state.HydratedAt != nil {
+		t.Fatalf("hydrated_at was not cleared: %#v", state)
+	}
+
+	// A second transition must not report progress.
+	started, err = db.BeginMessageRehydration("chat-1", "123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if started {
+		t.Fatal("second rehydration transition should not run")
+	}
+
+	// Nil upserts keep the demoted state.
+	if err = db.UpsertMessages([]MessageState{{
+		PortalKey: "chat-1",
+		RemoteID:  "123",
+		Text:      "Media",
+		Kind:      "media",
+		HasMedia:  true,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	state, err = db.GetMessage("chat-1", "123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state == nil || state.HydratedAt != nil {
+		t.Fatalf("hydrated_at must stay cleared after nil upsert: %#v", state)
+	}
+
+	// Successful delivery marks hydration again; recovery is complete.
+	if err = db.MarkMessageHydrated("chat-1", "123"); err != nil {
+		t.Fatal(err)
+	}
+	state, err = db.GetMessage("chat-1", "123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state == nil || state.HydratedAt == nil {
+		t.Fatalf("hydrated_at was not restored after delivery: %#v", state)
+	}
+}
+
 func TestPortalOtherUserIDPersists(t *testing.T) {
 	db, err := New(filepath.Join(t.TempDir(), "state.sqlite"))
 	if err != nil {

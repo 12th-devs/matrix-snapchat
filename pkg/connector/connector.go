@@ -10,8 +10,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rs/zerolog"
 	"go.mau.fi/util/configupgrade"
 	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/bridgev2/commands"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
@@ -43,6 +45,33 @@ func NewConnector() *SnapchatConnector {
 
 func (sc *SnapchatConnector) Init(bridge *bridgev2.Bridge) {
 	sc.br = bridge
+	if proc, ok := bridge.Commands.(*commands.Processor); ok {
+		proc.AddHandlers(&commands.FullHandler{
+			Name: "resync-all", RequiresLogin: true,
+			Help: commands.HelpMeta{
+				Section: commands.HelpSectionChats, Args: "[chat-id]",
+				Description: "Reconcile rooms and recent messages in your existing Snapchat space. Optionally scope to one chat first.",
+			},
+			Func: func(ce *commands.Event) {
+				if len(ce.Args) > 1 {
+					ce.Reply("Usage: $cmdprefix resync-all [chat-id]")
+					return
+				}
+				ce.Reply("Starting resync. Existing healthy rooms and the personal filtering space will be preserved.")
+				ctx, cancel := context.WithTimeout(ce.Ctx, 30*time.Minute)
+				defer cancel()
+				results, err := sc.ResyncAll(ctx, ce.User, func(line string) { ce.Reply("%s", line) }, strings.Join(ce.Args, ""))
+				if err != nil {
+					ce.Reply("Resync failed: %s", err)
+					return
+				}
+				for _, stats := range results {
+					zerolog.Ctx(ctx).Info().Str("resync_summary", stats.Summary()).Msg("Resync completed")
+					ce.Reply("%s", stats.Summary())
+				}
+			},
+		})
+	}
 }
 
 func (sc *SnapchatConnector) Start(ctx context.Context) error {
@@ -214,6 +243,13 @@ func (sc *SnapchatConnector) CreateLogin(ctx context.Context, user *bridgev2.Use
 
 func (sc *SnapchatConnector) newClient() *sidecar.Client {
 	cfg := sc.Config
+	// Restored logins can be loaded before Start applies runtime overrides.
+	if baseURL := strings.TrimSpace(os.Getenv("SNAPCHAT_CONNECTOR_BASE_URL")); baseURL != "" {
+		cfg.BaseURL = baseURL
+	}
+	if secret := strings.TrimSpace(os.Getenv("SNAPCHAT_CONNECTOR_SHARED_SECRET")); secret != "" {
+		cfg.SharedSecret = secret
+	}
 	if cfg.RequestTimeoutSeconds <= 0 {
 		cfg.RequestTimeoutSeconds = 20
 	}

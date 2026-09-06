@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -117,21 +117,54 @@ func (c *Client) SendText(ctx context.Context, chatID, text string, replyToMessa
 	return fmt.Sprintf("%d", resp.GetClientResolutionId()), nil
 }
 
+// SendMedia sends one ordinary chat image (EXTERNAL_MEDIA), not a snap. It
+// mirrors the proven Snapchat Web upload pipeline: getUploadLocations ->
+// AES-256-CBC encrypt -> PUT ciphertext -> CreateContentMessage with the
+// content object reference and the clear key/IV embedded in the message
+// contents. Only JPEG is supported in this first version.
 func (c *Client) SendMedia(ctx context.Context, chatID string, media MediaAttachment, caption string) (string, error) {
-	if err := c.ensureAuthenticated(ctx); err != nil {
-		return "", err
-	}
 	if len(media.Data) == 0 {
 		return "", fmt.Errorf("missing media data")
 	}
-	if len(media.Data) > 16*1024*1024 {
-		return "", fmt.Errorf("media is too large for safe inline Snapchat API send")
+	if len(media.Data) > maxOutgoingMediaSize {
+		return "", fmt.Errorf("media is too large for Snapchat send (max %d bytes)", maxOutgoingMediaSize)
 	}
-	remoteType, hasAudio, err := outgoingRemoteMediaType(media.MimeType, media.Data)
+	mimeType := strings.ToLower(strings.TrimSpace(strings.Split(media.MimeType, ";")[0]))
+	if !isJPEGData(media.Data) || (mimeType != "" && mimeType != "image/jpeg" && mimeType != "image/jpg") {
+		return "", fmt.Errorf("outbound Snapchat media supports only image/jpeg in this version (got %q)", media.MimeType)
+	}
+	width, height, err := imageDimensions(media.Data)
 	if err != nil {
 		return "", err
 	}
-	conv, err := c.conversationFresh(ctx, chatID)
+	if caption != "" {
+		log.Printf("snapapi send: media caption ignored in outbound image v1 chat_id=%s", chatID)
+	}
+	if err := c.ensureAuthenticated(ctx); err != nil {
+		return "", err
+	}
+	encrypted, err := EncryptOutgoingMedia(media.Data)
+	if err != nil {
+		return "", fmt.Errorf("encrypt outgoing media: %w", err)
+	}
+	location, err := c.GetUploadLocations(ctx)
+	if err != nil {
+		return "", err
+	}
+	zerolog.Ctx(ctx).Info().
+		Str("diag", "outgoing_media").
+		Str("chat_id", chatID).
+		Int("jpeg_bytes", len(media.Data)).
+		Int("cipher_bytes", len(encrypted.Ciphertext)).
+		Int("width", width).
+		Int("height", height).
+		Str("upload_host", uploadHostOf(location.PutURL)).
+		Msg("outgoing-media: encrypted payload ready for PUT")
+	descriptor, err := c.UploadEncryptedMedia(ctx, location, encrypted)
+	if err != nil {
+		return "", err
+	}
+	convID, err := encodeUUIDString(chatID)
 	if err != nil {
 		return "", err
 	}
@@ -139,43 +172,29 @@ func (c *Client) SendMedia(ctx context.Context, chatID string, media MediaAttach
 	req := &protos.CreateContentMessageRequest{
 		SenderId:           c.selfUUID(),
 		ClientResolutionId: randomUint64(),
+		// The proven web capture sends the plain conversation destination
+		// (no destination EncryptionInfo) with the placeholder version 111.
 		Destinations: []*protos.DeliveryDestination{{
-			EncryptionInfo: &protos.EncryptionInfo{
-				Method: &protos.EncryptionInfo_Fidelius{Fidelius: &protos.Empty{}},
-			},
 			Destination: &protos.DeliveryDestination_ConversationDestination{
 				ConversationDestination: &protos.ConversationDestination{
-					ConversationId: conv.GetConversationId(),
-					CurrentVersion: conv.GetVersion(),
+					ConversationId: convID,
+					CurrentVersion: 111,
 				},
 			},
 		}},
 		Content: &protos.ContentEnvelope{
-			ContentType: protos.ContentType_SNAP,
-			RemoteMediaInfos: []*protos.ContentEnvelope_RemoteMediaInfo{{
-				MediaInfo: &protos.ContentEnvelope_RemoteMediaInfo_ContentObject{
-					ContentObject: append([]byte(nil), media.Data...),
-				},
-				MediaType: int32(remoteType),
-				HasAudio:  hasAudio,
+			ContentType: protos.ContentType_EXTERNAL_MEDIA,
+			Contents:    encodeExternalMediaContents(mediaUploadClock(), width, height, encrypted.Key, encrypted.IV),
+			MediaReferenceLists: []*protos.ContentEnvelope_MediaReferenceList{{
+				Reference: []*protos.MediaReference{{
+					ContentObject: descriptor,
+					MediaType:     protos.MediaType_MEDIA_TYPE_IMAGE,
+				}},
 			}},
-			SavePolicy: protos.ContentEnvelope_SavePolicy_PROHIBITED,
-			EnvelopeEncryption: &protos.EnvelopeEncryption{
-				Method: &protos.EnvelopeEncryption_None{None: &protos.Empty{}},
-			},
-			FeedDisplayInfo: &protos.ContentEnvelope_FeedDisplayInfo{
-				FeedDisplayInfo: &protos.ContentEnvelope_FeedDisplayInfo_SnapDisplayInfo{
-					SnapDisplayInfo: &protos.SnapDisplayInfo{HasAudio: hasAudio},
-				},
-			},
+			DisplayInfo: &protos.ContentEnvelope_DisplayInfo{},
+			// Persistent ordinary chat image: the web capture uses LIFETIME.
+			SavePolicy: protos.ContentEnvelope_SavePolicy_LIFETIME,
 		},
-		FeatureAttachment: []*protos.FeatureAttachment{{
-			Attachment: &protos.FeatureAttachment_SnapViewability{
-				SnapViewability: &protos.SnapViewability{
-					SnapPostOpenViewingPolicy: protos.SnapPostOpenViewingPolicy_POLICY_MEDIA,
-				},
-			},
-		}},
 		CreateContentMessageBlizzardData: &protos.CreateContentMessageBlizzardData{
 			SendMessageAttemptId: &protos.UUID{EncodedId: attemptID},
 		},
@@ -189,12 +208,24 @@ func (c *Client) SendMedia(ctx context.Context, chatID string, media MediaAttach
 			return "", fmt.Errorf("snapchat api media send failed: %v", result.GetFailureReason())
 		}
 	}
-	c.forgetConversation(chatID)
 	createdID := createdMessageIDFromResponse(&resp)
 	if createdID != "" {
+		zerolog.Ctx(ctx).Info().
+			Str("diag", "outgoing_media").
+			Str("chat_id", chatID).
+			Str("created_message_id", createdID).
+			Msg("outgoing-media: CreateContentMessage accepted")
 		return createdID, nil
 	}
 	return fmt.Sprintf("%d", resp.GetClientResolutionId()), nil
+}
+
+func uploadHostOf(raw string) string {
+	host := ""
+	if parsed, err := url.Parse(raw); err == nil {
+		host = parsed.Hostname()
+	}
+	return host
 }
 
 func (c *Client) MarkRead(ctx context.Context, chatID string, messageID int64, version int64) error {
@@ -305,21 +336,4 @@ func (c *Client) EraseMessage(ctx context.Context, chatID string, messageID int6
 			resp.GetResult().GetFailureType(), resp.GetResult().GetFailureDescription())
 	}
 	return nil
-}
-
-func outgoingRemoteMediaType(mimeType string, data []byte) (protos.ContentEnvelope_RemoteMediaInfo_MediaType, bool, error) {
-	mimeType = strings.ToLower(strings.TrimSpace(strings.Split(mimeType, ";")[0]))
-	if mimeType == "" || mimeType == "application/octet-stream" {
-		mimeType = strings.ToLower(strings.TrimSpace(strings.Split(http.DetectContentType(data), ";")[0]))
-	}
-	switch {
-	case mimeType == "image/gif":
-		return protos.ContentEnvelope_RemoteMediaInfo_MediaType_GIF, false, nil
-	case strings.HasPrefix(mimeType, "image/"):
-		return protos.ContentEnvelope_RemoteMediaInfo_MediaType_IMAGE, false, nil
-	case strings.HasPrefix(mimeType, "video/"):
-		return protos.ContentEnvelope_RemoteMediaInfo_MediaType_VIDEO, true, nil
-	default:
-		return protos.ContentEnvelope_RemoteMediaInfo_MediaType_MEDIATYPE_UNKNOWN, false, fmt.Errorf("unsupported Snapchat media type %q", mimeType)
-	}
 }

@@ -91,11 +91,23 @@ export function createApp({
     res.json(await bridge.debugMediaSignedDownload(req.body || {}));
   }));
 
+  app.post("/debug/media-decrypt", asyncRoute(async (req, res) => {
+    res.json(await bridge.debugMediaDecrypt(req.body || {}));
+  }));
+
   app.get("/debug/conversation-messages", asyncRoute(async (req, res) => {
     res.json(await bridge.getBrowserConversationMessages(
       String(req.query.chatId || ""),
       Number(req.query.limit || 20),
     ));
+  }));
+
+  app.post("/debug/realtime-probe/start", asyncRoute(async (req, res) => {
+    res.json(await bridge.startRealtimeProbe(req.body || {}));
+  }));
+
+  app.get("/debug/realtime-probe", asyncRoute(async (_req, res) => {
+    res.json(await bridge.getRealtimeProbe());
   }));
 
   app.post("/session/eel-decrypt", asyncRoute(async (req, res) => {

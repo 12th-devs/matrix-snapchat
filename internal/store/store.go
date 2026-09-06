@@ -508,6 +508,27 @@ func (s *Store) MarkMessageHydrated(portalKey, remoteID string) error {
 	return err
 }
 
+// BeginMessageRehydration demotes a stale hydrated media row back to the
+// ordinary unhydrated state so the normal retryable hydration path can run.
+// HydratedAt alone is not authoritative for historical rows: without
+// bridge-side delivery proof, exactly one recovery transition is performed.
+// It reports whether this call performed the transition.
+func (s *Store) BeginMessageRehydration(portalKey, remoteID string) (bool, error) {
+	res, err := s.db.Exec(`
+		UPDATE message_state
+		SET hydrated_at=NULL
+		WHERE portal_key = ? AND remote_id = ? AND hydrated_at IS NOT NULL
+	`, portalKey, remoteID)
+	if err != nil {
+		return false, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected > 0, nil
+}
+
 func (s *Store) ResetSyncState() error {
 	tx, err := s.db.Begin()
 	if err != nil {

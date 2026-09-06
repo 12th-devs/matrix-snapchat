@@ -73,7 +73,7 @@ func (sa *SnapchatAPI) syncChatMessagesDOM(ctx context.Context, chat sidecar.Cha
 	}
 }
 
-func (sa *SnapchatAPI) syncChatMessagesAPI(ctx context.Context, chat sidecar.Chat, version int64, reason string, includeMedia bool, requireAutoFetch bool) error {
+func (sa *SnapchatAPI) syncChatMessagesAPI(ctx context.Context, chat sidecar.Chat, version int64, reason string, includeMedia bool, requireAutoFetch bool, resync ...*ResyncStats) error {
 	if sa.UserLogin == nil || sa.UserLogin.Bridge == nil || chat.ID == "" {
 		return nil
 	}
@@ -103,6 +103,13 @@ func (sa *SnapchatAPI) syncChatMessagesAPI(ctx context.Context, chat sidecar.Cha
 		}
 	}
 	log.Printf("bridgev2 sync: API fetched %d messages for chat=%q id=%s reason=%s", len(messages), chat.Name, chat.ID, reason)
+	var stats *ResyncStats
+	var wait []context.Context
+	if len(resync) > 0 {
+		stats = resync[0]
+		stats.MessagesFetched += len(messages)
+		wait = []context.Context{ctx}
+	}
 	states := make([]store.MessageState, 0, len(messages))
 	for _, apiMessage := range messages {
 		apiMessage = sa.normalizeAPIMessageDirection(chat.ID, apiMessage)
@@ -118,48 +125,114 @@ func (sa *SnapchatAPI) syncChatMessagesAPI(ctx context.Context, chat sidecar.Cha
 		if baseRemoteID == "" {
 			baseRemoteID = message.ID
 		}
+		// Outgoing echoes of media this login just sent are suppressed before
+		// any media descriptor resolution, CDN download, or decryption. The
+		// state row is still recorded so later syncs/restarts stay skipped via
+		// the persisted Matrix delivery proof.
+		if message.Outgoing && sa.hasExactRecentOutgoingRemoteID(chat.ID, baseRemoteID) {
+			sa.markSeen(chat.ID, baseRemoteID)
+			log.Printf("bridgev2 echo: suppressed outgoing API echo before media render chat_id=%s message_id=%s", chat.ID, baseRemoteID)
+			if stats != nil {
+				stats.MessagesAlreadyMapped++
+			}
+			now := time.Now()
+			states = append(states, store.MessageState{
+				PortalKey:  chat.ID,
+				RemoteID:   baseRemoteID,
+				Author:     message.Author,
+				Text:       message.Text,
+				Outgoing:   true,
+				Kind:       messageKindFromAPI(apiMessage),
+				HasMedia:   len(apiMessage.Media) > 0,
+				HydratedAt: &now,
+				LastSeenAt: now,
+			})
+			continue
+		}
 		if shouldSuppressAPIMessage(apiMessage, message) {
 			log.Printf("bridgev2 sync: suppressing passive API message chat_id=%s message_id=%s content_type=%s", chat.ID, baseRemoteID, apiMessage.ContentType)
 			continue
 		}
 		existing := sa.lookupStoredMessage(chat.ID, baseRemoteID)
-		if includeMedia && sa.snapMediaEnabled() && len(apiMessage.Media) > 0 {
-			if existing != nil && existing.HydratedAt != nil {
-				zerolog.Ctx(ctx).Debug().
-					Str("diag", "snapchat_media").
-					Str("chat_id", chat.ID).
-					Str("message_id", apiMessage.ID).
-					Str("content_type", apiMessage.ContentType).
-					Bool("is_snap", apiMessage.IsSnap).
-					Msg("media: skipping already hydrated attachment")
-			} else if isSnapRow(apiMessage) {
-				// View-once snaps are never fetched or rendered from passive
-				// polling: the inline payload is a placeholder thumbnail and the
-				// real media requires an open/read action we must not trigger.
-				logMediaEvidence(ctx, "media: snap placeholder retained (view-once not auto-opened)", chat.ID, apiMessage)
+		if stats != nil {
+			parts, err := sa.currentMessageParts(ctx, chat.ID, baseRemoteID)
+			if err != nil {
+				return err
+			}
+			if len(parts) == 0 {
+				// Keep stored content for decryption fallback, but not as send proof.
+				sa.mu.Lock()
+				delete(sa.seenByChat[chat.ID], message.ID)
+				sa.mu.Unlock()
 			} else {
+				stats.MessagesAlreadyMapped++
+			}
+		}
+		if includeMedia && sa.snapMediaEnabled() && len(apiMessage.Media) > 0 {
+			if stats != nil {
+				stats.MediaCandidates++
+			}
+			// HydratedAt alone does not prove successful media delivery for
+			// historical rows; bridge-side MediaDelivered metadata does. The
+			// pre-download media identities are deterministic and stable, so
+			// the delivered media-scoped mapping can be proven without
+			// downloading anything.
+			proofMessage := message
+			for _, media := range apiMessage.Media {
+				proofMessage.Media = append(proofMessage.Media, sidecar.MediaAttachment{ID: media.ID, MimeType: media.MimeType})
+			}
+			confirmed := sa.mediaDeliveryConfirmed(ctx, chat.ID, baseRemoteID, proofMessage, len(apiMessage.Media))
+			decision := decideMediaHydration(
+				existing,
+				confirmed,
+				isSnapRow(apiMessage),
+			)
+			switch decision {
+			case mediaHydrationSkip:
+				if confirmed {
+					zerolog.Ctx(ctx).Info().Str("chat_id", chat.ID).Str("message_id", baseRemoteID).Msg("media: SKIP current-room-delivery")
+					if stats != nil {
+						if err := sa.repairMediaPresentation(ctx, chat, baseRemoteID, proofMessage); err != nil {
+							return err
+						}
+						stats.MediaSkipped++
+					}
+					continue
+				}
+				if existing != nil && existing.HydratedAt != nil {
+					zerolog.Ctx(ctx).Debug().
+						Str("diag", "snapchat_media").
+						Str("chat_id", chat.ID).
+						Str("message_id", apiMessage.ID).
+						Str("content_type", apiMessage.ContentType).
+						Bool("is_snap", apiMessage.IsSnap).
+						Msg("media: skipping already hydrated attachment")
+				} else {
+					logMediaEvidence(ctx, "media: snap placeholder retained (view-once not auto-opened)", chat.ID, apiMessage)
+				}
+			case mediaHydrationRecover:
+				if !sa.beginMediaRehydration(chat.ID, baseRemoteID) {
+					zerolog.Ctx(ctx).Info().
+						Str("diag", "snapchat_media").
+						Str("chat_id", chat.ID).
+						Str("message_id", apiMessage.ID).
+						Msg("media: rehydration transition lost; leaving unchanged")
+					break
+				}
 				zerolog.Ctx(ctx).Info().
 					Str("diag", "snapchat_media").
 					Str("chat_id", chat.ID).
 					Str("message_id", apiMessage.ID).
 					Str("content_type", apiMessage.ContentType).
 					Bool("is_snap", apiMessage.IsSnap).
-					Int("attachment_count", len(apiMessage.Media)).
-					Msg("media: rendering API media")
-				message.Media = sa.downloadAPIMessageMedia(ctx, client, apiMessage)
-				if len(message.Media) > 0 {
-					message.ID = mediaMessageID(message.ID, message.Media)
-					if sa.reconcileMediaDelivery(ctx, chat.ID, message.ID, baseRemoteID, len(message.Media)) || sa.reconcileMediaDelivery(ctx, chat.ID, baseRemoteID, baseRemoteID, len(message.Media)) {
-						continue
-					}
-					// The state row may precede a failed first Matrix send. An edit
-					// needs an actual placeholder mapping, not just that state row.
-					if existing != nil && sa.UserLogin.Bridge.DB != nil {
-						parts, lookupErr := sa.UserLogin.Bridge.DB.Message.GetAllPartsByID(ctx, sa.UserLogin.ID, makeMessageID(scopedSnapchatMessageID(chat.ID, baseRemoteID)))
-						if lookupErr == nil && len(parts) == 0 {
-							existing = nil
-						}
-					}
+					Msg("media: stale hydrated state without delivery proof; rehydrating once")
+				existing.HydratedAt = nil
+				if sa.renderAPIMessageMedia(ctx, chat, client, apiMessage, &message, baseRemoteID, &existing) {
+					continue
+				}
+			case mediaHydrationRender:
+				if sa.renderAPIMessageMedia(ctx, chat, client, apiMessage, &message, baseRemoteID, &existing) {
+					continue
 				}
 			}
 		} else if len(apiMessage.Media) > 0 {
@@ -196,22 +269,55 @@ func (sa *SnapchatAPI) syncChatMessagesAPI(ctx context.Context, chat sidecar.Cha
 			log.Printf("bridgev2 sync: suppressing undecrypted historical placeholder chat_id=%s message_id=%s reason=%s", chat.ID, baseRemoteID, reason)
 			continue
 		}
+		if stats != nil {
+			parts, err := sa.currentMessageParts(ctx, chat.ID, baseRemoteID)
+			if err != nil {
+				return err
+			}
+			if len(parts) == 0 {
+				existing = nil
+			}
+		}
+		mappingID := baseRemoteID
+		queued := false
 		switch action := classifyMessageSync(existing, message); action {
 		case messageSyncEdit:
 			log.Printf("bridgev2 event_class: kind=%s source=api chat_id=%s message_id=%s api_kind=%s old_len=%d new_len=%d", action, chat.ID, baseRemoteID, messageKindFromAPI(apiMessage), len(existing.Text), len(message.Text))
-			sa.queueRemoteMessageEdit(chat, baseRemoteID, message)
+			if err := sa.queueRemoteMessageEdit(chat, baseRemoteID, message, wait...); err != nil {
+				return err
+			}
+			queued = true
 		case messageSyncNew:
 			if len(message.Media) > 0 && sa.UserLogin.Bridge.DB != nil {
-				parts, lookupErr := sa.UserLogin.Bridge.DB.Message.GetAllPartsByID(ctx, sa.UserLogin.ID, makeMessageID(scopedSnapchatMessageID(chat.ID, message.ID)))
+				parts, lookupErr := sa.currentMessageParts(ctx, chat.ID, message.ID)
+				if lookupErr != nil {
+					return lookupErr
+				}
 				if lookupErr == nil && len(parts) > 0 {
-					sa.queueRemoteMessageEdit(chat, message.ID, message)
+					if err := sa.queueRemoteMessageEdit(chat, message.ID, message, wait...); err != nil {
+						return err
+					}
+					mappingID, queued = message.ID, true
 					break
 				}
 			}
 			log.Printf("bridgev2 event_class: kind=%s source=api chat_id=%s message_id=%s api_kind=%s sender_id=%s outgoing=%t", action, chat.ID, baseRemoteID, messageKindFromAPI(apiMessage), message.AuthorID, message.Outgoing)
-			sa.queueRemoteMessage(chat, message)
+			if err := sa.queueRemoteMessage(chat, message, wait...); err != nil {
+				return err
+			}
+			mappingID, queued = message.ID, true
 		case messageSyncUnchanged:
 			log.Printf("bridgev2 event_class: kind=%s source=api chat_id=%s message_id=%s api_kind=%s", action, chat.ID, baseRemoteID, messageKindFromAPI(apiMessage))
+		}
+		if stats != nil && queued {
+			parts, err := sa.UserLogin.Bridge.DB.Message.GetAllPartsByID(ctx, sa.UserLogin.ID, makeMessageID(scopedSnapchatMessageID(chat.ID, mappingID)))
+			if err != nil || len(parts) == 0 {
+				return fmt.Errorf("Matrix send did not persist mapping for %s: %v", mappingID, err)
+			}
+			stats.MessagesBridged++
+			if deliveredMediaParts(parts, len(message.Media)) {
+				stats.MediaHydrated++
+			}
 		}
 		states = append(states, store.MessageState{
 			PortalKey:    chat.ID,
@@ -294,7 +400,7 @@ func restoreStoredDecryptedText(existing *store.MessageState, message sidecar.Me
 }
 
 func suppressUndecryptedBackfill(reason string, existing *store.MessageState, message sidecar.Message, apiMessage snapapi.Message) bool {
-	if reason != "startup stored portal backfill" || existing != nil {
+	if reason != "resync-all" && (reason != "startup stored portal backfill" || existing != nil) {
 		return false
 	}
 	if apiMessage.IsSnap || message.IsSnap || len(apiMessage.Media) > 0 || len(message.Media) > 0 {
@@ -334,9 +440,9 @@ func shouldQueueMessageEdit(existing *store.MessageState, message sidecar.Messag
 	return true
 }
 
-func (sa *SnapchatAPI) queueRemoteMessage(chat sidecar.Chat, message sidecar.Message) {
+func (sa *SnapchatAPI) queueRemoteMessage(chat sidecar.Chat, message sidecar.Message, wait ...context.Context) error {
 	if sa.UserLogin == nil || sa.UserLogin.Bridge == nil || chat.ID == "" || message.ID == "" {
-		return
+		return nil
 	}
 	message = sa.normalizeRemoteMessageDirection(chat.ID, message)
 	if chat.DisappearAfterSeconds > 0 {
@@ -352,11 +458,11 @@ func (sa *SnapchatAPI) queueRemoteMessage(chat sidecar.Chat, message sidecar.Mes
 	if sa.shouldSuppressOutgoingEcho(chat.ID, message) {
 		sa.markSeen(chat.ID, message.ID)
 		log.Printf("bridgev2 echo: suppressed outgoing API echo chat_id=%s message_id=%s content_type=%s disappear_after=%d", chat.ID, message.ID, message.ContentType, message.DisappearAfterSeconds)
-		return
+		return nil
 	}
 	if len(message.Media) == 0 && sa.isSeen(chat.ID, message.ID) {
 		log.Printf("bridgev2 dedupe: already saw message chat_id=%s message_id=%s", chat.ID, message.ID)
-		return
+		return nil
 	}
 	if len(message.Media) == 0 {
 		sa.markSeen(chat.ID, message.ID)
@@ -395,22 +501,44 @@ func (sa *SnapchatAPI) queueRemoteMessage(chat sidecar.Chat, message sidecar.Mes
 		ID:       networkid.PortalID(chat.ID),
 		Receiver: sa.UserLogin.ID,
 	}
-	sa.UserLogin.Bridge.QueueRemoteEvent(sa.UserLogin, &simplevent.Message[sidecar.Message]{
+	done := make(chan struct{})
+	post := sa.mediaDeliveryPostHandle(chat, message.ID, message)
+	result := sa.UserLogin.Bridge.QueueRemoteEvent(sa.UserLogin, &simplevent.Message[sidecar.Message]{
 		EventMeta: simplevent.EventMeta{
 			Type: bridgev2.RemoteEventMessage,
 			LogContext: func(c zerolog.Context) zerolog.Context {
 				return c.Str("chat", chat.Name).Str("chat_id", chat.ID).Str("message_id", message.ID).Str("event_id", eventID)
 			},
-			PortalKey:      portalKey,
-			CreatePortal:   true,
-			Sender:         sender,
-			Timestamp:      parseMessageTimestamp(message.Timestamp),
-			PostHandleFunc: sa.mediaDeliveryPostHandle(chat, message.ID, message),
+			PortalKey:    portalKey,
+			CreatePortal: true,
+			Sender:       sender,
+			Timestamp:    parseMessageTimestamp(message.Timestamp),
+			PostHandleFunc: func(ctx context.Context, portal *bridgev2.Portal) {
+				if post != nil {
+					post(ctx, portal)
+				}
+				close(done)
+			},
 		},
 		ID:                 makeMessageID(eventID),
 		Data:               copyMsg,
 		ConvertMessageFunc: sa.convertMessage,
 	})
+	return waitRemoteMessage(result, done, wait)
+}
+
+func waitRemoteMessage(result bridgev2.EventHandlingResult, done <-chan struct{}, wait []context.Context) error {
+	if !result.Success {
+		return fmt.Errorf("queue remote message: %v", result.Error)
+	}
+	if len(wait) > 0 && result.Queued {
+		select {
+		case <-done:
+		case <-wait[0].Done():
+			return wait[0].Err()
+		}
+	}
+	return nil
 }
 
 func (sa *SnapchatAPI) queueRemoteMessageRemove(chat sidecar.Chat, targetMessageID string, message sidecar.Message) {
@@ -445,9 +573,9 @@ func (sa *SnapchatAPI) queueRemoteMessageRemove(chat sidecar.Chat, targetMessage
 	})
 }
 
-func (sa *SnapchatAPI) queueRemoteMessageEdit(chat sidecar.Chat, targetMessageID string, message sidecar.Message) {
+func (sa *SnapchatAPI) queueRemoteMessageEdit(chat sidecar.Chat, targetMessageID string, message sidecar.Message, wait ...context.Context) error {
 	if sa.UserLogin == nil || sa.UserLogin.Bridge == nil || chat.ID == "" || targetMessageID == "" || message.ID == "" {
-		return
+		return nil
 	}
 	message = sa.normalizeRemoteMessageDirection(chat.ID, message)
 	copyMsg := message
@@ -479,17 +607,24 @@ func (sa *SnapchatAPI) queueRemoteMessageEdit(chat sidecar.Chat, targetMessageID
 	if len(message.Media) == 0 {
 		editID = targetEventID + "-edit-" + stableTextID(message.Text)
 	}
-	sa.UserLogin.Bridge.QueueRemoteEvent(sa.UserLogin, &simplevent.Message[sidecar.Message]{
+	done := make(chan struct{})
+	post := sa.mediaDeliveryPostHandle(chat, targetMessageID, message)
+	result := sa.UserLogin.Bridge.QueueRemoteEvent(sa.UserLogin, &simplevent.Message[sidecar.Message]{
 		EventMeta: simplevent.EventMeta{
 			Type: bridgev2.RemoteEventEdit,
 			LogContext: func(c zerolog.Context) zerolog.Context {
 				return c.Str("chat", chat.Name).Str("chat_id", chat.ID).Str("message_id", message.ID).Str("target_message_id", targetMessageID).Str("target_event_id", targetEventID)
 			},
-			PortalKey:      portalKey,
-			CreatePortal:   true,
-			Sender:         sender,
-			Timestamp:      parseMessageTimestamp(message.Timestamp),
-			PostHandleFunc: sa.mediaDeliveryPostHandle(chat, targetMessageID, message),
+			PortalKey:    portalKey,
+			CreatePortal: true,
+			Sender:       sender,
+			Timestamp:    parseMessageTimestamp(message.Timestamp),
+			PostHandleFunc: func(ctx context.Context, portal *bridgev2.Portal) {
+				if post != nil {
+					post(ctx, portal)
+				}
+				close(done)
+			},
 		},
 		ID:                 makeMessageID(editID),
 		TargetMessage:      makeMessageID(targetEventID),
@@ -497,6 +632,7 @@ func (sa *SnapchatAPI) queueRemoteMessageEdit(chat sidecar.Chat, targetMessageID
 		ConvertMessageFunc: sa.convertMessage,
 		ConvertEditFunc:    sa.convertMessageEdit,
 	})
+	return waitRemoteMessage(result, done, wait)
 }
 
 func (sa *SnapchatAPI) convertMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, message sidecar.Message) (*bridgev2.ConvertedMessage, error) {
@@ -551,14 +687,14 @@ func (sa *SnapchatAPI) convertMessage(ctx context.Context, portal *bridgev2.Port
 				Int("size", len(media.Data)).
 				Msg("media: uploaded Snapchat media")
 			partBody := body
-			if partBody == "" || isGeneratedSnapchatNotice(partBody) {
+			if partBody == "" || partBody == "Media" || isGeneratedSnapchatNotice(partBody) {
 				// Some Matrix clients use body as the displayed/downloaded filename
 				// for encrypted media, so don't use "New Snap" as the body here.
 				partBody = fileName
 			}
 			parts = append(parts, &bridgev2.ConvertedMessagePart{
 				ID:         mediaPartID(len(parts)),
-				DBMetadata: &MediaDeliveryMetadata{MediaDelivered: true, AttachmentCount: len(message.Media)},
+				DBMetadata: &MediaDeliveryMetadata{MediaDelivered: true, AttachmentCount: len(message.Media), PresentationVersion: 1},
 				Type:       event.EventMessage,
 				Content: &event.MessageEventContent{
 					MsgType:  msgType,
@@ -661,6 +797,38 @@ func truncateDescriptorID(id string) string {
 	return id
 }
 
+// renderAPIMessageMedia downloads and attaches clear media bytes for an
+// ordinary API message. It reports whether the message was reconciled as
+// already delivered, in which case the caller must skip the rest of the sync
+// iteration for this message.
+func (sa *SnapchatAPI) renderAPIMessageMedia(ctx context.Context, chat sidecar.Chat, client *snapapi.Client, apiMessage snapapi.Message, message *sidecar.Message, baseRemoteID string, existing **store.MessageState) bool {
+	zerolog.Ctx(ctx).Info().
+		Str("diag", "snapchat_media").
+		Str("chat_id", chat.ID).
+		Str("message_id", apiMessage.ID).
+		Str("content_type", apiMessage.ContentType).
+		Bool("is_snap", apiMessage.IsSnap).
+		Int("attachment_count", len(apiMessage.Media)).
+		Msg("media: rendering API media")
+	message.Media = sa.downloadAPIMessageMedia(ctx, client, apiMessage)
+	if len(message.Media) == 0 {
+		return false
+	}
+	message.ID = mediaMessageID(message.ID, message.Media)
+	if sa.mediaDeliveryConfirmed(ctx, chat.ID, baseRemoteID, *message, len(message.Media)) {
+		return true
+	}
+	// The state row may precede a failed first Matrix send. An edit
+	// needs an actual placeholder mapping, not just that state row.
+	if *existing != nil && sa.UserLogin != nil && sa.UserLogin.Bridge != nil && sa.UserLogin.Bridge.DB != nil {
+		parts, lookupErr := sa.currentMessageParts(ctx, chat.ID, baseRemoteID)
+		if lookupErr == nil && len(parts) == 0 {
+			*existing = nil
+		}
+	}
+	return false
+}
+
 func (sa *SnapchatAPI) downloadAPIMessageMedia(ctx context.Context, client *snapapi.Client, message snapapi.Message) []sidecar.MediaAttachment {
 	attachments := make([]sidecar.MediaAttachment, 0, len(message.Media))
 	for _, media := range message.Media {
@@ -687,6 +855,8 @@ func (sa *SnapchatAPI) downloadAPIMessageMedia(ctx context.Context, client *snap
 				Str("content_type", message.ContentType).
 				Bool("is_snap", message.IsSnap).
 				Str("source", info.Source).
+				Str("descriptor_shape", info.DescriptorShape).
+				Str("cdn_fallback_reason", info.CDNFallbackReason).
 				Bool("url_present", media.URL != "").
 				Int("inline_bytes", len(media.Data)).
 				Int("key_bytes", len(media.Key)).

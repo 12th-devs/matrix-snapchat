@@ -10,6 +10,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/0xzer/snapper/protos"
 )
 
 func TestDownloadMediaWithInfoRejectsDescriptorOnlyAttachment(t *testing.T) {
@@ -215,5 +217,46 @@ func TestMediaDecryptionFailureNeverReturnsCiphertext(t *testing.T) {
 	data, _, _, err := client.DownloadMediaWithInfo(context.Background(), MediaAttachment{Data: bytes.Repeat([]byte{0x42}, 4096), Key: make([]byte, 32), IV: make([]byte, 17), Kind: MediaKindFile})
 	if err == nil || len(data) != 0 {
 		t.Fatal("failed decryption exposed ciphertext")
+	}
+}
+
+// referenceEnvelope builds an EXTERNAL_MEDIA reference-list envelope like
+// message 772: mediaListId 0 carries the original media and mediaListId 2 a
+// server-derived thumbnail rendition (descriptor ID suffix ".1020") declared
+// by the envelope's thumbnails field.
+func referenceEnvelope(originalListID, thumbnailListID uint64, declareThumbnail bool) *protos.ContentEnvelope {
+	envelope := &protos.ContentEnvelope{
+		ContentType: protos.ContentType_EXTERNAL_MEDIA,
+		MediaReferenceLists: []*protos.ContentEnvelope_MediaReferenceList{{
+			Reference: []*protos.MediaReference{
+				{MediaType: protos.MediaType_MEDIA_TYPE_IMAGE, MediaListId: originalListID, ContentObject: []byte("original-descriptor")},
+				{MediaType: protos.MediaType_MEDIA_TYPE_IMAGE, MediaListId: thumbnailListID, ContentObject: []byte("thumbnail-descriptor")},
+			},
+		}},
+	}
+	if declareThumbnail {
+		envelope.Thumbnails = &protos.ContentEnvelope_Thumbnails{
+			Thumbnails: []*protos.ThumbnailInfo{{MediaId: &protos.MediaId{MediaListId: thumbnailListID}}},
+		}
+	}
+	return envelope
+}
+
+func TestThumbnailRenditionReferenceExcludedFromAttachments(t *testing.T) {
+	media := mediaAttachmentsFromEnvelope(referenceEnvelope(0, 2, true), "772")
+	if len(media) != 1 {
+		t.Fatalf("attachment count = %d, want 1 (thumbnail rendition excluded)", len(media))
+	}
+	if !bytes.Equal(media[0].Data, []byte("original-descriptor")) {
+		t.Fatalf("kept attachment = %q, want the original descriptor", media[0].Data)
+	}
+}
+
+func TestUndeclaredThumbnailReferencesStayAttachments(t *testing.T) {
+	// Without the envelope thumbnail declaration, both references must stay:
+	// the exclusion follows only the envelope's own structural statement.
+	media := mediaAttachmentsFromEnvelope(referenceEnvelope(0, 2, false), "772")
+	if len(media) != 2 {
+		t.Fatalf("attachment count = %d, want 2", len(media))
 	}
 }

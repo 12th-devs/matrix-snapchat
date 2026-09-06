@@ -95,8 +95,30 @@ The full-stack runner writes connector stdout/stderr to `logs/connector.out.log`
 - `pgrep -f` can match itself. Prefer exact tracked PID files plus endpoint checks.
 - PowerShell can interpolate Bash `$?` before Bash receives it; quote commands carefully.
 
+## Resync Recovery Verified 2026-09-05
+
+- Matrix management command: `!snapchat resync-all [chat-id]`. Coverage is native discovery union existing portals for the current login, deduplicated by chat ID; stored metadata is fallback only. Messages use the existing native query path with limit 20.
+- Target `86ed4c7f-229d-50e9-bcd9-7b5adad048ea` kept portal rowid 16 and receiver `browser-session`. Dead `!xepqzRcmGfBzoBXEy67B:beeper.local` was replaced through normal room creation with `!ihl4S0nA5R5TpxoaWna5:beeper.local`.
+- Existing PFS `!UYASx81RyuZ8VpkrY8Hw:beeper.local` retained; new child linked, old child cleared. New room live members and Megolm encryption state returned HTTP 200.
+- Scoped first resync: coverage 66 native / 75 union, scanned 1, replaced 1, fetched 20, bridged 20, hydrated 1, errors 0. Message 4114 downloaded/decrypted an 89793-byte JPEG, sent encrypted, persisted MediaDelivered and HydratedAt.
+- Immediate second scoped resync: scanned 1, preserved 1, bridged 0, hydrated 0, errors 0; 4114 skipped before download. Its unchanged event `$BTDiqZ9HOlLepJyb4ieTZGA5pK_UpZprpOoINxXA0Zs:beeper.local` is retrievable in the new room.
+- Incoming media remains enabled, media-on-read and outgoing media disabled. Manual resync locks this login; polling skips while it runs. Historical delivery proof checks the current room; post-send persistence does not require an immediate event read.
+- Chat Accounts icon remains a Beeper canonical-type/icon-registry blocker: no supported identity-preserving metadata update found. Do not re-register or rotate credentials to test this.
+
 ## Known Quirks
 
 - The Windows connector process appears in WSL process lists as an `/init` relay. Check Windows processes and port `3101` to confirm it is real.
 - Headless Windows Chrome may only appear after an endpoint forces browser startup.
 - `check_connector_local_wsl.sh` intentionally exercises `/healthz`, `/session/status`, `/session/api-auth`, and `/chats`, so it can take time on a cold profile.
+
+## Alpha Validation Blockers 2026-09-05
+
+- Beeper Desktop API (supported OAuth, localhost:23373) decoded 4114 as IMAGE, image/jpeg, 89793 bytes, with its encrypted MXC attachment. User visually confirmed the image with literal `Media` caption. Transport was not the presentation failure: the generated fallback was being retained as a caption. New conversion uses the filename instead; real captions are preserved.
+- Historical caption repair uses normal bridgev2 edits without download/upload, but current ratcheting policy prevents bridge-side historical GetEvent decryption. Preserve encryption policy and the original visible image/caption; this cosmetic limitation no longer aborts resync. No claim that 4114's caption was repaired.
+- Live text regression reproduced in Phill (`58867445-6026-5827-8bfc-0aac38259257`): messages 740, 742, 743 around 18:29 local have `[Snapchat message unavailable]`; connector EEL helper logs `attempts_exhausted`. This is Snapchat plaintext recovery, not a Matrix/Megolm failure. Underlying cause remains unresolved; do not call text generally alpha-stable.
+- Phill ordinary image 745 (18:35:37 local) has key/IV metadata but descriptor RPC returns an empty response. It remains retryable with HydratedAt NULL and no successful media proof. Two other sampled chats likewise yielded unavailable/invalid payloads. Only JPEG 4114 is visually verified; PNG conversion has tests, video is not live verified. Do not auto-open view-once snaps or investigate forbidden pagination as a shortcut.
+- Manual resync now suppresses undecoded historical text instead of replaying unavailable placeholders. It does not repair EEL decryption; existing Matrix placeholders remain intact.
+- Restart test reproduced a restored login using config-default localhost instead of the WSL gateway because the sidecar client can be created before connector Start. Client construction now applies existing runtime URL/secret overrides directly, with a regression test.
+- Reusable operator tools: `python3 scripts/bridge_admin.py snapshot --output data/runtime/NAME.json`, `compare data/runtime/NAME.json`, `resync [chat-id]`, `report --since-byte N`, `chat NAME`, `media`. Snapshots are gitignored, read-only DB/live state evidence. `node scripts/check_beeper_media.mjs ROOM EVENT [--focus]` uses normal Desktop OAuth with credentials held in memory; focus may mark the chat read.
+- Baseline `data/runtime/alpha-before.json`: 75 portals, 476 mappings, one login/PFS. Subsequent comparison preserved rows, healthy MXIDs, login identity and exact PFS children; live traffic increased mappings. Full 75-chat resync twice, complete alpha audit/cleanup and stable checkpoint commit are deferred because priority-1 media/text usability remains blocked.
+- Targeted package tests and vet pass. Bridge-only restarts use `SNAPCHAT_BRIDGE_RESET_OUTBOUND_MEGOLM_ON_START=false` to retain existing outbound sessions, original connector/Chrome session and credentials. Additional builds were necessary after reproduced runtime regressions; no full connector restart or registration change was performed.

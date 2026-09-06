@@ -54,23 +54,17 @@ func (sl *SnapchatLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error)
 		_ = sl.Connector.store.UpsertLogin(store.LoginState{
 			UserID:        string(makeUserLoginID(meta.Label)),
 			RemoteID:      status.URL,
-			RemoteName:    "Snapchat Web",
+			RemoteName:    resolvedRemoteName("", ""),
 			SessionJSON:   store.MarshalJSON(status),
 			LastSeenState: status.State,
 		})
-	}
-
-	if err := sl.Connector.resetSyncState(); err != nil {
-		log.Printf("bridgev2 login: failed to reset sync state before relogin: %v", err)
-	} else {
-		log.Printf("bridgev2 login: reset sync state for fresh resync")
 	}
 
 	api := NewSnapchatAPI(sl.Connector, nil, meta.Label)
 	api.updateLoginState(status)
 	ul, err := sl.User.NewLogin(ctx, &database.UserLogin{
 		ID:         makeUserLoginID(meta.Label),
-		RemoteName: "Snapchat Web",
+		RemoteName: resolvedRemoteName("", ""),
 		Metadata:   meta,
 	}, &bridgev2.NewLoginParams{
 		LoadUserLogin: func(ctx context.Context, login *bridgev2.UserLogin) error {

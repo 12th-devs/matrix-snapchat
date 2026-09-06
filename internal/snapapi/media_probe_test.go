@@ -1,11 +1,15 @@
 package snapapi
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -83,11 +87,17 @@ func TestMediaEnvelopeProbe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	requestedCount := 40
+	if raw := strings.TrimSpace(os.Getenv("SNAPCHAT_PROBE_COUNT")); raw != "" {
+		if parsed, parseErr := strconv.Atoi(raw); parseErr == nil && parsed > 0 && parsed <= 500 {
+			requestedCount = parsed
+		}
+	}
 	qreq := &protos.QueryMessagesRequest{
 		SelfUserId:         client.selfUUID(),
 		ConversationId:     conv.GetConversationId(),
 		CurrentVersion:     conv.GetVersion(),
-		RequestedCountSize: 40,
+		RequestedCountSize: int32(requestedCount),
 	}
 	var qresp protos.QueryMessagesResponse
 	if err := client.doGRPC(ctx, paths.QUERY_MESSAGES, qreq, &qresp); err != nil {
@@ -125,12 +135,49 @@ func TestMediaEnvelopeProbe(t *testing.T) {
 		if envelope.GetContentType() == protos.ContentType_EXTERNAL_MEDIA {
 			key, iv, err := ExternalMediaEncryptionKeys(decoded)
 			t.Logf("  external media key_len=%d iv_len=%d metadata_error=%v", len(key), len(iv), err)
+			if os.Getenv("SNAPCHAT_PROBE_WEB_DECRYPT") == "true" && len(key) == 32 && len(iv) == 16 {
+				// Narrowest in-memory handoff: the decoded key/IV only cross to
+				// the connector's existing debug decrypt probe over loopback,
+				// are never logged here, and are not part of any response body
+				// the connector returns.
+				descriptorHex := strings.TrimSpace(os.Getenv("SNAPCHAT_PROBE_DESCRIPTOR_HEX"))
+				if descriptorHex == "" {
+					t.Log("  web decrypt skipped: SNAPCHAT_PROBE_DESCRIPTOR_HEX not set")
+				} else {
+					body := map[string]string{
+						"descriptorHex": descriptorHex,
+						"chatId":        chatID,
+						"messageId":     id,
+						"mediaKeyB64":   base64.StdEncoding.EncodeToString(key),
+						"mediaIVB64":    base64.StdEncoding.EncodeToString(iv),
+					}
+					payload, marshalErr := json.Marshal(body)
+					if marshalErr != nil {
+						t.Fatalf("  web decrypt body marshal: %v", marshalErr)
+					}
+					decryptReq, reqErr := http.NewRequest(http.MethodPost, strings.TrimRight(base, "/")+"/debug/media-decrypt", bytes.NewReader(payload))
+					if reqErr != nil {
+						t.Fatalf("  web decrypt request: %v", reqErr)
+					}
+					decryptReq.Header.Set("X-Bridge-Secret", secret)
+					decryptReq.Header.Set("Content-Type", "application/json")
+					decryptResp, postErr := http.DefaultClient.Do(decryptReq)
+					if postErr != nil {
+						t.Fatalf("  web decrypt call: %v", postErr)
+					}
+					decryptBody, _ := io.ReadAll(io.LimitReader(decryptResp.Body, 1<<20))
+					decryptResp.Body.Close()
+					t.Logf("  web decrypt http_status=%d response=%s", decryptResp.StatusCode, string(decryptBody))
+				}
+			}
 			if os.Getenv("SNAPCHAT_PROBE_DOWNLOAD") == "true" {
 				parsed := client.messageFromProto(ctx, chatID, msg)
 				for _, attachment := range parsed.Media {
 					data, mime, info, err := client.DownloadMediaWithInfo(ctx, attachment)
 					t.Logf("  download: descriptor_id=%q bytes=%d mime=%s info=%+v error=%v", MediaDescriptorID(attachment.Data), len(data), mime, info, err)
-					if err != nil { t.Error("ordinary media download failed") }
+					if err != nil {
+						t.Error("ordinary media download failed")
+					}
 				}
 			}
 		}

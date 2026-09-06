@@ -62,6 +62,41 @@ let capturedIdentitySource = "";
 const capturedAccountEndpoints = new Set();
 let lastAPIAuthSnapshot = null;
 let lastAPIAuthSnapshotAt = 0;
+let realtimeProbe = null;
+
+function rememberRealtimeProbeEvent(event) {
+  if (!realtimeProbe) {
+    return;
+  }
+  const item = {
+    at: new Date().toISOString(),
+    ...event,
+  };
+  realtimeProbe.events.push(item);
+  if (realtimeProbe.events.length > 300) {
+    realtimeProbe.events.splice(0, realtimeProbe.events.length - 300);
+  }
+}
+
+function realtimeProbeChatForText(text) {
+  const normalized = normalizeText(text).toLowerCase();
+  if (!normalized) {
+    return {};
+  }
+  let best = {};
+  for (const chat of knownChatsByKey.values()) {
+    const name = normalizeText(chat?.name).toLowerCase();
+    if (!name || !chat?.id) {
+      continue;
+    }
+    if (normalized === name || normalized.startsWith(`${name} `) || normalized.includes(` ${name} `)) {
+      if (!best.name || name.length > best.name.length) {
+        best = { id: chat.id, name: chat.name };
+      }
+    }
+  }
+  return best;
+}
 
 function identityUUIDFromJSON(value, pathParts = [], seen = new Set(), depth = 0) {
   if (!value || typeof value !== "object" || seen.has(value) || depth > 8) {
@@ -258,6 +293,14 @@ async function ensureSession() {
   context.on("request", async (request) => {
     try {
       const requestURL = request.url();
+      if (realtimeProbe && /websocket|blizzard|messagingcoreservice|snapchat\.notification|grpc|stream/i.test(requestURL)) {
+        rememberRealtimeProbeEvent({
+          source: "playwright-request",
+          method: request.method(),
+          url: requestURL.slice(0, 500),
+          resourceType: request.resourceType(),
+        });
+      }
       const headers = await request.allHeaders();
       const authorization = String(headers.authorization || "").trim();
       const authorizationMatch = authorization.match(/^Bearer\s+([^\s]+)$/i);
@@ -318,6 +361,14 @@ async function ensureSession() {
   context.on("response", async (response) => {
     try {
       const responseURL = new URL(response.url());
+      if (realtimeProbe && /websocket|blizzard|messagingcoreservice|snapchat\.notification|grpc|stream/i.test(response.url())) {
+        rememberRealtimeProbeEvent({
+          source: "playwright-response",
+          status: response.status(),
+          url: response.url().slice(0, 500),
+          contentType: String(response.headers()["content-type"] || "").slice(0, 120),
+        });
+      }
       if (!/(^|\.)accounts\.snapchat\.com$/i.test(responseURL.hostname)) {
         return;
       }
@@ -2717,6 +2768,7 @@ export async function debugMediaResolve(payload) {
   });
 }
 export const debugMediaSignedDownload = debugTools.debugMediaSignedDownload;
+export const debugMediaDecrypt = debugTools.debugMediaDecrypt;
 export const getBrowserConversationMessages = debugTools.getBrowserConversationMessages;
 export const getBrowserE2EESummary = debugTools.getBrowserE2EESummary;
 export const deriveBrowserE2EESharedSecret = debugTools.deriveBrowserE2EESharedSecret;
@@ -3304,6 +3356,352 @@ export async function getTypingState(watchChatID = "") {
     }
     return result;
   }, { priority: 5, timeoutMs: 8000, label: "getTypingState" });
+}
+
+export async function startRealtimeProbe(options = {}) {
+  return withLock(async () => {
+    const currentPage = await gotoSnapchat();
+    realtimeProbe = {
+      startedAt: new Date().toISOString(),
+      url: currentPage.url(),
+      events: [],
+      cdpAttached: false,
+      injected: false,
+      decodedHookInstalled: false,
+      decodedHookReinitialized: false,
+    };
+
+    try {
+      const cdp = await context.newCDPSession(currentPage);
+      await cdp.send("Network.enable");
+      cdp.on("Network.webSocketCreated", (event) => {
+        rememberRealtimeProbeEvent({
+          source: "cdp-websocket-created",
+          requestId: event.requestId,
+          url: String(event.url || "").slice(0, 500),
+        });
+      });
+      cdp.on("Network.webSocketFrameReceived", (event) => {
+        rememberRealtimeProbeEvent({
+          source: "cdp-websocket-frame-received",
+          requestId: event.requestId,
+          opcode: event.response?.opcode,
+          payloadLength: String(event.response?.payloadData || "").length,
+        });
+      });
+      cdp.on("Network.eventSourceMessageReceived", (event) => {
+        rememberRealtimeProbeEvent({
+          source: "cdp-eventsource-message",
+          requestId: event.requestId,
+          eventName: event.eventName,
+          dataLength: String(event.eventId || event.data || "").length,
+        });
+      });
+      realtimeProbe.cdpAttached = true;
+    } catch (error) {
+      rememberRealtimeProbeEvent({ source: "probe-error", stage: "cdp", error: String(error).slice(0, 240) });
+    }
+
+    try {
+      await currentPage.exposeBinding("__codexRealtimeProbeRecord", (_source, event) => {
+        const matchedChat = event?.chatId ? {} : realtimeProbeChatForText(event?.text || "");
+        rememberRealtimeProbeEvent({
+          source: "browser-app",
+          eventType: String(event?.eventType || "app-change"),
+          chatId: String(event?.chatId || matchedChat.id || ""),
+          chatName: String(matchedChat.name || ""),
+          diagnosticOnly: true,
+          url: String(event?.url || "").slice(0, 500),
+          text: String(event?.text || "").replace(/\s+/g, " ").trim().slice(0, 180),
+        });
+      });
+    } catch (error) {
+      if (!/has been registered/i.test(String(error))) {
+        rememberRealtimeProbeEvent({ source: "probe-error", stage: "exposeBinding", error: String(error).slice(0, 240) });
+      }
+    }
+
+    try {
+      await currentPage.exposeBinding("__codexRealtimeProbeDecodedRecord", (_source, event) => {
+        rememberRealtimeProbeEvent({
+          source: "decoded-dispatcher",
+          eventType: String(event?.eventType || ""),
+          chatId: String(event?.chatId || ""),
+          messageId: String(event?.messageId || ""),
+          senderId: String(event?.senderId || ""),
+          timestamp: String(event?.timestamp || ""),
+          handler: String(event?.handler || ""),
+          summary: String(event?.summary || "").slice(0, 240),
+        });
+      });
+    } catch (error) {
+      if (!/has been registered/i.test(String(error))) {
+        rememberRealtimeProbeEvent({ source: "probe-error", stage: "decodedExposeBinding", error: String(error).slice(0, 240) });
+      }
+    }
+
+    const decodedHook = await currentPage.evaluate(async ({ forceReinit }) => {
+      function findWebpackRequire() {
+        for (const key of Object.keys(globalThis)) {
+          if (!/^webpackChunk/.test(key)) {
+            continue;
+          }
+          const chunk = globalThis[key];
+          if (!Array.isArray(chunk) || typeof chunk.push !== "function") {
+            continue;
+          }
+          let webpackRequire;
+          try {
+            chunk.push([[`codex-realtime-hook-${Date.now()}`], {}, (req) => {
+              webpackRequire = req;
+            }]);
+          } catch {
+            continue;
+          }
+          if (webpackRequire?.m) {
+            return webpackRequire;
+          }
+        }
+        return undefined;
+      }
+      function resolveAppState(webpackRequire) {
+        for (const moduleId of [96821, 97003]) {
+          try {
+            const store = webpackRequire(moduleId)?.M;
+            const state = store?.getState?.();
+            if (state?.messaging || state?.wasm) {
+              return { store, state, moduleId };
+            }
+          } catch {
+          }
+        }
+        return {};
+      }
+      function uuidFromValue(value, seen = new Set(), depth = 0) {
+        if (!value || depth > 4) {
+          return "";
+        }
+        if (typeof value === "string") {
+          return /^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(value) ? value.toLowerCase() : "";
+        }
+        if (value instanceof Uint8Array && value.byteLength === 16) {
+          const hex = Array.from(value).map((byte) => byte.toString(16).padStart(2, "0")).join("");
+          return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+        }
+        if (ArrayBuffer.isView(value) && value.byteLength === 16) {
+          return uuidFromValue(new Uint8Array(value.buffer, value.byteOffset, value.byteLength), seen, depth + 1);
+        }
+        if (typeof value !== "object" || seen.has(value)) {
+          return "";
+        }
+        seen.add(value);
+        for (const key of ["str", "id", "conversationId", "participantId", "senderId", "userId"]) {
+          const found = uuidFromValue(value[key], seen, depth + 1);
+          if (found) {
+            return found;
+          }
+        }
+        return "";
+      }
+      function findByKey(value, patterns, seen = new Set(), depth = 0) {
+        if (!value || typeof value !== "object" || seen.has(value) || depth > 6) {
+          return "";
+        }
+        seen.add(value);
+        for (const [key, child] of Object.entries(value)) {
+          if (patterns.some((pattern) => pattern.test(key)) && child != null && typeof child !== "object") {
+            return String(child);
+          }
+          if (patterns.some((pattern) => pattern.test(key))) {
+            const uuid = uuidFromValue(child);
+            if (uuid) {
+              return uuid;
+            }
+          }
+        }
+        for (const child of Object.values(value)) {
+          const nested = findByKey(child, patterns, seen, depth + 1);
+          if (nested) {
+            return nested;
+          }
+        }
+        return "";
+      }
+      function summarizeArgs(handler, args) {
+        const first = args[0];
+        const chatId = findByKey(args, [/conversationId$/i, /^conversationId$/i, /feedEntryIdentifier/i]);
+        const messageId = findByKey(args, [/messageId$/i, /^messageId$/i, /serverMessageId/i]);
+        const senderId = findByKey(args, [/senderId$/i, /^senderId$/i, /participantId$/i]);
+        const timestamp = findByKey(args, [/timestamp/i, /createdAt/i, /serverCreatedAt/i]);
+        const summary = JSON.stringify({
+          argCount: args.length,
+          firstType: Array.isArray(first) ? `array:${first.length}` : typeof first,
+          firstKeys: first && typeof first === "object" ? Object.keys(first).slice(0, 12) : [],
+        });
+        return { chatId, messageId, senderId, timestamp, summary };
+      }
+      function wrapDelegate(delegate, delegateName) {
+        if (!delegate || typeof delegate !== "object") {
+          return;
+        }
+        for (const key of Object.keys(delegate)) {
+          if (typeof delegate[key] !== "function" || delegate[key].__codexRealtimeWrapped) {
+            continue;
+          }
+          const original = delegate[key];
+          const wrapped = function (...args) {
+            try {
+              if (/FeedEntriesUpdated|ConversationUpdated|ConversationCreated|ConversationRemoved|ConversationReset|SendComplete|Error/i.test(key)) {
+                const trigger = summarizeArgs(key, args);
+                window.__codexRealtimeProbeDecodedRecord?.({
+                  eventType: key,
+                  handler: `${delegateName}.${key}`,
+                  ...trigger,
+                });
+              }
+            } catch {
+            }
+            return original.apply(this, args);
+          };
+          wrapped.__codexRealtimeWrapped = true;
+          delegate[key] = wrapped;
+        }
+      }
+      const webpackRequire = findWebpackRequire();
+      const { state } = resolveAppState(webpackRequire);
+      const workerProxy = state?.wasm?.workerProxy;
+      if (!workerProxy || typeof workerProxy.createMessagingSession !== "function") {
+        return { ok: false, error: "workerProxy.createMessagingSession unavailable" };
+      }
+      if (!workerProxy.__codexOriginalCreateMessagingSession) {
+        workerProxy.__codexOriginalCreateMessagingSession = workerProxy.createMessagingSession;
+        workerProxy.createMessagingSession = function (...args) {
+          wrapDelegate(args[1], "conversationDelegate");
+          wrapDelegate(args[2], "feedDelegate");
+          window.__codexRealtimeProbeDecodedRecord?.({
+            eventType: "createMessagingSession",
+            handler: "workerProxy.createMessagingSession",
+            summary: `args=${args.length}`,
+          });
+          return workerProxy.__codexOriginalCreateMessagingSession.apply(this, args);
+        };
+      }
+      let reinitialized = false;
+      if (forceReinit && state?.messaging?.client && typeof state.messaging.destroyClient === "function" && typeof state.messaging.initializeClient === "function") {
+        await Promise.race([
+          state.messaging.destroyClient().then(() => state.messaging.initializeClient()),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("messaging_reinit_timeout")), 12000)),
+        ]);
+        reinitialized = true;
+      } else if (!state?.messaging?.client && typeof state?.messaging?.initializeClient === "function") {
+        await Promise.race([
+          state.messaging.initializeClient(),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("messaging_init_timeout")), 12000)),
+        ]);
+        reinitialized = true;
+      }
+      return { ok: true, reinitialized, hadClient: Boolean(state?.messaging?.client) };
+    }, { forceReinit: options.forceReinit !== false });
+    realtimeProbe.decodedHookInstalled = Boolean(decodedHook?.ok);
+    realtimeProbe.decodedHookReinitialized = Boolean(decodedHook?.reinitialized);
+    rememberRealtimeProbeEvent({
+      source: "probe",
+      eventType: "decoded-hook",
+      ok: Boolean(decodedHook?.ok),
+      reinitialized: Boolean(decodedHook?.reinitialized),
+      error: decodedHook?.error || "",
+    });
+
+    const injected = await currentPage.evaluate(() => {
+      if (window.__codexRealtimeProbeInstalled) {
+        return true;
+      }
+      window.__codexRealtimeProbeInstalled = true;
+      const chatIDPattern = /\/web\/([0-9a-f]{8}-[0-9a-f-]{27,})/i;
+      const emit = (event) => {
+        try {
+          window.__codexRealtimeProbeRecord?.({
+            ...event,
+            url: location.href,
+          });
+        } catch {
+        }
+      };
+      const scan = (reason) => {
+        const rows = [];
+        for (const element of document.querySelectorAll("a[href*='/web/'], [role='button'][aria-labelledby*='title-'], [role='link'][aria-labelledby*='title-']")) {
+          const href = element.href || element.getAttribute("href") || "";
+          const match = href.match(chatIDPattern);
+          const text = (element.innerText || element.textContent || "").replace(/\s+/g, " ").trim();
+          if (!match && !text) {
+            continue;
+          }
+          rows.push({
+            eventType: reason,
+            chatId: match?.[1]?.toLowerCase() || "",
+            text,
+          });
+        }
+        for (const row of rows.slice(0, 12)) {
+          emit(row);
+        }
+      };
+      const observer = new MutationObserver((mutations) => {
+        const interesting = mutations.some((mutation) => {
+          const text = `${mutation.target?.textContent || ""}`;
+          return /typing|opened|received|sent|new chat|snap|delivered/i.test(text) || mutation.addedNodes.length > 0;
+        });
+        if (interesting) {
+          scan("dom-live-candidate");
+        }
+      });
+      observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+      scan("initial-dom-candidate");
+      return true;
+    });
+    realtimeProbe.injected = Boolean(injected);
+    try {
+      for (const resource of await currentPage.evaluate(() => performance.getEntriesByType("resource")
+        .map((entry) => ({
+          name: entry.name,
+          initiatorType: entry.initiatorType,
+          duration: Math.round(entry.duration || 0),
+          transferSize: entry.transferSize || 0,
+        }))
+        .filter((entry) => /websocket|blizzard|messagingcoreservice|snapchat\.notification|grpc|stream/i.test(entry.name))
+        .slice(-60))) {
+        rememberRealtimeProbeEvent({
+          source: "browser-performance-resource",
+          eventType: "resource",
+          initiatorType: resource.initiatorType,
+          durationMs: resource.duration,
+          transferSize: resource.transferSize,
+          url: String(resource.name || "").slice(0, 500),
+        });
+      }
+    } catch (error) {
+      rememberRealtimeProbeEvent({ source: "probe-error", stage: "performance", error: String(error).slice(0, 240) });
+    }
+    rememberRealtimeProbeEvent({ source: "probe", eventType: "started", url: currentPage.url() });
+    return {
+      ok: true,
+      startedAt: realtimeProbe.startedAt,
+      cdpAttached: realtimeProbe.cdpAttached,
+      injected: realtimeProbe.injected,
+      url: realtimeProbe.url,
+    };
+  }, { priority: 0, timeoutMs: 15000, label: "startRealtimeProbe" });
+}
+
+export async function getRealtimeProbe() {
+  return {
+    ok: Boolean(realtimeProbe),
+    startedAt: realtimeProbe?.startedAt || "",
+    url: realtimeProbe?.url || "",
+    cdpAttached: Boolean(realtimeProbe?.cdpAttached),
+    injected: Boolean(realtimeProbe?.injected),
+    events: realtimeProbe?.events || [],
+  };
 }
 
 export async function getDiagnostics() {

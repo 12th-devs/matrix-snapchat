@@ -53,6 +53,11 @@ func (sa *SnapchatAPI) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Ma
 			DB: &database.Message{
 				ID:       makeMessageID(scopedSnapchatMessageID(chatID, messageID)),
 				SenderID: makeUserID(sa.Label),
+				// The send itself proves the single attachment was delivered:
+				// Snapchat accepted the message after a successful upload.
+				// Persisting delivery proof keeps later syncs of the outgoing
+				// echo from re-downloading the media or editing the event.
+				Metadata: &MediaDeliveryMetadata{MediaDelivered: true, AttachmentCount: 1, PresentationVersion: 1},
 			},
 		}, nil
 	}
@@ -478,7 +483,9 @@ func (sa *SnapchatAPI) matrixMediaToSend(ctx context.Context, msg *bridgev2.Matr
 		return sidecar.MediaAttachment{}, "", false, nil
 	}
 	switch msg.Content.MsgType {
-	case event.MsgImage, event.MsgVideo, event.MsgFile:
+	case event.MsgImage:
+	case event.MsgVideo, event.MsgFile:
+		return sidecar.MediaAttachment{}, "", true, fmt.Errorf("outbound Snapchat media supports only images in this version (got %s)", msg.Content.MsgType)
 	default:
 		return sidecar.MediaAttachment{}, "", false, nil
 	}
@@ -508,6 +515,9 @@ func (sa *SnapchatAPI) matrixMediaToSend(ctx context.Context, msg *bridgev2.Matr
 		mimeType = strings.TrimSpace(msg.Content.Info.MimeType)
 	}
 	mimeType = normalizeMediaMIME(data, mimeType)
+	if mimeType != "image/jpeg" {
+		return sidecar.MediaAttachment{}, "", true, fmt.Errorf("outbound Snapchat media supports only image/jpeg in this version (got %q)", mimeType)
+	}
 	fileName := strings.TrimSpace(msg.Content.FileName)
 	if fileName == "" {
 		fileName = strings.TrimSpace(msg.Content.Body)

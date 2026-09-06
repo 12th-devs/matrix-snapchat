@@ -142,6 +142,10 @@ type Client struct {
 	profileCheckedAt  map[string]time.Time
 	eelPlaintext      map[string][]byte
 	failedEEL         map[string]time.Time
+
+	mediaMappingMu sync.Mutex
+	mediaMapping   *boltNetworkMapping
+	mediaMappingAt time.Time
 }
 
 const minPublicProfileRefreshInterval = 24 * time.Hour

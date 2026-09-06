@@ -28,6 +28,14 @@ func testHexBytes(t *testing.T, value string) []byte {
 	return data
 }
 
+func TestRestoredLoginClientUsesRuntimeURLBeforeStart(t *testing.T) {
+	t.Setenv("SNAPCHAT_CONNECTOR_BASE_URL", "http://172.21.112.1:3101")
+	sc := &SnapchatConnector{Config: ConnectorConfig{BaseURL: "http://127.0.0.1:3101"}}
+	if got := sc.newClient().BaseURL(); got != "http://172.21.112.1:3101" {
+		t.Fatalf("restored login ignored runtime URL: %s", got)
+	}
+}
+
 type recordingMatrixAPI struct {
 	uploadCalls int
 }
@@ -673,6 +681,11 @@ func TestSuppressUndecryptedBackfillSkipsOnlyNewHistoricalPlaceholders(t *testin
 	}
 	if suppressUndecryptedBackfill("api poll", nil, placeholder, apiMessage) {
 		t.Fatal("live API poll placeholder should not be suppressed")
+	}
+	for _, existing := range []*store.MessageState{nil, {Text: "[Snapchat message unavailable]"}} {
+		if !suppressUndecryptedBackfill("resync-all", existing, placeholder, apiMessage) {
+			t.Fatal("manual resync must not replay undecoded history even with stored placeholder state")
+		}
 	}
 	if suppressUndecryptedBackfill("startup stored portal backfill", &store.MessageState{Text: "old"}, placeholder, apiMessage) {
 		t.Fatal("stored baseline should not be suppressed")

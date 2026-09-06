@@ -40,6 +40,10 @@ func (sa *SnapchatAPI) pollLoop(ctx context.Context) {
 }
 
 func (sa *SnapchatAPI) pollOnce(ctx context.Context) {
+	if !sa.resyncMu.TryLock() {
+		return
+	}
+	defer sa.resyncMu.Unlock()
 	if sa.UserLogin == nil || sa.UserLogin.Bridge == nil {
 		log.Printf("bridgev2 sync: skipping poll because user login is not fully initialized label=%s", sa.Label)
 		return

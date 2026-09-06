@@ -1572,6 +1572,519 @@ async function debugMediaSignedDownload(payload) {
   }, { priority: 0 });
 }
 
+async function debugMediaDecrypt(payload) {
+  const descriptorHex = String(payload?.descriptorHex || "").replace(/[^0-9a-fA-F]/g, "");
+  const messageId = String(payload?.messageId || "");
+  const chatId = String(payload?.chatId || "");
+  const metricsContext = String(payload?.metricsContext || "chat_media");
+  // Optional in-process handoff: base64 media key/IV decoded by the native API
+  // side (ExternalMediaEncryptionKeys). Held only in evaluate-arg memory;
+  // never logged, persisted, or echoed in responses.
+  const mediaKeyB64 = String(payload?.mediaKeyB64 || "");
+  const mediaIVB64 = String(payload?.mediaIVB64 || "");
+  const suppliedKeyIv = mediaKeyB64.length > 0 && mediaIVB64.length > 0;
+  if (!descriptorHex || descriptorHex.length < 8 || descriptorHex.length % 2 !== 0) {
+    return { ok: false, error: "descriptor hex required" };
+  }
+  if (!suppliedKeyIv && (!chatId || !messageId)) {
+    return { ok: false, error: "chatId and messageId required unless mediaKeyB64/mediaIVB64 supplied" };
+  }
+  return withLock(async () => {
+    const { page: currentPage } = await ensureSession();
+    if (!currentPage || currentPage.isClosed()) {
+      return { ok: false, error: "no active page" };
+    }
+      return await currentPage.evaluate(async ({ descriptorHex, messageId, chatId, metricsContext, mediaKeyB64, mediaIVB64 }) => {
+      function findWebpackRequire() {
+        for (const key of Object.keys(globalThis)) {
+          if (!/^webpackChunk/.test(key)) continue;
+          const chunk = globalThis[key];
+          if (!Array.isArray(chunk) || typeof chunk.push !== "function") continue;
+          let webpackRequire;
+          try {
+            chunk.push([[`codex-media-decrypt-${Date.now()}`], {}, (req) => { webpackRequire = req; }]);
+          } catch {
+            continue;
+          }
+          if (webpackRequire?.m) return webpackRequire;
+        }
+        return undefined;
+      }
+      function bytesFromHex(hex) {
+        return new Uint8Array(hex.match(/.{2}/g).map((pair) => Number.parseInt(pair, 16)));
+      }
+      function bytesView(value) {
+        if (!value) return undefined;
+        if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+        if (value instanceof ArrayBuffer) return new Uint8Array(value);
+        if (Array.isArray(value)) return Uint8Array.from(value);
+        return undefined;
+      }
+      function sniff(value, contentType = "") {
+        const bytes = bytesView(value) || new Uint8Array(0);
+        const head = Array.from(bytes.slice(0, 16));
+        const ascii = String.fromCharCode(...bytes.slice(0, 16)).replace(/[^\x20-\x7e]/g, ".");
+        let container = "unknown";
+        if (head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff) container = "jpeg";
+        else if (head[0] === 0x89 && head[1] === 0x50 && head[2] === 0x4e && head[3] === 0x47) container = "png";
+        else if (ascii.startsWith("GIF8")) container = "gif";
+        else if (ascii.slice(4, 8) === "ftyp") container = "mp4";
+        else if (head[0] === 0x52 && head[1] === 0x49 && head[2] === 0x46 && head[3] === 0x46) container = "riff";
+        return {
+          container,
+          appearsClear: ["jpeg", "png", "gif", "mp4", "riff"].includes(container) || /^image\/|^video\/|^audio\//i.test(contentType),
+          headHex: head.map((b) => b.toString(16).padStart(2, "0")).join(""),
+        };
+      }
+      function summarizeUrl(value) {
+        const url = new URL(value);
+        return {
+          host: url.host,
+          pathShape: url.pathname.replace(/[A-Za-z0-9_-]{12,}/g, ":id"),
+          queryParamNames: Array.from(url.searchParams.keys()).sort(),
+          uc: url.searchParams.get("uc") || "",
+        };
+      }
+      function messageIds(message) {
+        return [
+          message?.descriptor?.messageId,
+          message?.messageId,
+          message?.serverMessageId,
+          message?.metadata?.messageId,
+          message?.metadata?.serverMessageId,
+          message?.messageAnalytics?.serverMessageId,
+          message?.messageAnalytics?.analyticsMessageId,
+        ].filter((value) => value !== undefined && value !== null).map((value) => String(value));
+      }
+      function uuidBytes(uuid) {
+        const hex = String(uuid || "").replace(/-/g, "");
+        if (!/^[0-9a-f]{32}$/i.test(hex)) return undefined;
+        const bytes = new Uint8Array(16);
+        for (let i = 0; i < 16; i++) bytes[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+        return bytes;
+      }
+      function findEncryptionInfo(value, seen = new Set(), depth = 0) {
+        if (!value || typeof value !== "object" || seen.has(value) || depth > 10) return undefined;
+        seen.add(value);
+        if (value.encryptionInfo?.key !== undefined && value.encryptionInfo?.iv !== undefined) return value.encryptionInfo;
+        if (value.key !== undefined && value.iv !== undefined && /encrypt/i.test(Object.keys(value).join(" "))) return value;
+        for (const key of Object.keys(value)) {
+          if (!/(media|content|encrypt|message|metadata|attachment|reference|snap)/i.test(key)) continue;
+          const found = findEncryptionInfo(value[key], seen, depth + 1);
+          if (found) return found;
+        }
+        if (Array.isArray(value)) {
+          for (const item of value) {
+            const found = findEncryptionInfo(item, seen, depth + 1);
+            if (found) return found;
+          }
+        }
+        return undefined;
+      }
+      function summarizeEncryptionInfo(info) {
+        if (!info) return { present: false };
+        const keyBytes = bytesView(info.key);
+        const ivBytes = bytesView(info.iv);
+        return {
+          present: true,
+          fieldNames: Object.keys(info).sort(),
+          keyLength: keyBytes?.byteLength ?? info.key?.length ?? 0,
+          ivLength: ivBytes?.byteLength ?? info.iv?.length ?? 0,
+          hasHash: Object.keys(info).some((key) => /hash|mac|digest|checksum|integrity/i.test(key)),
+        };
+      }
+      function appStateFromRequire(webpackRequire) {
+        for (const moduleId of [96821, 97003]) {
+          try {
+            const state = webpackRequire(moduleId)?.M?.getState?.();
+            if (state) return state;
+          } catch {}
+        }
+        return undefined;
+      }
+      function findMessage(appState) {
+        const conversations = appState?.messaging?.conversations || {};
+        const possibleConversations = chatId
+          ? [conversations[chatId], conversations[String(chatId)], ...Object.values(conversations).filter((item) => String(item?.conversationId?.str || item?.conversationId || item?.id || "") === chatId)]
+          : Object.values(conversations);
+        for (const conversation of possibleConversations.filter(Boolean)) {
+          const collections = [
+            conversation?.messages,
+            conversation?.messageList,
+            conversation?.conversationMessages,
+            conversation?.items,
+            conversation?.entries,
+            conversation?.messagesById && Object.values(conversation.messagesById),
+          ];
+          for (const collection of collections) {
+            const values = collection instanceof Map ? Array.from(collection.values()) : Array.isArray(collection) ? collection : [];
+            for (const message of values) {
+              if (!messageId || messageIds(message).includes(messageId)) return message;
+            }
+          }
+        }
+        return undefined;
+      }
+      async function loadConversation(appState, messagingModule) {
+        if (!chatId) return;
+        const feedItem = appState?.messaging?.feed?.[chatId];
+        const conversationRef = feedItem?.conversationId || { id: uuidBytes(chatId), str: chatId };
+        if (!conversationRef?.id) return;
+        if (typeof messagingModule?.uk === "function" && appState?.messaging?.client) {
+          try {
+            return await Promise.race([
+              messagingModule.uk(appState.messaging.client, conversationRef),
+              new Promise((_, reject) => setTimeout(() => reject(new Error("fetch_messages_timeout")), 60000)),
+            ]);
+          } catch (error) {
+            return { error: String(error?.message || error).slice(0, 160) };
+          }
+        }
+        if (typeof appState?.messaging?.fetchConversation !== "function") return;
+        try {
+          return await Promise.race([
+            appState.messaging.fetchConversation(conversationRef),
+            new Promise((_, reject) => setTimeout(() => reject(new Error("fetch_conversation_timeout")), 30000)),
+          ]);
+        } catch (error) {
+          return { error: String(error?.message || error).slice(0, 160) };
+        }
+      }
+      function sanitizeError(value) {
+        const text = String(value?.message || value || "").replace(/\s+/g, " ").trim().slice(0, 240);
+        return text.replace(/[A-Za-z0-9+/=_.-]{24,}/g, "[redacted]");
+      }
+      const callbackStatusNames = ["INTERNALERROR", "UNAUTHORIZED", "TIMEOUT", "RETRYFAILURE", "INVALID", "UNAVAILABLE", "DUPLICATEREQUEST", "NOTFOUND", "STORAGEFULL", "UNEXPECTEDDATABASEERROR", "CORRUPTEDDATABASEERROR", "CANCELED", "SENDCANCELED"];
+      function errorDiagnostics(error) {
+        if (!error) {
+          return {};
+        }
+        const raw = String(error?.message || error);
+        const status = error?.callbackStatus;
+        return {
+          errorName: error?.name || undefined,
+          errorCallbackStatus: typeof status === "number" && status >= 0 && status < callbackStatusNames.length
+            ? `${status}(${callbackStatusNames[status]})`
+            : (status !== undefined && status !== null ? String(status).slice(0, 40) : undefined),
+          errorRawLength: raw.length,
+          error: sanitizeError(error),
+        };
+      }
+      function messageStructure(message) {
+        if (!message || typeof message !== "object") {
+          return { type: typeof message };
+        }
+        const structural = {};
+        for (const key of Object.keys(message)) {
+          if (!/(id|time|sequence|order|sort|cursor|anchor|older|newer|page|index|position|server)/i.test(key)) {
+            continue;
+          }
+          const value = message[key];
+          if (value === undefined || value === null || typeof value === "object") {
+            structural[key] = value === null ? "null" : typeof value;
+          } else {
+            structural[key] = String(value).slice(0, 40);
+          }
+        }
+        return {
+          keys: Object.keys(message).slice(0, 80),
+          identifiers: messageIds(message),
+          descriptorKeys: message?.descriptor ? Object.keys(message.descriptor).slice(0, 40) : undefined,
+          descriptorMessageId: message?.descriptor?.messageId !== undefined ? String(message.descriptor.messageId).slice(0, 40) : undefined,
+          structural,
+        };
+      }
+      function pageDiagnostics(page, pageNumber) {
+        const messages = Array.isArray(page?.messages) ? page.messages : [];
+        return {
+          pageNumber,
+          messagesReturned: messages.length,
+          firstMessageId: messages.length ? messageIds(messages[0])[0] || "" : "",
+          lastMessageId: messages.length ? messageIds(messages[messages.length - 1])[0] || "" : "",
+          hasMoreMessages: Boolean(page?.hasMoreMessages),
+          targetFound: messages.some((item) => messageIds(item).includes(messageId)),
+          ...(page?.error ? errorDiagnostics(page.error) : {}),
+          ...(page?.serverRequests !== undefined ? { serverRequests: page.serverRequests } : {}),
+        };
+      }
+      async function loadConversationPages(appState, messagingModule) {
+        const feedItem = appState?.messaging?.feed?.[chatId];
+        const conversationRef = feedItem?.conversationId || { id: uuidBytes(chatId), str: chatId };
+        // enterConversation (56639.Mw) intentionally NOT called: it alters
+        // active/read/display state and its manager call hangs without a
+        // server request in this debug context.
+        const enterResult = { attempted: false };
+        const first = await loadConversation(appState, messagingModule);
+        if (!first?.messages || typeof messagingModule?.Gq !== "function" || !appState?.messaging?.client) {
+          return { ...first, enter: enterResult };
+        }
+        const seen = new Map();
+        const addPage = (pageMessages) => {
+          for (const message of pageMessages || []) {
+            const key = messageIds(message)[0] || `idx:${seen.size}`;
+            if (!seen.has(key)) {
+              seen.set(key, message);
+            }
+          }
+        };
+        addPage(first.messages);
+        let page = first;
+        // Web's paginateMessages (module 76748) anchors each Gq call at
+        // KK(pageArray) = pageArray[0].descriptor.messageId, starting with the
+        // uk page-1 array's first element, not the last.
+        let anchor = messageIds(page.messages[0])[0];
+        const pages = [pageDiagnostics(first, 1)];
+        for (let i = 1; i < 10 && seen.size < 300; i++) {
+          if (pages[pages.length - 1].targetFound) break;
+          if (!page?.hasMoreMessages || !anchor) break;
+          let serverRequests = 0;
+          const pagePromise = (async () => {
+            const manager = await Promise.resolve(appState.messaging.client.getConversationManager?.());
+            const BX = webpackRequire(62347)?.BX;
+            return new Promise((resolve, reject) => {
+              manager.fetchConversationWithMessagesPaginated(
+                conversationRef,
+                anchor,
+                40,
+                BX({
+                  onServerRequest: () => { serverRequests += 1; },
+                  onFetchConversationWithMessagesComplete: (conversation, messages, more) => {
+                    resolve({ messages, conversation, hasMoreMessages: more, serverRequests });
+                  },
+                  onError: (status) => {
+                    reject(Object.assign(new Error(`onError:${status}`), { callbackStatus: status }));
+                  },
+                }),
+              );
+            });
+          })();
+          try {
+            page = await Promise.race([
+              pagePromise,
+              new Promise((_, reject) => setTimeout(() => reject(new Error("pagination_race_timeout")), 55000)),
+            ]);
+          } catch (error) {
+            page = /pagination_race_timeout/.test(String(error?.message || error))
+              ? { error: new Error("pagination_race_timeout"), messages: [], hasMoreMessages: false, serverRequests }
+              : { error, messages: [], hasMoreMessages: false, serverRequests };
+          }
+          const pageMessages = Array.isArray(page?.messages) ? page.messages : [];
+          addPage(pageMessages);
+          pages.push(pageDiagnostics({ ...page, messages: pageMessages }, i + 1));
+          if (!pageMessages.length) {
+            break;
+          }
+          anchor = messageIds(pageMessages[0])[0];
+        }
+        return {
+          enter: enterResult,
+          error: page?.error,
+          hasMoreMessages: Boolean(page?.hasMoreMessages),
+          messages: Array.from(seen.values()),
+          pages,
+        };
+      }
+      async function loadMessage(appState, messagingModule) {
+        if (!chatId || !messageId || typeof messagingModule?.A_ !== "function" || !appState?.messaging?.client) return;
+        const feedItem = appState?.messaging?.feed?.[chatId];
+        const conversationRef = feedItem?.conversationId || { id: uuidBytes(chatId), str: chatId };
+        if (!conversationRef?.id) return;
+        try {
+          return await Promise.race([
+            messagingModule.A_(appState.messaging.client, conversationRef, messageId),
+            new Promise((_, reject) => setTimeout(() => reject(new Error("fetch_message_timeout")), 30000)),
+          ]);
+        } catch (error) {
+          return { error: String(error?.message || error).slice(0, 160) };
+        }
+      }
+      function feedStructure(appState) {
+        const feedItem = appState?.messaging?.feed?.[chatId];
+        if (!feedItem || typeof feedItem !== "object") {
+          return { present: false };
+        }
+        const shape = (value, depth = 0) => {
+          if (value === null || value === undefined) {
+            return String(value);
+          }
+          if (value instanceof Uint8Array) {
+            return `Uint8Array(${value.byteLength})`;
+          }
+          if (Array.isArray(value)) {
+            return `array(${value.length})`;
+          }
+          if (typeof value !== "object" || depth > 1) {
+            return typeof value === "string" || typeof value === "number" || typeof value === "boolean"
+              ? `${typeof value}:${String(value).slice(0, 24)}`
+              : typeof value;
+          }
+          const out = {};
+          for (const key of Object.keys(value).slice(0, 40)) {
+            out[key] = shape(value[key], depth + 1);
+          }
+          return out;
+        };
+        return {
+          present: true,
+          feedItemKeys: Object.keys(feedItem).slice(0, 40),
+          conversationIdShape: shape(feedItem?.conversationId),
+          conversationShape: shape(feedItem?.conversation),
+        };
+      }
+      async function paginatedMethodInfo(appState) {
+        try {
+          let manager = appState?.messaging?.client?.getConversationManager?.();
+          if (manager && typeof manager.then === "function") {
+            manager = await manager;
+          }
+          const fn = manager?.fetchConversationWithMessagesPaginated;
+          const methodNames = manager && typeof manager === "object"
+            ? [
+                ...Object.keys(manager),
+                ...(Object.getPrototypeOf(manager) ? Object.getOwnPropertyNames(Object.getPrototypeOf(manager)) : []),
+              ].filter((name) => /fetch|paginat|sync|message/i.test(name))
+            : [];
+          return {
+            hasManager: Boolean(manager),
+            managerType: manager?.constructor?.name || "",
+            hasMethod: typeof fn,
+            arity: typeof fn === "function" ? fn.length : undefined,
+            fetchSyncMethodNames: methodNames.slice(0, 40),
+          };
+        } catch (error) {
+          return { error: sanitizeError(error) };
+        }
+      }
+      function stateDiagnostics(appState, loadedConversation) {
+        const conversations = appState?.messaging?.conversations || {};
+        const conversation = conversations[chatId] || conversations[String(chatId)];
+        const collections = conversation ? [
+          conversation?.messages,
+          conversation?.messageList,
+          conversation?.conversationMessages,
+          conversation?.items,
+          conversation?.entries,
+          conversation?.messagesById && Object.values(conversation.messagesById),
+        ] : [];
+        return {
+          hasFeedItem: Boolean(appState?.messaging?.feed?.[chatId]),
+          conversationCount: Object.keys(conversations).length,
+          hasConversation: Boolean(conversation),
+          conversationKeys: Object.keys(conversation || {}).slice(0, 40),
+          collectionLengths: collections.map((collection) => collection instanceof Map ? collection.size : Array.isArray(collection) ? collection.length : 0),
+          loadedConversationType: loadedConversation?.constructor?.name || typeof loadedConversation,
+          loadedConversationKeys: loadedConversation && typeof loadedConversation === "object" ? Object.keys(loadedConversation).slice(0, 40) : [],
+          loadedMessageCount: Array.isArray(loadedConversation?.messages) ? loadedConversation.messages.length : 0,
+          pages: loadedConversation?.pages || [],
+          hasMoreMessages: Boolean(loadedConversation?.hasMoreMessages),
+          enter: loadedConversation?.enter || undefined,
+        };
+      }
+
+      const webpackRequire = findWebpackRequire();
+      if (!webpackRequire?.m) return { ok: false, error: "webpack modules not found" };
+      const cryptoModule = webpackRequire(60446);
+      const resolver = webpackRequire(24977);
+      const requestHelper = webpackRequire(17196);
+      const messagingModule = webpackRequire(56639);
+      if (typeof cryptoModule?.Am !== "function" || typeof cryptoModule?.Ys !== "function") return { ok: false, error: "decrypt exports missing" };
+      if (typeof resolver?.hB !== "function" || typeof requestHelper?.u9 !== "function") return { ok: false, error: "download exports missing" };
+
+      const appState = appStateFromRequire(webpackRequire);
+      const suppliedKeyIv = Boolean(mediaKeyB64 && mediaIVB64);
+      function bytesFromBase64(value) {
+        const binary = atob(value);
+        const bytes = new Uint8Array(binary.length);
+        for (let index = 0; index < binary.length; index += 1) {
+          bytes[index] = binary.charCodeAt(index);
+        }
+        return bytes;
+      }
+      let suppliedKey;
+      let suppliedIV;
+      if (suppliedKeyIv) {
+        suppliedKey = bytesFromBase64(mediaKeyB64);
+        suppliedIV = bytesFromBase64(mediaIVB64);
+      }
+      let message;
+      let loadedMessage;
+      let loadedConversation;
+      let encryptionInfo;
+      let encryptionSummary;
+      if (suppliedKeyIv) {
+        // Native-side decoded metadata: skip all message lookup/pagination.
+        encryptionInfo = { key: suppliedKey, iv: suppliedIV, suppliedViaBody: true };
+        encryptionSummary = {
+          present: true,
+          suppliedViaBody: true,
+          fieldNames: ["iv", "key"],
+          keyLength: suppliedKey.byteLength,
+          ivLength: suppliedIV.byteLength,
+          hasHash: false,
+        };
+      } else {
+        message = findMessage(appState);
+        if (!message) {
+          loadedMessage = await loadMessage(appState, messagingModule);
+          if (loadedMessage && !loadedMessage.error) {
+            message = loadedMessage;
+          }
+        }
+        if (!message) {
+          loadedConversation = await loadConversationPages(appState, messagingModule);
+          message = findMessage(appStateFromRequire(webpackRequire))
+            || findMessage({ messaging: { conversations: { [chatId]: loadedConversation } } })
+            || (Array.isArray(loadedConversation?.messages) ? loadedConversation.messages.find((item) => !messageId || messageIds(item).includes(messageId)) : undefined);
+        }
+        encryptionInfo = findEncryptionInfo(message);
+        encryptionSummary = summarizeEncryptionInfo(encryptionInfo);
+      }
+      if (!encryptionInfo) {
+        const stateNow = appStateFromRequire(webpackRequire);
+        return {
+          ok: false,
+          stage: "encryptionInfo",
+          messageFound: Boolean(message),
+          encryptionInfo: encryptionSummary,
+          state: stateDiagnostics(stateNow, loadedConversation),
+          feedStructure: feedStructure(stateNow),
+          page1MessageStructure: messageStructure(Array.isArray(loadedConversation?.messages) ? loadedConversation.messages[0] : undefined),
+          paginatedMethod: await paginatedMethodInfo(stateNow),
+          loadedMessageType: loadedMessage?.constructor?.name || typeof loadedMessage,
+          loadedMessageKeys: loadedMessage && typeof loadedMessage === "object" ? Object.keys(loadedMessage).slice(0, 40) : [],
+        };
+      }
+
+      const contentObject = bytesFromHex(descriptorHex);
+      const signedUrl = await resolver.hB(contentObject, metricsContext);
+      const response = await requestHelper.u9(new Request(signedUrl), 60000, `media_download_for_${metricsContext}_codex_decrypt_probe`);
+      const encrypted = await response.arrayBuffer();
+      const keyIvPair = await cryptoModule.Am(encryptionInfo.key, encryptionInfo.iv);
+      const decrypted = await cryptoModule.Ys(encrypted, keyIvPair, metricsContext);
+      return {
+        ok: true,
+        pageOrigin: location.origin,
+        messageFound: Boolean(message),
+        keySource: suppliedKeyIv ? "native-api-body" : "message-state",
+        pages: loadedConversation?.pages || [],
+        encryptionInfo: {
+          ...encryptionSummary,
+          algorithm: keyIvPair.key?.algorithm?.name || "",
+          padding: "WebCrypto AES-CBC default PKCS#7 validation/removal",
+          integrityCheck: encryptionSummary.hasHash ? "field-present-not-checked-by-60446.Ys" : "none-in-60446-path",
+        },
+        url: summarizeUrl(signedUrl),
+        httpStatus: response.status,
+        contentType: response.headers.get("content-type") || "",
+        encryptedByteCount: encrypted.byteLength,
+        encryptedSniff: sniff(encrypted, response.headers.get("content-type") || ""),
+        decryptedByteCount: decrypted.byteLength,
+        decryptedSniff: sniff(decrypted),
+      };
+    }, { descriptorHex, messageId, chatId, metricsContext, mediaKeyB64, mediaIVB64 });
+  }, { priority: 0, timeoutMs: 600000, label: "debug/media-decrypt" });
+}
+
   return {
     getBrowserStorageSummary,
     searchBrowserBundle,
@@ -1581,5 +2094,6 @@ async function debugMediaSignedDownload(payload) {
     deriveBrowserE2EESharedSecret,
     debugMediaResolve,
     debugMediaSignedDownload,
+    debugMediaDecrypt,
   };
 }

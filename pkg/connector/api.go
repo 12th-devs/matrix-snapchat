@@ -51,6 +51,7 @@ type SnapchatAPI struct {
 	Client    *sidecar.Client
 
 	apiMu                    sync.Mutex
+	resyncMu                 sync.Mutex
 	apiClient                *snapapi.Client
 	apiCookieString          string
 	apiAuthCheckedAt         time.Time

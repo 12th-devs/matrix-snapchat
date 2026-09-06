@@ -13,6 +13,7 @@ import (
 	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/networkid"
+	"maunium.net/go/mautrix/bridgev2/status"
 )
 
 const apiAuthRetryWindow = 45 * time.Second
@@ -235,8 +236,35 @@ func (sa *SnapchatAPI) recordRecentOutgoing(chatID, body, remoteID string) {
 	sa.recentOutgoing[chatID] = filtered
 }
 
-func (sa *SnapchatAPI) shouldSuppressOutgoingEcho(chatID string, message sidecar.Message) bool {
-	if !message.Outgoing {
+// hasExactRecentOutgoingRemoteID reports whether this exact remote message ID
+// was recently recorded as sent by this login. It is a read-only fast path so
+// outgoing echoes can skip media descriptor resolution, CDN download, and
+// decryption before any Matrix conversion. Only an exact RemoteID match counts;
+// messages sent from another Snapchat device/session never match.
+func (sa *SnapchatAPI) hasExactRecentOutgoingRemoteID(chatID, remoteID string) bool {
+	if sa == nil || chatID == "" {
+		return false
+	}
+	remoteID = baseSnapchatMessageID(remoteID)
+	if remoteID == "" {
+		return false
+	}
+	now := time.Now()
+	cutoff := now.Add(-15 * time.Minute)
+	sa.mu.Lock()
+	defer sa.mu.Unlock()
+	for _, item := range sa.recentOutgoing[chatID] {
+		if item.SentAt.Before(cutoff) {
+			continue
+		}
+		if item.RemoteID != "" && item.RemoteID == remoteID {
+			return true
+		}
+	}
+	return false
+}
+
+func (sa *SnapchatAPI) shouldSuppressOutgoingEcho(chatID string, message sidecar.Message) bool {	if !message.Outgoing {
 		return false
 	}
 	chatID = strings.TrimSpace(chatID)
@@ -595,6 +623,7 @@ func (sa *SnapchatAPI) ensureSnapClient(ctx context.Context) (*snapapi.Client, e
 	if strings.TrimSpace(auth.MCSCOFIDsBin) == "" {
 		return nil, fmt.Errorf("connector API auth did not return messenger headers; wait for browser messenger warmup and retry")
 	}
+	sa.applyResolvedRemoteName(ctx, auth.DisplayName, auth.Username)
 	if selfUserID != "" {
 		sa.mu.Lock()
 		sa.apiSelfUserID = selfUserID
@@ -880,6 +909,72 @@ func (sa *SnapchatAPI) persistChat(chat sidecar.Chat) {
 	}
 }
 
+func (sa *SnapchatAPI) applyResolvedRemoteName(ctx context.Context, displayName, username string) {
+	if sa == nil || sa.UserLogin == nil {
+		return
+	}
+	applyRemoteNameUpdate(ctx, remoteNameLoginAdapter{sa.UserLogin}, displayName, username)
+}
+
+type remoteNameUpdater interface {
+	RemoteName() string
+	SetRemoteName(name string)
+	Save(ctx context.Context) error
+	SendConnectedState()
+}
+
+type remoteNameLoginAdapter struct{ ul *bridgev2.UserLogin }
+
+func (a remoteNameLoginAdapter) RemoteName() string {
+	return a.ul.RemoteName
+}
+
+func (a remoteNameLoginAdapter) SetRemoteName(name string) {
+	a.ul.RemoteName = name
+}
+
+func (a remoteNameLoginAdapter) Save(ctx context.Context) error {
+	return a.ul.Save(ctx)
+}
+
+func (a remoteNameLoginAdapter) SendConnectedState() {
+	a.ul.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
+}
+
+func applyRemoteNameUpdate(ctx context.Context, login remoteNameUpdater, displayName, username string) {
+	name := resolvedRemoteName(displayName, username)
+	if login.RemoteName() == name {
+		return
+	}
+	log.Printf("bridgev2 login: updating login RemoteName from %q to self profile name %q", login.RemoteName(), name)
+	login.SetRemoteName(name)
+	if err := login.Save(ctx); err != nil {
+		log.Printf("bridgev2 login: failed to save updated RemoteName: %v", err)
+		return
+	}
+	login.SendConnectedState()
+}
+
+func resolvedRemoteName(displayName, username string) string {
+	name := strings.TrimSpace(displayName)
+	if name == "" {
+		name = strings.TrimSpace(username)
+	}
+	if name == "" {
+		name = "Snapchat"
+	}
+	return name
+}
+
+func isGenericRemoteName(name string) bool {
+	switch strings.TrimSpace(name) {
+	case "", "Snapchat", "Snapchat Web", "sh-snapchat":
+		return true
+	default:
+		return false
+	}
+}
+
 func (sa *SnapchatAPI) updateLoginState(status *sidecar.SessionStatus) {
 	if status == nil {
 		return
@@ -889,10 +984,14 @@ func (sa *SnapchatAPI) updateLoginState(status *sidecar.SessionStatus) {
 		meta.LastURL = status.URL
 	}
 	if sa.Connector != nil && sa.Connector.store != nil {
+		remoteName := resolvedRemoteName("", "")
+		if existing, err := sa.Connector.store.GetLogin(string(makeUserLoginID(sa.Label))); err == nil && existing != nil && !isGenericRemoteName(existing.RemoteName) {
+			remoteName = existing.RemoteName
+		}
 		_ = sa.Connector.store.UpsertLogin(store.LoginState{
 			UserID:        string(makeUserLoginID(sa.Label)),
 			RemoteID:      status.URL,
-			RemoteName:    "Snapchat Web",
+			RemoteName:    remoteName,
 			SessionJSON:   store.MarshalJSON(status),
 			LastSeenState: status.State,
 		})
