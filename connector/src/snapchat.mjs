@@ -3688,6 +3688,8 @@ export async function startRealtimeProbe(options = {}) {
       startedAt: realtimeProbe.startedAt,
       cdpAttached: realtimeProbe.cdpAttached,
       injected: realtimeProbe.injected,
+      decodedHookInstalled: realtimeProbe.decodedHookInstalled,
+      decodedHookReinitialized: realtimeProbe.decodedHookReinitialized,
       url: realtimeProbe.url,
     };
   }, { priority: 0, timeoutMs: 15000, label: "startRealtimeProbe" });
@@ -3700,6 +3702,8 @@ export async function getRealtimeProbe() {
     url: realtimeProbe?.url || "",
     cdpAttached: Boolean(realtimeProbe?.cdpAttached),
     injected: Boolean(realtimeProbe?.injected),
+    decodedHookInstalled: Boolean(realtimeProbe?.decodedHookInstalled),
+    decodedHookReinitialized: Boolean(realtimeProbe?.decodedHookReinitialized),
     events: realtimeProbe?.events || [],
   };
 }
