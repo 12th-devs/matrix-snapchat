@@ -149,14 +149,46 @@ EOF
     chmod 600 "${runtime_env}"
 }
 
+# Caller-overridable runtime variables. Session state (shared secrets,
+# connector base URL) stays env-file-authoritative because it must match the
+# running connector; feature flags follow the precedence
+# explicit caller environment > persisted env file > script default.
+overridable_runtime_variables() {
+    printf '%s\n' \
+        SNAPCHAT_BRIDGE_CONFIG \
+        SNAPCHAT_READ_RECEIPTS_ENABLED \
+        SNAPCHAT_SNAP_MEDIA_ENABLED \
+        SNAPCHAT_SNAP_MEDIA_ON_READ \
+        SNAPCHAT_SEND_MEDIA_ENABLED
+}
+
+# caller_runtime_overrides emits NAME=value pairs for overridable variables
+# that the caller explicitly placed in the environment.
+caller_runtime_overrides() {
+    local variable
+    while IFS= read -r variable; do
+        if [[ -n "${!variable+x}" ]]; then
+            printf '%s=%s\n' "${variable}" "${!variable}"
+        fi
+    done < <(overridable_runtime_variables)
+}
+
 load_runtime_env() {
     if [[ ! -f "${runtime_env}" ]]; then
         echo "Runtime env file not found at ${runtime_env}" >&2
         echo "Run '$0 full' first to create a connector session, or restart the full stack." >&2
         exit 1
     fi
+    local caller_overrides
+    caller_overrides="$(caller_runtime_overrides)"
     # shellcheck disable=SC1090
     source "${runtime_env}"
+    if [[ -n "${caller_overrides}" ]]; then
+        # Restore explicit caller overrides clobbered by sourcing the file.
+        while IFS= read -r entry; do
+            export "${entry?}"
+        done <<<"${caller_overrides}"
+    fi
     if [[ -z "${SNAPCHAT_SHARED_SECRET:-}" || -z "${SNAPCHAT_CONNECTOR_BASE_URL:-}" ]]; then
         echo "Runtime env file ${runtime_env} is incomplete" >&2
         exit 1
@@ -181,6 +213,9 @@ sync_runtime_env_from_running_bridge() {
 		return 1
 	fi
 	for value in SNAPCHAT_BRIDGE_CONFIG SNAPCHAT_READ_RECEIPTS_ENABLED SNAPCHAT_SNAP_MEDIA_ENABLED SNAPCHAT_SNAP_MEDIA_ON_READ SNAPCHAT_SEND_MEDIA_ENABLED; do
+		if printf '%s\n' "${caller_runtime_overrides}" | grep -aqs "^${value}="; then
+			continue # explicit caller override wins over the old process env
+		fi
 		if proc_value="$(printf '%s\n' "${proc_env}" | sed -n "s/^${value}=//p" | head -n 1)" && [[ -n "${proc_value}" ]]; then
 			export "${value}=${proc_value}"
 		fi
@@ -284,6 +319,7 @@ start_connector() {
 \$env:SNAPCHAT_HEADLESS = "${SNAPCHAT_HEADLESS:-false}"
 \$env:SNAPCHAT_SAFE_NO_OPEN = "1"
 \$env:SNAPCHAT_SHARED_SECRET = "${SNAPCHAT_SHARED_SECRET}"
+\$env:SNAPCHAT_REALTIME_ENABLED = "${SNAPCHAT_REALTIME_ENABLED:-false}"
 \$process = Start-Process -FilePath "${node_windows}" -ArgumentList "src/index.mjs" -WorkingDirectory "${repo_windows}\\connector" -RedirectStandardOutput "${connector_stdout_windows}" -RedirectStandardError "${connector_stderr_windows}" -WindowStyle Hidden -PassThru
 Set-Content -LiteralPath "${connector_pid_windows}" -Value ([string]\$process.Id) -Encoding ascii
 EOF
@@ -393,8 +429,8 @@ case "${mode}" in
         require_paths
         configure_bridge_runtime
         load_runtime_env
-        SNAPCHAT_SNAP_MEDIA_ENABLED=true
-        SNAPCHAT_SNAP_MEDIA_ON_READ=false
+        SNAPCHAT_SNAP_MEDIA_ENABLED="${SNAPCHAT_SNAP_MEDIA_ENABLED:-true}"
+        SNAPCHAT_SNAP_MEDIA_ON_READ="${SNAPCHAT_SNAP_MEDIA_ON_READ:-false}"
         SNAPCHAT_SEND_MEDIA_ENABLED="${SNAPCHAT_SEND_MEDIA_ENABLED:-false}"
         export SNAPCHAT_SNAP_MEDIA_ENABLED SNAPCHAT_SNAP_MEDIA_ON_READ SNAPCHAT_SEND_MEDIA_ENABLED
         write_runtime_env_values "${SNAPCHAT_SHARED_SECRET}" "${SNAPCHAT_CONNECTOR_BASE_URL}"
