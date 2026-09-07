@@ -482,10 +482,20 @@ func (sa *SnapchatAPI) matrixMediaToSend(ctx context.Context, msg *bridgev2.Matr
 	if msg == nil || msg.Content == nil {
 		return sidecar.MediaAttachment{}, "", false, nil
 	}
+	// Sticker-shaped events (m.sticker events and msgtype-less media, both
+	// mapped to CapMsgSticker by the caps gate) carry a plain image payload
+	// and ride the ordinary image path.
+	if msg.Content.MsgType == event.CapMsgSticker ||
+		(msg.Content.MsgType == "" && (msg.Content.URL != "" || msg.Content.File != nil)) {
+		msg.Content.MsgType = event.MsgImage
+	}
 	switch msg.Content.MsgType {
-	case event.MsgImage:
-	case event.MsgVideo, event.MsgFile:
-		return sidecar.MediaAttachment{}, "", true, fmt.Errorf("outbound Snapchat media supports only images in this version (got %s)", msg.Content.MsgType)
+	case event.MsgImage, event.MsgVideo:
+	case event.MsgAudio:
+		// Beeper voice notes arrive as m.audio (MSC3245 voice marker is not
+		// required); they are forwarded as Snapchat voice notes.
+	case event.MsgFile:
+		return sidecar.MediaAttachment{}, "", true, fmt.Errorf("outbound Snapchat media supports only images, MP4 video, and voice notes in this version (got %s)", msg.Content.MsgType)
 	default:
 		return sidecar.MediaAttachment{}, "", false, nil
 	}
@@ -515,8 +525,15 @@ func (sa *SnapchatAPI) matrixMediaToSend(ctx context.Context, msg *bridgev2.Matr
 		mimeType = strings.TrimSpace(msg.Content.Info.MimeType)
 	}
 	mimeType = normalizeMediaMIME(data, mimeType)
-	if mimeType != "image/jpeg" {
-		return sidecar.MediaAttachment{}, "", true, fmt.Errorf("outbound Snapchat media supports only image/jpeg in this version (got %q)", mimeType)
+	if msg.Content.MsgType == event.MsgAudio {
+		// Go's sniffer classifies any ftyp container (audio-only included)
+		// as video/mp4; a voice note must reach the audio classifier.
+		if mimeType == "video/mp4" {
+			mimeType = "audio/mp4"
+		}
+	}
+	if mimeType != "image/jpeg" && mimeType != "image/png" && mimeType != "image/webp" && mimeType != "video/mp4" && mimeType != "audio/mp4" {
+		return sidecar.MediaAttachment{}, "", true, fmt.Errorf("outbound Snapchat media supports only image/jpeg, image/png, image/webp, video/mp4, and audio/mp4 voice notes (got %q)", mimeType)
 	}
 	fileName := strings.TrimSpace(msg.Content.FileName)
 	if fileName == "" {

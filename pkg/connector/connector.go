@@ -314,7 +314,7 @@ func (sc *SnapchatConnector) resetSyncState() error {
 
 func (sc *SnapchatConnector) chatCapabilities() *event.RoomFeatures {
 	features := &event.RoomFeatures{
-		ID:            "fi.mau.snapchat.capabilities.2026_08_30_2",
+		ID:            "fi.mau.snapchat.capabilities.2026_09_06_3",
 		MaxTextLength: 5000,
 		// Replies are real Snapchat protocol operations: outbound replies attach
 		// FeatureAttachment.ReplyMessageInfo (QuotedMessageId) on
@@ -338,9 +338,9 @@ func (sc *SnapchatConnector) chatCapabilities() *event.RoomFeatures {
 			"image/jpeg": event.CapLevelFullySupported,
 			"image/png":  event.CapLevelFullySupported,
 			"image/gif":  event.CapLevelFullySupported,
-			"image/webp": event.CapLevelPartialSupport,
+			"image/webp": event.CapLevelFullySupported,
 			"image/*":    event.CapLevelPartialSupport,
-			"video/mp4":  event.CapLevelPartialSupport,
+			"video/mp4":  event.CapLevelFullySupported,
 			"video/*":    event.CapLevelPartialSupport,
 		}
 		mediaFeatures := &event.FileFeatures{
@@ -351,9 +351,25 @@ func (sc *SnapchatConnector) chatCapabilities() *event.RoomFeatures {
 			ViewOnce:         true,
 		}
 		features.File = event.FileFeatureMap{
-			event.MsgImage: mediaFeatures,
-			event.MsgVideo: mediaFeatures,
-			event.MsgFile:  mediaFeatures,
+			event.MsgImage:      mediaFeatures,
+			event.MsgVideo:      mediaFeatures,
+			event.MsgFile:       mediaFeatures,
+			event.CapMsgSticker: mediaFeatures,
+		}
+		// Voice notes (MSC3245): the note wire shape is confirmed, but the
+		// accepted audio/mp4 container is an experimental first format
+		// (Snapchat Web's own recorder could not be inspected). ogg/webm are
+		// advertised as partial because the container question is still open;
+		// they are rejected cleanly without transcoding until proven.
+		features.File[event.CapMsgVoice] = &event.FileFeatures{
+			MimeTypes: map[string]event.CapabilitySupportLevel{
+				"audio/mp4":  event.CapLevelFullySupported,
+				"audio/ogg":  event.CapLevelPartialSupport,
+				"audio/webm": event.CapLevelPartialSupport,
+			},
+			Caption:          event.CapLevelDropped,
+			MaxCaptionLength: 5000,
+			MaxSize:          16 * 1024 * 1024,
 		}
 	}
 	return features

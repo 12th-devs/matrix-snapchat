@@ -2,7 +2,7 @@
 network:
     # Snapchat Web sidecar connector
     base_url: "http://connector:3101"
-    shared_secret: "1225"
+    shared_secret: "EJrXh8MuSe-wdYhbbMG5hrub7mDECW0XTX5w8ebVzWQb3JDdMtEJPSPGvf_CQF2G"
     request_timeout_seconds: 120
     poll_interval_seconds: 2
     message_fetch_limit: 20

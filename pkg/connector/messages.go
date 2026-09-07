@@ -666,6 +666,10 @@ func (sa *SnapchatAPI) convertMessage(ctx context.Context, portal *bridgev2.Port
 				continue
 			}
 			mimeType := normalizeMediaMIME(media.Data, media.MimeType)
+			if strings.HasPrefix(media.MimeType, "audio/") && mimeType == "video/mp4" {
+				// Go's sniffer reports video/mp4 for voice-note ftyp bytes.
+				mimeType = media.MimeType
+			}
 			msgType := matrixMsgTypeForMedia(mimeType)
 			fileName := mediaFileNameForMIME(media.FileName, msgType, mimeType)
 			mxc, file, err := uploadIntent.UploadMedia(ctx, portal.MXID, media.Data, fileName, mimeType)
@@ -692,7 +696,7 @@ func (sa *SnapchatAPI) convertMessage(ctx context.Context, portal *bridgev2.Port
 				// for encrypted media, so don't use "New Snap" as the body here.
 				partBody = fileName
 			}
-			parts = append(parts, &bridgev2.ConvertedMessagePart{
+			part := &bridgev2.ConvertedMessagePart{
 				ID:         mediaPartID(len(parts)),
 				DBMetadata: &MediaDeliveryMetadata{MediaDelivered: true, AttachmentCount: len(message.Media), PresentationVersion: 1},
 				Type:       event.EventMessage,
@@ -707,7 +711,14 @@ func (sa *SnapchatAPI) convertMessage(ctx context.Context, portal *bridgev2.Port
 						Size:     len(media.Data),
 					},
 				},
-			})
+			}
+			if msgType == event.MsgAudio {
+				// MSC3245 voice marker so clients render the voice-note UI.
+				part.Extra = map[string]any{
+					"org.matrix.msc3245.voice": map[string]any{},
+				}
+			}
+			parts = append(parts, part)
 		}
 		if len(parts) > 0 {
 			if len(parts) != len(message.Media) {
@@ -866,6 +877,11 @@ func (sa *SnapchatAPI) downloadAPIMessageMedia(ctx context.Context, client *snap
 		}
 		fileName := strings.TrimSpace(media.FileName)
 		mimeType = normalizeMediaMIME(data, mimeType)
+		if strings.HasPrefix(media.MimeType, "audio/") && mimeType == "video/mp4" {
+			// Go's sniffer classifies any ftyp container (voice-note audio
+			// included) as video/mp4; trust the declared audio type.
+			mimeType = media.MimeType
+		}
 		fileName = mediaFileNameForMIME(fileName, matrixMsgTypeForMedia(mimeType), mimeType)
 		zerolog.Ctx(ctx).Info().
 			Str("diag", "snapchat_media").

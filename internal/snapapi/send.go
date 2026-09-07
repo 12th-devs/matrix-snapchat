@@ -9,7 +9,6 @@ import (
 	"time"
 
 	snapcrypto "github.com/0xzer/snapper/crypto"
-	"github.com/0xzer/snapper/data/paths"
 	"github.com/0xzer/snapper/protos"
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
@@ -121,7 +120,9 @@ func (c *Client) SendText(ctx context.Context, chatID, text string, replyToMessa
 // mirrors the proven Snapchat Web upload pipeline: getUploadLocations ->
 // AES-256-CBC encrypt -> PUT ciphertext -> CreateContentMessage with the
 // content object reference and the clear key/IV embedded in the message
-// contents. Only JPEG is supported in this first version.
+// contents. Snapchat Web sends JPEG, PNG and WebP bytes as-is over the
+// identical wire shape (only decoded dimensions differ), so all formats share
+// this one sender.
 func (c *Client) SendMedia(ctx context.Context, chatID string, media MediaAttachment, caption string) (string, error) {
 	if len(media.Data) == 0 {
 		return "", fmt.Errorf("missing media data")
@@ -130,15 +131,13 @@ func (c *Client) SendMedia(ctx context.Context, chatID string, media MediaAttach
 		return "", fmt.Errorf("media is too large for Snapchat send (max %d bytes)", maxOutgoingMediaSize)
 	}
 	mimeType := strings.ToLower(strings.TrimSpace(strings.Split(media.MimeType, ";")[0]))
-	if !isJPEGData(media.Data) || (mimeType != "" && mimeType != "image/jpeg" && mimeType != "image/jpg") {
-		return "", fmt.Errorf("outbound Snapchat media supports only image/jpeg in this version (got %q)", media.MimeType)
-	}
-	width, height, err := imageDimensions(media.Data)
+	info, err := classifyOutgoingMedia(media.Data, mimeType)
 	if err != nil {
 		return "", err
 	}
+	width, height := info.Width, info.Height
 	if caption != "" {
-		log.Printf("snapapi send: media caption ignored in outbound image v1 chat_id=%s", chatID)
+		log.Printf("snapapi send: media caption ignored in outbound image chat_id=%s", chatID)
 	}
 	if err := c.ensureAuthenticated(ctx); err != nil {
 		return "", err
@@ -147,6 +146,15 @@ func (c *Client) SendMedia(ctx context.Context, chatID string, media MediaAttach
 	if err != nil {
 		return "", fmt.Errorf("encrypt outgoing media: %w", err)
 	}
+	contentType := protos.ContentType_EXTERNAL_MEDIA
+	contents := encodeExternalMediaContents(mediaUploadClock(), info, encrypted.Key, encrypted.IV)
+	if info.MediaType == protos.MediaType_MEDIA_TYPE_AUDIO {
+		// Voice notes ride a separate NOTE content type with the audio
+		// metadata (and the base64 key/IV) embedded in the note itself; the
+		// encrypt/upload/reference pipeline is shared with images and video.
+		contentType = protos.ContentType_NOTE
+		contents = encodeNoteContents(info, encrypted.Key, encrypted.IV)
+	}
 	location, err := c.GetUploadLocations(ctx)
 	if err != nil {
 		return "", err
@@ -154,7 +162,8 @@ func (c *Client) SendMedia(ctx context.Context, chatID string, media MediaAttach
 	zerolog.Ctx(ctx).Info().
 		Str("diag", "outgoing_media").
 		Str("chat_id", chatID).
-		Int("jpeg_bytes", len(media.Data)).
+		Str("mime", info.MIME).
+		Int("media_bytes", len(media.Data)).
 		Int("cipher_bytes", len(encrypted.Ciphertext)).
 		Int("width", width).
 		Int("height", height).
@@ -169,6 +178,26 @@ func (c *Client) SendMedia(ctx context.Context, chatID string, media MediaAttach
 		return "", err
 	}
 	attemptID, _ := snapcrypto.EncodeUUID(uuid.NewString())
+	// The web voice-note sender sets allowsTranscription on the envelope's
+	// audio-note message-type metadata.
+	envelope := &protos.ContentEnvelope{
+		ContentType: contentType,
+		Contents:    contents,
+		MediaReferenceLists: []*protos.ContentEnvelope_MediaReferenceList{{
+			Reference: []*protos.MediaReference{{
+				ContentObject: descriptor,
+				MediaType:     info.MediaType,
+			}},
+		}},
+		DisplayInfo: &protos.ContentEnvelope_DisplayInfo{},
+		// Persistent ordinary chat image: the web capture uses LIFETIME.
+		SavePolicy: protos.ContentEnvelope_SavePolicy_LIFETIME,
+	}
+	if contentType == protos.ContentType_NOTE {
+		envelope.MessageTypeMetadata = &protos.ContentEnvelope_AudioNote{
+			AudioNote: &protos.AudioNoteMetadata{AllowsTranscription: true},
+		}
+	}
 	req := &protos.CreateContentMessageRequest{
 		SenderId:           c.selfUUID(),
 		ClientResolutionId: randomUint64(),
@@ -182,25 +211,13 @@ func (c *Client) SendMedia(ctx context.Context, chatID string, media MediaAttach
 				},
 			},
 		}},
-		Content: &protos.ContentEnvelope{
-			ContentType: protos.ContentType_EXTERNAL_MEDIA,
-			Contents:    encodeExternalMediaContents(mediaUploadClock(), width, height, encrypted.Key, encrypted.IV),
-			MediaReferenceLists: []*protos.ContentEnvelope_MediaReferenceList{{
-				Reference: []*protos.MediaReference{{
-					ContentObject: descriptor,
-					MediaType:     protos.MediaType_MEDIA_TYPE_IMAGE,
-				}},
-			}},
-			DisplayInfo: &protos.ContentEnvelope_DisplayInfo{},
-			// Persistent ordinary chat image: the web capture uses LIFETIME.
-			SavePolicy: protos.ContentEnvelope_SavePolicy_LIFETIME,
-		},
+		Content: envelope,
 		CreateContentMessageBlizzardData: &protos.CreateContentMessageBlizzardData{
 			SendMessageAttemptId: &protos.UUID{EncodedId: attemptID},
 		},
 	}
 	var resp protos.CreateContentMessageResponse
-	if err = c.doGRPC(ctx, paths.CREATE_CONTENT_MESSAGE, req, &resp); err != nil {
+	if err = c.doGRPC(ctx, createContentMessageURL, req, &resp); err != nil {
 		return "", err
 	}
 	for _, result := range resp.GetResult() {

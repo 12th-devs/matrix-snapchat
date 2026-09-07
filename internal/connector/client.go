@@ -162,6 +162,13 @@ type EELDecryptResponse struct {
 	DecryptedContentBase64 string `json:"decryptedContentBase64,omitempty"`
 	Error                  string `json:"error,omitempty"`
 	Retryable              bool   `json:"retryable,omitempty"`
+	// Decrypt-attribution diagnostics (never contain payload material).
+	Method              string `json:"method,omitempty"`
+	RequestedMessageID  string `json:"requestedMessageId,omitempty"`
+	MatchedWebMessageID string `json:"matchedWebMessageId,omitempty"`
+	MessageCount        int    `json:"messageCount,omitempty"`
+	ExactMatch          *bool  `json:"exactMatch,omitempty"`
+	ContentSource       string `json:"contentSource,omitempty"`
 }
 
 func New(cfg config.ConnectorConfig) *Client {
@@ -234,32 +241,40 @@ func (c *Client) APIAuth(ctx context.Context) (*APIAuth, error) {
 }
 
 func (c *Client) DecryptEEL(ctx context.Context, payload EELDecryptRequest) ([]byte, error) {
+	decrypted, _, err := c.DecryptEELDetailed(ctx, payload)
+	return decrypted, err
+}
+
+// DecryptEELDetailed behaves like DecryptEEL but also returns the connector's
+// decrypt-attribution diagnostics so callers can verify the plaintext really
+// belongs to the requested message.
+func (c *Client) DecryptEELDetailed(ctx context.Context, payload EELDecryptRequest) ([]byte, *EELDecryptResponse, error) {
 	if strings.TrimSpace(payload.ContentBase64) == "" {
-		return nil, fmt.Errorf("missing EEL content")
+		return nil, nil, fmt.Errorf("missing EEL content")
 	}
 	req, err := c.newRequest(ctx, http.MethodPost, "/session/eel-decrypt", payload)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	var response EELDecryptResponse
 	if err = c.doJSON(req, &response); err != nil {
-		return nil, err
+		return nil, &response, err
 	}
 	if !response.OK {
 		if response.Error == "" {
 			response.Error = "EEL decrypt failed"
 		}
-		return nil, errors.New(response.Error)
+		return nil, &response, errors.New(response.Error)
 	}
 	if response.DecryptedContentBase64 == "" {
-		return nil, fmt.Errorf("connector returned empty EEL plaintext")
+		return nil, &response, fmt.Errorf("connector returned empty EEL plaintext")
 	}
 	decrypted, err := base64.StdEncoding.DecodeString(response.DecryptedContentBase64)
 	if err != nil {
-		return nil, fmt.Errorf("decode connector EEL plaintext: %w", err)
+		return nil, &response, fmt.Errorf("decode connector EEL plaintext: %w", err)
 	}
-	return decrypted, nil
+	return decrypted, &response, nil
 }
 
 func (c *Client) ListChats(ctx context.Context) ([]Chat, error) {

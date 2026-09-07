@@ -264,7 +264,8 @@ func (sa *SnapchatAPI) hasExactRecentOutgoingRemoteID(chatID, remoteID string) b
 	return false
 }
 
-func (sa *SnapchatAPI) shouldSuppressOutgoingEcho(chatID string, message sidecar.Message) bool {	if !message.Outgoing {
+func (sa *SnapchatAPI) shouldSuppressOutgoingEcho(chatID string, message sidecar.Message) bool {
+	if !message.Outgoing {
 		return false
 	}
 	chatID = strings.TrimSpace(chatID)

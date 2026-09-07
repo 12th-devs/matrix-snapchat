@@ -1,6 +1,7 @@
 package connector
 
 import (
+	"strings"
 	"testing"
 
 	"maunium.net/go/mautrix/bridgev2"
@@ -81,5 +82,34 @@ func TestBridgeGeneratedMarkerOnlyMatchesBracketedNotices(t *testing.T) {
 		if !isBridgeGeneratedSnapchatMarker(body) {
 			t.Fatalf("isBridgeGeneratedSnapchatMarker(%q) = false; bracketed notices must match", body)
 		}
+	}
+}
+
+func TestMatrixVoiceNotePassesMsgTypeGate(t *testing.T) {
+	sa := &SnapchatAPI{Connector: &SnapchatConnector{Config: ConnectorConfig{SendMediaEnabled: true}}}
+	voice := &bridgev2.MatrixMessage{MatrixEventBase: bridgev2.MatrixEventBase[*event.MessageEventContent]{
+		Content: &event.MessageEventContent{MsgType: event.MsgAudio, Body: "voice-message.m4a", URL: "mxc://test/audio"},
+	}}
+	_, _, ok, err := sa.matrixMediaToSend(t.Context(), voice)
+	// m.audio must pass the msgtype gate and the send-media switch; with no
+	// Matrix client stub it must then stop at the missing downloader rather
+	// than being silently ignored.
+	if !ok || err == nil || !strings.Contains(err.Error(), "media downloader") {
+		t.Fatalf("m.audio gate: ok=%v err=%v; voice notes must reach the media pipeline", ok, err)
+	}
+	notice := &bridgev2.MatrixMessage{MatrixEventBase: bridgev2.MatrixEventBase[*event.MessageEventContent]{
+		Content: &event.MessageEventContent{MsgType: event.MsgNotice, Body: "hello"},
+	}}
+	if _, _, ok, err := sa.matrixMediaToSend(t.Context(), notice); ok || err != nil {
+		t.Fatalf("m.notice must stay ignored: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestDefaultMediaFileNameVoiceNote(t *testing.T) {
+	if got := defaultMediaFileName(event.MsgAudio, "audio/mp4"); got != "snap-audio.m4a" {
+		t.Fatalf("defaultMediaFileName(audio/mp4) = %q, want snap-audio.m4a", got)
+	}
+	if got := defaultMediaFileName(event.MsgAudio, "audio/ogg"); got != "snap-audio.mp3" {
+		t.Fatalf("defaultMediaFileName(audio/ogg) = %q, want snap-audio.mp3", got)
 	}
 }

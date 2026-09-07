@@ -504,6 +504,8 @@ func matrixMsgTypeForMedia(mimeType string) event.MessageType {
 		return event.MsgImage
 	case strings.HasPrefix(mimeType, "video/"):
 		return event.MsgVideo
+	case strings.HasPrefix(mimeType, "audio/"):
+		return event.MsgAudio
 	default:
 		return event.MsgFile
 	}
@@ -555,6 +557,8 @@ func defaultMediaFileName(msgType event.MessageType, mimeType string) string {
 		return "snap.mov"
 	case msgType == event.MsgVideo:
 		return "snap.mp4"
+	case msgType == event.MsgAudio && strings.Contains(lowerMime, "mp4"):
+		return "snap-audio.m4a"
 	case strings.HasPrefix(lowerMime, "audio/"):
 		return "snap-audio.mp3"
 	default:

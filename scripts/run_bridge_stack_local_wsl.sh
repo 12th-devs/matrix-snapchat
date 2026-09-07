@@ -17,7 +17,7 @@ startup_timeout_seconds="${SNAPCHAT_CONNECTOR_STARTUP_TIMEOUT_SECONDS:-180}"
 
 usage() {
     cat >&2 <<EOF
-Usage: $0 [full|bridge-only|stop]
+Usage: $0 [full|connector-only|bridge-only|stop]
 
   full         Start a fresh local stack: Windows connector/Chrome, then WSL bridge.
   bridge-only Rebuild/restart only the WSL bridge using the existing connector session.
@@ -201,7 +201,8 @@ sync_runtime_env_from_running_bridge() {
 	if ! tracked_pid_alive "${bridge_pid_file}"; then
 		return 1
 	fi
-	local pid proc_env runtime_secret connector_base_url value
+	local pid proc_env runtime_secret connector_base_url value caller_overrides
+	caller_overrides="$(caller_runtime_overrides)"
 	pid="$(cat "${bridge_pid_file}" 2>/dev/null || true)"
 	proc_env="$(tr '\0' '\n' <"/proc/${pid}/environ" 2>/dev/null || true)"
 	runtime_secret="$(printf '%s\n' "${proc_env}" | sed -n 's/^SNAPCHAT_CONNECTOR_SHARED_SECRET=//p' | head -n 1)"
@@ -213,7 +214,7 @@ sync_runtime_env_from_running_bridge() {
 		return 1
 	fi
 	for value in SNAPCHAT_BRIDGE_CONFIG SNAPCHAT_READ_RECEIPTS_ENABLED SNAPCHAT_SNAP_MEDIA_ENABLED SNAPCHAT_SNAP_MEDIA_ON_READ SNAPCHAT_SEND_MEDIA_ENABLED; do
-		if printf '%s\n' "${caller_runtime_overrides}" | grep -aqs "^${value}="; then
+		if printf '%s\n' "${caller_overrides}" | grep -aqs "^${value}="; then
 			continue # explicit caller override wins over the old process env
 		fi
 		if proc_value="$(printf '%s\n' "${proc_env}" | sed -n "s/^${value}=//p" | head -n 1)" && [[ -n "${proc_value}" ]]; then
@@ -424,6 +425,13 @@ case "${mode}" in
         cd "${repo_dir}"
         reset_outbound_megolm_sessions
         start_bridge
+        ;;
+    connector-only)
+        require_paths
+        load_runtime_env
+        stop_windows_pid_file "${connector_pid_file}" "connector"
+        start_connector
+        wait_for_connector
         ;;
     bridge-only)
         require_paths

@@ -64,6 +64,7 @@ const capturedAccountEndpoints = new Set();
 let lastAPIAuthSnapshot = null;
 let lastAPIAuthSnapshotAt = 0;
 let realtimeProbe = null;
+const realtimeNetworkRequests = new Map();
 
 function rememberRealtimeProbeEvent(event) {
   if (!realtimeProbe) {
@@ -365,6 +366,123 @@ async function ensureSession() {
         firstKeys: args[0] && typeof args[0] === "object" ? Object.keys(args[0]).slice(0, 12) : [],
       }),
     });
+    const numericIdPattern = /\b\d{12,}\b/g;
+    const uuidPattern = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/ig;
+    const messageShape = (value, seen = new Set(), depth = 0) => {
+      if (value == null) return String(value);
+      if (typeof value === "string") return `string:${value.length}`;
+      if (typeof value === "number" || typeof value === "bigint" || typeof value === "boolean") return typeof value;
+      if (value instanceof ArrayBuffer) return `ArrayBuffer:${value.byteLength}`;
+      if (ArrayBuffer.isView(value)) return `${value.constructor?.name || "TypedArray"}:${value.byteLength}`;
+      if (Array.isArray(value)) return `array:${value.length}`;
+      if (typeof value !== "object" || seen.has(value) || depth > 2) return typeof value;
+      seen.add(value);
+      return `object:${Object.keys(value).slice(0, 12).join(",")}`;
+    };
+    const summarizeBoundaryPayload = (payload) => {
+      const uuids = new Set();
+      const numericIds = new Set();
+      const methods = new Set();
+      const scanText = (text) => {
+        if (!text) return;
+        for (const match of String(text).matchAll(uuidPattern)) uuids.add(match[0].toLowerCase());
+        for (const match of String(text).matchAll(numericIdPattern)) numericIds.add(match[0]);
+      };
+      const walk = (value, path = "", seen = new Set(), depth = 0) => {
+        if (value == null || seen.has(value) || depth > 4) return;
+        if (typeof value === "string" || typeof value === "number" || typeof value === "bigint") {
+          scanText(value);
+          if (/method|operation|op|type|name$/i.test(path) && String(value).length < 120) methods.add(String(value));
+          return;
+        }
+        if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {
+          return;
+        }
+        if (typeof value !== "object") return;
+        seen.add(value);
+        for (const [key, child] of Object.entries(value).slice(0, 80)) {
+          const childPath = path ? `${path}.${key}` : key;
+          if (/method|operation|op|type|name$/i.test(key) && child != null && typeof child !== "object") {
+            methods.add(String(child).slice(0, 120));
+          }
+          walk(child, childPath, seen, depth + 1);
+        }
+      };
+      walk(payload);
+      return {
+        payloadType: messageShape(payload),
+        rpcMethod: Array.from(methods).slice(0, 8).join(","),
+        uuids: Array.from(uuids).slice(0, 12).join(","),
+        numericIds: Array.from(numericIds).slice(0, 12).join(","),
+      };
+    };
+    const recordBoundary = (event) => {
+      record({
+        eventType: "MessageBoundary",
+        ...event,
+      });
+    };
+    if (!globalThis.MessagePort.prototype.__codexRealtimeWrappedPort) {
+      const OriginalMessagePortPost = globalThis.MessagePort.prototype.postMessage;
+      globalThis.MessagePort.prototype.postMessage = function (message, transfer) {
+        try {
+          recordBoundary({
+            handler: "MessagePort.postMessage",
+            direction: "page->port",
+            transferCount: Array.isArray(transfer) ? transfer.length : 0,
+            ...summarizeBoundaryPayload(message),
+          });
+        } catch {
+        }
+        return OriginalMessagePortPost.apply(this, arguments);
+      };
+      const OriginalAddEventListener = globalThis.MessagePort.prototype.addEventListener;
+      globalThis.MessagePort.prototype.addEventListener = function (type, listener, options) {
+        if (type === "message" && typeof listener === "function" && !listener.__codexRealtimeWrappedPortListener) {
+          const originalListener = listener;
+          listener = function (event) {
+            try {
+              recordBoundary({
+                handler: "MessagePort.message",
+                direction: "port->page",
+                ...summarizeBoundaryPayload(event?.data),
+              });
+            } catch {
+            }
+            return originalListener.apply(this, arguments);
+          };
+          listener.__codexRealtimeWrappedPortListener = true;
+        }
+        return OriginalAddEventListener.call(this, type, listener, options);
+      };
+      const originalOnMessage = Object.getOwnPropertyDescriptor(globalThis.MessagePort.prototype, "onmessage");
+      if (originalOnMessage?.set) {
+        Object.defineProperty(globalThis.MessagePort.prototype, "onmessage", {
+          configurable: true,
+          enumerable: originalOnMessage.enumerable,
+          get: originalOnMessage.get,
+          set(listener) {
+            if (typeof listener === "function" && !listener.__codexRealtimeWrappedPortListener) {
+              const originalListener = listener;
+              listener = function (event) {
+                try {
+                  recordBoundary({
+                    handler: "MessagePort.onmessage",
+                    direction: "port->page",
+                    ...summarizeBoundaryPayload(event?.data),
+                  });
+                } catch {
+                }
+                return originalListener.apply(this, arguments);
+              };
+              listener.__codexRealtimeWrappedPortListener = true;
+            }
+            return originalOnMessage.set.call(this, listener);
+          },
+        });
+      }
+      globalThis.MessagePort.prototype.__codexRealtimeWrappedPort = true;
+    }
     const wrapDelegate = (delegate, delegateName) => {
       if (!delegate || typeof delegate !== "object") return;
       for (const key of Object.keys(delegate)) {
@@ -572,7 +690,36 @@ async function ensureSession() {
           handler: "global.Worker",
           summary: JSON.stringify(workerInfo),
         });
-        return new OriginalWorker(scriptURL, options);
+        const worker = new OriginalWorker(scriptURL, options);
+        if (!worker.__codexRealtimeWrappedWorkerInstance) {
+          const originalPostMessage = worker.postMessage;
+          worker.postMessage = function (message, transfer) {
+            try {
+              recordBoundary({
+                handler: "Worker.postMessage",
+                direction: "page->worker",
+                workerName: workerInfo.name,
+                transferCount: Array.isArray(transfer) ? transfer.length : 0,
+                ...summarizeBoundaryPayload(message),
+              });
+            } catch {
+            }
+            return originalPostMessage.apply(this, arguments);
+          };
+          worker.addEventListener("message", (event) => {
+            try {
+              recordBoundary({
+                handler: "Worker.message",
+                direction: "worker->page",
+                workerName: workerInfo.name,
+                ...summarizeBoundaryPayload(event?.data),
+              });
+            } catch {
+            }
+          }, true);
+          worker.__codexRealtimeWrappedWorkerInstance = true;
+        }
+        return worker;
       };
       WrappedWorker.prototype = OriginalWorker.prototype;
       Object.setPrototypeOf(WrappedWorker, OriginalWorker);
@@ -586,8 +733,17 @@ async function ensureSession() {
     try {
       const requestURL = request.url();
       if (realtimeProbe && /websocket|blizzard|messagingcoreservice|snapchat\.notification|grpc|stream/i.test(requestURL)) {
+        const requestId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+        realtimeNetworkRequests.set(request, {
+          requestId,
+          startedAt: new Date(),
+          url: requestURL,
+          method: request.method(),
+        });
         rememberRealtimeProbeEvent({
           source: "playwright-request",
+          eventType: "request-start",
+          requestId,
           method: request.method(),
           url: requestURL.slice(0, 500),
           resourceType: request.resourceType(),
@@ -654,11 +810,19 @@ async function ensureSession() {
     try {
       const responseURL = new URL(response.url());
       if (realtimeProbe && /websocket|blizzard|messagingcoreservice|snapchat\.notification|grpc|stream/i.test(response.url())) {
+        const tracked = realtimeNetworkRequests.get(response.request());
         rememberRealtimeProbeEvent({
           source: "playwright-response",
+          eventType: "response-headers",
+          requestId: String(tracked?.requestId || ""),
           status: response.status(),
           url: response.url().slice(0, 500),
           contentType: String(response.headers()["content-type"] || "").slice(0, 120),
+          summary: JSON.stringify({
+            transferEncoding: response.headers()["transfer-encoding"] || "",
+            contentLength: response.headers()["content-length"] || "",
+            grpcStatus: response.headers()["grpc-status"] || "",
+          }),
         });
       }
       if (!/(^|\.)accounts\.snapchat\.com$/i.test(responseURL.hostname)) {
@@ -678,6 +842,54 @@ async function ensureSession() {
       }
     } catch {
       // Best-effort identity capture only.
+    }
+  });
+
+  context.on("requestfinished", async (request) => {
+    try {
+      const tracked = realtimeNetworkRequests.get(request);
+      if (!tracked || !realtimeProbe) {
+        return;
+      }
+      realtimeNetworkRequests.delete(request);
+      const finishedAt = new Date();
+      let bodyLength = "";
+      try {
+        const response = await request.response();
+        const body = await response?.body?.();
+        bodyLength = body ? String(body.length) : "";
+      } catch {
+      }
+      rememberRealtimeProbeEvent({
+        source: "playwright-request",
+        eventType: "request-finished",
+        requestId: tracked.requestId,
+        method: tracked.method,
+        url: tracked.url.slice(0, 500),
+        durationMs: finishedAt.getTime() - tracked.startedAt.getTime(),
+        bodyLength,
+      });
+    } catch {
+    }
+  });
+
+  context.on("requestfailed", (request) => {
+    try {
+      const tracked = realtimeNetworkRequests.get(request);
+      if (!tracked || !realtimeProbe) {
+        return;
+      }
+      realtimeNetworkRequests.delete(request);
+      rememberRealtimeProbeEvent({
+        source: "playwright-request",
+        eventType: "request-failed",
+        requestId: tracked.requestId,
+        method: tracked.method,
+        url: tracked.url.slice(0, 500),
+        durationMs: Date.now() - tracked.startedAt.getTime(),
+        summary: String(request.failure()?.errorText || "").slice(0, 240),
+      });
+    } catch {
     }
   });
 
@@ -2876,36 +3088,38 @@ export async function decryptEELMessage(input = {}) {
         return false;
       }
 
+      // Strict targeted lookup: content is only attributed to the requested
+      // message when one of the fetched messages matches that exact message
+      // ID. There is intentionally no single-message fallback here: returning
+      // another message's decrypted bytes under the requested message ID is
+      // exactly the misattribution this guard exists to prevent.
       function decryptedContentFromFetchedMessages(result, targetMessageId) {
         const messages = Array.isArray(result?.messages) ? result.messages : [];
-        let match = messages.find((message) => messageMatchesTarget(message, targetMessageId));
-        if (!match && messages.length === 1) {
-          match = messages[0];
+        const requestedMessageId = String(targetMessageId || "");
+        const matchedWebMessageId = "";
+        if (!requestedMessageId) {
+          return { requestedMessageId, messageCount: messages.length, matchedWebMessageId, exactMatch: false, missReason: "no_target_message_id" };
         }
+        const match = messages.find((message) => messageMatchesTarget(message, targetMessageId));
+        if (!match) {
+          return { requestedMessageId, messageCount: messages.length, matchedWebMessageId, exactMatch: false, missReason: "no_exact_match" };
+        }
+        const webMessageId = String(match?.descriptor?.messageId || match?.messageId || "");
+        const analyticsMessageId = String(match?.messageAnalytics?.analyticsMessageId || "");
         const content = resultBytes(match?.content)
           || resultBytes(match?.messageContent?.content)
           || resultBytes(match?.messageContent);
-        if (!content) {
-          const text = textFromWebContent(match?.messageContent) || textFromWebContent(match?.content);
-          if (!text) {
-            return undefined;
-          }
-          return {
-            content: text,
-            webMessageId: String(match?.descriptor?.messageId || match?.messageId || ""),
-            analyticsMessageId: String(match?.messageAnalytics?.analyticsMessageId || ""),
-            contentSource: "web_message_text",
-          };
+        if (content) {
+          return { requestedMessageId, messageCount: messages.length, matchedWebMessageId: webMessageId, analyticsMessageId, exactMatch: true, content, contentSource: "web_message_bytes" };
         }
-        return {
-          content,
-          webMessageId: String(match?.descriptor?.messageId || match?.messageId || ""),
-          analyticsMessageId: String(match?.messageAnalytics?.analyticsMessageId || ""),
-          contentSource: "web_message_bytes",
-        };
+        const text = textFromWebContent(match?.messageContent) || textFromWebContent(match?.content);
+        if (text) {
+          return { requestedMessageId, messageCount: messages.length, matchedWebMessageId: webMessageId, analyticsMessageId, exactMatch: true, content: text, contentSource: "web_message_text" };
+        }
+        return { requestedMessageId, messageCount: messages.length, matchedWebMessageId: webMessageId, analyticsMessageId, exactMatch: false, missReason: "matched_message_has_no_content" };
       }
 
-      async function resolveDecryptedContentViaMessaging(webpackRequire, targetConversationId, targetMessageId) {
+      async function resolveDecryptedContentViaMessaging(webpackRequire, targetConversationId, targetMessageId, lookupDiagnostics) {
         if (!targetConversationId || !targetMessageId) {
           return undefined;
         }
@@ -2927,9 +3141,22 @@ export async function decryptEELMessage(input = {}) {
             fetchPage(),
             new Promise((_, reject) => setTimeout(() => reject(new Error("messaging_fetch_timeout")), 5000)),
           ]);
-          const match = decryptedContentFromFetchedMessages(result, targetMessageId);
-          if (match) {
-            return match;
+          const lookup = decryptedContentFromFetchedMessages(result, targetMessageId);
+          if (lookupDiagnostics) {
+            lookupDiagnostics.requestedMessageId = lookup.requestedMessageId;
+            lookupDiagnostics.messageCount = lookup.messageCount;
+            lookupDiagnostics.matchedWebMessageId = lookup.matchedWebMessageId;
+            lookupDiagnostics.exactMatch = lookup.exactMatch === true;
+            lookupDiagnostics.missReason = lookup.missReason || "";
+          }
+          if (lookup.exactMatch && lookup.content) {
+            return {
+              content: lookup.content,
+              webMessageId: lookup.matchedWebMessageId,
+              analyticsMessageId: lookup.analyticsMessageId,
+              contentSource: lookup.contentSource,
+              messageCount: lookup.messageCount,
+            };
           }
         }
         return undefined;
@@ -2953,8 +3180,15 @@ export async function decryptEELMessage(input = {}) {
       }
 
       const webpackRequire = findWebpackRequire();
+      const messagingLookup = {
+        requestedMessageId: payload.messageId,
+        messageCount: 0,
+        matchedWebMessageId: "",
+        exactMatch: false,
+        missReason: "",
+      };
       try {
-        const messagingContent = await resolveDecryptedContentViaMessaging(webpackRequire, payload.conversationId, payload.messageId);
+        const messagingContent = await resolveDecryptedContentViaMessaging(webpackRequire, payload.conversationId, payload.messageId, messagingLookup);
         if (messagingContent?.content) {
           return {
             ok: true,
@@ -2963,6 +3197,10 @@ export async function decryptEELMessage(input = {}) {
             webMessageId: messagingContent.webMessageId,
             analyticsMessageId: messagingContent.analyticsMessageId,
             contentSource: messagingContent.contentSource,
+            requestedMessageId: payload.messageId,
+            matchedWebMessageId: messagingContent.webMessageId,
+            messageCount: messagingContent.messageCount,
+            exactMatch: true,
           };
         }
       } catch (error) {
@@ -3010,12 +3248,12 @@ export async function decryptEELMessage(input = {}) {
                 ? new Uint8Array(bytesLike)
                 : Uint8Array.from(bytesLike);
             if (bytes.byteLength === content.byteLength) {
-              return { ok: true, decryptedContentBase64: toBase64(bytes), method: methodName };
+              return { ok: true, decryptedContentBase64: toBase64(bytes), method: methodName, requestedMessageId: payload.messageId, matchedWebMessageId: "", messageCount: messagingLookup.messageCount, exactMatch: false, exactMatchMiss: messagingLookup.missReason || "" };
             }
             if ([16, 24, 32].includes(bytes.byteLength)) {
               const decrypted = await decryptAESGCM(bytes, cekIv, content);
               if (decrypted) {
-                return { ok: true, decryptedContentBase64: toBase64(decrypted), method: `${methodName}:derived_cek` };
+                return { ok: true, decryptedContentBase64: toBase64(decrypted), method: `${methodName}:derived_cek`, requestedMessageId: payload.messageId, matchedWebMessageId: "", messageCount: messagingLookup.messageCount, exactMatch: false, exactMatchMiss: messagingLookup.missReason || "" };
               }
             }
             attempts.push(`${methodName}:bytes_${bytes.byteLength}`);
@@ -3024,7 +3262,7 @@ export async function decryptEELMessage(input = {}) {
           }
         }
       }
-      return { ok: false, error: "eel_decrypt_unavailable", retryable: true, failureClass: attempts.length > 0 ? "attempts_exhausted" : "no_candidate_methods" };
+      return { ok: false, error: "eel_decrypt_unavailable", retryable: true, failureClass: attempts.length > 0 ? "attempts_exhausted" : "no_candidate_methods", requestedMessageId: payload.messageId, matchedWebMessageId: "", messageCount: messagingLookup.messageCount, exactMatch: false, exactMatchMiss: messagingLookup.missReason || "" };
     }, {
       messageId,
       conversationId,
@@ -3041,9 +3279,9 @@ export async function decryptEELMessage(input = {}) {
       failureClass: String(error?.message || error || "unknown").replace(/\s+/g, " ").slice(0, 160),
     }));
     if (!result.ok) {
-      console.error(`eel-decrypt: failed messageId=${messageId} conversationId=${conversationId} error=${result.error || "unknown"} failureClass=${result.failureClass || ""}`);
+      console.error(`eel-decrypt: failed messageId=${messageId} conversationId=${conversationId} error=${result.error || "unknown"} failureClass=${result.failureClass || ""} requestedMessageId=${messageId} matchedWebMessageId=${String(result.matchedWebMessageId || "")} messageCount=${Number(result.messageCount || 0)} exactMatch=${result.exactMatch === true ? "true" : "false"}`);
     } else {
-      console.error(`eel-decrypt: ok messageId=${messageId} conversationId=${conversationId} method=${result.method || "unknown"}`);
+      console.error(`eel-decrypt: ok messageId=${messageId} conversationId=${conversationId} method=${result.method || "unknown"} requestedMessageId=${String(result.requestedMessageId || messageId)} matchedWebMessageId=${String(result.matchedWebMessageId || "")} messageCount=${Number(result.messageCount || 0)} exactMatch=${result.exactMatch === true ? "true" : "false"} contentSource=${String(result.contentSource || "")}`);
     }
     return result;
   }, { priority: 0 });
@@ -3850,6 +4088,7 @@ async function startRealtimeProbeUnlocked(options = {}) {
                     const items = Array.isArray(value) ? value : (value === undefined ? [] : [value]);
                     const seen = new Set();
                     const candidates = { chatId: "", messageId: "", senderId: "", receiptType: "", contentType: "", isSender: "" };
+                    const candidateFields = [];
                     const walk = (item, path, depth) => {
                       if (!item || typeof item !== "object" || seen.has(item) || depth > 4) return;
                       seen.add(item);
@@ -3859,7 +4098,10 @@ async function startRealtimeProbeUnlocked(options = {}) {
                         const text = scalarText(child);
                         if (text) {
                           if (!candidates.chatId && /conversation.*id/i.test(nextPath) && /^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(text)) candidates.chatId = text.toLowerCase();
-                          if (!candidates.messageId && /(analyticsMessageId|message.*id|attemptId)/i.test(nextPath)) candidates.messageId = text;
+                          if (/(analyticsMessageId|message.*id|serverMessageId|createdMessageId|conversationMessageId|sequenceId|feedEntryId|contentMessageId|attemptId)/i.test(nextPath)) {
+                            if (!candidates.messageId) candidates.messageId = text;
+                            if (candidateFields.length < 20) candidateFields.push({ path: nextPath, value: text.slice(0, 120) });
+                          }
                           if (!candidates.senderId && /(sender|participant|user).*id/i.test(nextPath) && /^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(text)) candidates.senderId = text.toLowerCase();
                           if (!candidates.receiptType && /receiptType$/i.test(nextPath)) candidates.receiptType = text;
                           if (!candidates.contentType && /contentType$/i.test(nextPath)) candidates.contentType = text;
@@ -3876,21 +4118,174 @@ async function startRealtimeProbeUnlocked(options = {}) {
                       argumentKind: Array.isArray(value) ? "array" : typeof value,
                       argumentCount: items.length,
                       firstKeys: items[0] && typeof items[0] === "object" ? Object.keys(items[0]).slice(0, 32) : [],
+                      candidateFields,
                       ...candidates,
                     };
                   };
+                  const emitSummary = (callbackName, value) => {
+                    const emit = globalThis.__codexRealtimeWorkerEmit;
+                    if (typeof emit === "function") {
+                      emit(JSON.stringify(summarize(callbackName, value)));
+                    }
+                  };
+                  const boundaryShape = (value) => {
+                    if (value == null) return String(value);
+                    if (typeof value === "string") return "string:" + value.length;
+                    if (typeof value === "number" || typeof value === "bigint" || typeof value === "boolean") return typeof value;
+                    if (value instanceof ArrayBuffer) return "ArrayBuffer:" + value.byteLength;
+                    if (ArrayBuffer.isView(value)) return (value.constructor?.name || "TypedArray") + ":" + value.byteLength;
+                    if (Array.isArray(value)) return "array:" + value.length;
+                    if (typeof value === "object") return "object:" + Object.keys(value).slice(0, 12).join(",");
+                    return typeof value;
+                  };
+                  const summarizeBoundary = (callbackName, payload) => {
+                    const uuids = new Set();
+                    const numericIds = new Set();
+                    const methods = new Set();
+                    const uuidPattern = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/ig;
+                    const numericIdPattern = /\\b\\d{3,}\\b/g;
+                    const scanText = (text) => {
+                      const value = String(text || "");
+                      for (const match of value.matchAll(uuidPattern)) uuids.add(match[0].toLowerCase());
+                      for (const match of value.matchAll(numericIdPattern)) numericIds.add(match[0]);
+                    };
+                    const walk = (value, path = "", seen = new Set(), depth = 0) => {
+                      if (value == null || seen.has(value) || depth > 4) return;
+                      if (typeof value === "string" || typeof value === "number" || typeof value === "bigint") {
+                        scanText(value);
+                        if (/method|operation|op|type|name$/i.test(path) && String(value).length < 120) methods.add(String(value));
+                        return;
+                      }
+                      if (value instanceof Uint8Array && value.byteLength === 16) {
+                        const uuid = uuidFromBytes(value);
+                        if (uuid) uuids.add(uuid);
+                        return;
+                      }
+                      if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer || typeof value !== "object") return;
+                      seen.add(value);
+                      for (const key of Object.keys(value).slice(0, 80)) {
+                        const child = value[key];
+                        if (/method|operation|op|type|name$/i.test(key) && child != null && typeof child !== "object") {
+                          methods.add(String(child).slice(0, 120));
+                        }
+                        walk(child, path ? path + "." + key : key, seen, depth + 1);
+                      }
+                    };
+                    walk(payload);
+                    return {
+                      callbackName,
+                      timestamp: new Date().toISOString(),
+                      argumentKind: boundaryShape(payload),
+                      argumentCount: Array.isArray(payload) ? payload.length : payload === undefined ? 0 : 1,
+                      firstKeys: payload && typeof payload === "object" && !Array.isArray(payload) ? Object.keys(payload).slice(0, 32) : [],
+                      chatId: Array.from(uuids)[0] || "",
+                      messageId: Array.from(numericIds)[0] || "",
+                      summary: JSON.stringify({
+                        rpcMethod: Array.from(methods).slice(0, 8),
+                        uuids: Array.from(uuids).slice(0, 12),
+                        numericIds: Array.from(numericIds).slice(0, 20),
+                        payloadType: boundaryShape(payload),
+                      }),
+                    };
+                  };
+                  const emitBoundary = (callbackName, payload) => {
+                    const emit = globalThis.__codexRealtimeWorkerEmit;
+                    if (typeof emit === "function") {
+                      emit(JSON.stringify(summarizeBoundary(callbackName, payload)));
+                    }
+                  };
+                  if (!globalThis.__codexRealtimeWorkerMessageBoundaryWrapped) {
+                    const originalPostMessage = globalThis.postMessage;
+                    if (typeof originalPostMessage === "function") {
+                      globalThis.postMessage = function codexObservedWorkerPostMessage(message, transfer) {
+                        try {
+                          emitBoundary("worker.global.postMessage", message);
+                        } catch {}
+                        return originalPostMessage.apply(this, arguments);
+                      };
+                    }
+                    if (globalThis.MessagePort?.prototype) {
+                      const originalPortPostMessage = globalThis.MessagePort.prototype.postMessage;
+                      globalThis.MessagePort.prototype.postMessage = function codexObservedWorkerPortPostMessage(message, transfer) {
+                        try {
+                          emitBoundary("worker.MessagePort.postMessage", message);
+                        } catch {}
+                        return originalPortPostMessage.apply(this, arguments);
+                      };
+                      const originalAddEventListener = globalThis.MessagePort.prototype.addEventListener;
+                      globalThis.MessagePort.prototype.addEventListener = function codexObservedWorkerPortAddEventListener(type, listener, options) {
+                        if (type === "message" && typeof listener === "function" && !listener.__codexRealtimeWrappedPortListener) {
+                          const originalListener = listener;
+                          listener = function codexObservedWorkerPortMessage(event) {
+                            try {
+                              emitBoundary("worker.MessagePort.message", event?.data);
+                            } catch {}
+                            return originalListener.apply(this, arguments);
+                          };
+                          listener.__codexRealtimeWrappedPortListener = true;
+                        }
+                        return originalAddEventListener.call(this, type, listener, options);
+                      };
+                    }
+                    globalThis.__codexRealtimeWorkerMessageBoundaryWrapped = true;
+                  }
+                  const wrapCallbackObject = (label, object) => {
+                    if (!object || typeof object !== "object") return 0;
+                    let wrapped = 0;
+                    for (const key of Object.keys(object).slice(0, 80)) {
+                      const value = object[key];
+                      if (typeof value !== "function" || value.__codexRealtimeWrappedCallback) continue;
+                      object[key] = function codexRealtimeObservedCallback(...args) {
+                        try {
+                          emitSummary(label + "." + key, args);
+                        } catch {}
+                        return value.apply(this, args);
+                      };
+                      object[key].__codexRealtimeWrappedCallback = true;
+                      object[key].__codexOriginal = value;
+                      wrapped += 1;
+                    }
+                    return wrapped;
+                  };
+                  const observeProxyPath = (label, target, path = []) => {
+                    if (!target || (typeof target !== "object" && typeof target !== "function")) return target;
+                    if (target.__codexRealtimeObservedProxy) return target;
+                    return new Proxy(target, {
+                      get(inner, property, receiver) {
+                        const value = Reflect.get(inner, property, receiver);
+                        if (typeof property === "symbol" || property === "then" || property === "bind" || property === "__codexRealtimeObservedProxy") {
+                          return value;
+                        }
+                        const nextPath = path.concat(String(property));
+                        return observeProxyPath(label, value, nextPath);
+                      },
+                      apply(inner, thisArg, args) {
+                        try {
+                          emitSummary(label + "." + (path.length ? path.join(".") : "<apply>"), args);
+                        } catch {}
+                        return Reflect.apply(inner, thisArg, args);
+                      },
+                    });
+                  };
+                  const wrappedCallbackCounts = {};
+                  try { t = observeProxyPath("createMessagingSession.argT", t); } catch {}
+                  try { r = observeProxyPath("createMessagingSession.argR", r); } catch {}
+                  try { wrappedCallbackCounts.argFeedOrConversationA = wrapCallbackObject("createMessagingSession.argT", t); } catch {}
+                  try { wrappedCallbackCounts.argFeedOrConversationB = wrapCallbackObject("createMessagingSession.argR", r); } catch {}
+                  try { wrappedCallbackCounts.gnFeedDelegate = wrapCallbackObject("worker.gn", gn); } catch {}
+                  try { wrappedCallbackCounts.mediaDelegate = wrapCallbackObject("worker.mediaDelegate", I); } catch {}
+                  try { wrappedCallbackCounts.snapSendDelegate = wrapCallbackObject("worker.yn", yn); } catch {}
+                  try { wrappedCallbackCounts.windowDelegate = wrapCallbackObject("worker.hn", hn); } catch {}
+                  try { wrappedCallbackCounts.downloadDelegate = wrapCallbackObject("worker.wn", wn); } catch {}
                   cn = function codexRealtimeObservedCn(e, t) {
                     try {
-                      const emit = globalThis.__codexRealtimeWorkerEmit;
-                      if (typeof emit === "function") {
-                        emit(JSON.stringify(summarize("onMessagesReceived", t)));
-                      }
+                      emitSummary("onMessagesReceived", t);
                     } catch {}
                     return originalCn.apply(this, arguments);
                   };
                   cn.__codexOriginal = originalCn;
                   globalThis.__codexRealtimeCnWrapped = true;
-                  return { ok: true, installedAt: new Date().toISOString(), pausedFunction: ${JSON.stringify(callFrame?.functionName || "")} };
+                  return { ok: true, installedAt: new Date().toISOString(), pausedFunction: ${JSON.stringify(callFrame?.functionName || "")}, wrappedCallbackCounts };
                 })()`,
                 returnByValue: true,
               }) : null;

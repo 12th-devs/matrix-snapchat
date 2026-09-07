@@ -93,6 +93,24 @@ func (c *Client) messageFromProto(ctx context.Context, chatID string, msg *proto
 			media[0].Key, media[0].IV = key, iv
 		}
 	}
+	if contentType == protos.ContentType_NOTE && len(media) == 1 {
+		// Voice notes carry the AES key/IV (base64) inside the note metadata
+		// and reference the audio content object with an unassigned media
+		// type; present them as audio so the bridge renders m.audio.
+		decoded := c.envelopeContentsForDecode(ctx, chatID, id, envelope)
+		key, iv, _, err := NoteAudioEncryptionKeys(decoded)
+		if err != nil {
+			log.Printf("snapapi media: note encryption metadata unavailable message_id=%s: %v", id, err)
+		} else if len(key) > 0 {
+			media[0].Key, media[0].IV = key, iv
+		}
+		if media[0].Kind != MediaKindVideo {
+			media[0].Kind = MediaKindAudio
+			if media[0].MimeType == "" || media[0].MimeType == "application/octet-stream" {
+				media[0].MimeType = "audio/mp4"
+			}
+		}
+	}
 	if body == "" && len(media) > 0 {
 		if isSnap {
 			body = "New Snap"
@@ -181,6 +199,9 @@ func (c *Client) messageBody(ctx context.Context, chatID string, msg *protos.Con
 	case protos.ContentType_SNAP, protos.ContentType_SNAP_NOT_VIEWABLE:
 		return "New Snap", true
 	case protos.ContentType_EXTERNAL_MEDIA:
+		return "", false
+	case protos.ContentType_NOTE:
+		// Voice notes are ordinary persistent media, not snaps.
 		return "", false
 	case protos.ContentType_STATUS, protos.ContentType_STATUS_SAVE_TO_CAMERA_ROLL,
 		protos.ContentType_STATUS_CONVERSATION_CAPTURE_SCREENSHOT,

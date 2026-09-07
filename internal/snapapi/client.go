@@ -75,6 +75,7 @@ const (
 	MediaKindImage MediaKind = "image"
 	MediaKindVideo MediaKind = "video"
 	MediaKindGIF   MediaKind = "gif"
+	MediaKindAudio MediaKind = "audio"
 )
 
 type MediaAttachment struct {
