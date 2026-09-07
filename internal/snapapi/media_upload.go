@@ -310,6 +310,78 @@ func mediaProtoVarint(field protowire.Number, value uint64) []byte {
 	return protowire.AppendVarint(protowire.AppendTag(nil, field, protowire.VarintType), value)
 }
 
+// encodeSnapContents builds the Contents payload for an outgoing image snap
+// (ContentType_SNAP). Field-for-field mirror of a live outgoing snap's
+// decrypted contents captured 2026-09-07 (snap item = Contents field 11):
+// media list with the AES key/IV (base64 at 4.1/4.2, raw at 19.1/19.2),
+// dimensions, a random 32-byte delivery identifier at 13.4.1.2.13, the
+// capture timestamp at 17.6 and the image media type at 22.4.
+func encodeSnapContents(nowMillis int64, info *OutgoingMediaInfo, key, iv []byte, mediaID []byte) []byte {
+	encryption := bytes.Join([][]byte{
+		mediaProtoString(1, base64.StdEncoding.EncodeToString(key)),
+		mediaProtoString(2, base64.StdEncoding.EncodeToString(iv)),
+	}, nil)
+	item := bytes.Join([][]byte{
+		mediaProtoVarint(2, 0),
+		mediaProtoBytes(4, encryption),
+		mediaProtoBytes(5, bytes.Join([][]byte{
+			mediaProtoVarint(1, uint64(info.Width)),
+			mediaProtoVarint(2, uint64(info.Height)),
+		}, nil)),
+		mediaProtoVarint(12, 0),
+		mediaProtoVarint(13, 0),
+		mediaProtoVarint(15, 0),
+		mediaProtoBytes(18, mediaProtoVarint(1, 0)),
+		mediaProtoBytes(19, bytes.Join([][]byte{
+			mediaProtoBytes(1, key),
+			mediaProtoBytes(2, iv),
+		}, nil)),
+		mediaProtoBytes(21, mediaProtoVarint(2, 1)),
+		mediaProtoBytes(26, nil),
+	}, nil)
+	mediaList := bytes.Join([][]byte{
+		mediaProtoBytes(1, item),
+		mediaProtoVarint(6, 1),
+	}, nil)
+	mediaSection := bytes.Join([][]byte{
+		mediaProtoBytes(1, mediaList),
+		mediaProtoBytes(2, bytes.Join([][]byte{
+			mediaProtoVarint(5, 0),
+			mediaProtoBytes(6, nil),
+		}, nil)),
+		mediaProtoVarint(7, 3),
+	}, nil)
+	deliveryMeta := bytes.Join([][]byte{
+		mediaProtoBytes(4, bytes.Join([][]byte{
+			mediaProtoBytes(1, bytes.Join([][]byte{
+				mediaProtoBytes(2, bytes.Join([][]byte{
+					mediaProtoBytes(13, mediaID),
+				}, nil)),
+				mediaProtoBytes(3, bytes.Join([][]byte{
+					mediaProtoBytes(21, bytes.Join([][]byte{
+						mediaProtoVarint(1, 0),
+						mediaProtoVarint(2, 0),
+					}, nil)),
+					mediaProtoBytes(23, nil),
+					mediaProtoVarint(25, 0),
+				}, nil)),
+			}, nil)),
+		}, nil)),
+	}, nil)
+	snapItem := bytes.Join([][]byte{
+		mediaProtoBytes(5, mediaSection),
+		mediaProtoBytes(13, deliveryMeta),
+		mediaProtoBytes(14, mediaProtoVarint(1, 0)),
+		mediaProtoBytes(17, mediaProtoVarint(6, uint64(nowMillis))),
+		mediaProtoBytes(22, mediaProtoVarint(4, 5)),
+		mediaProtoBytes(28, bytes.Join([][]byte{
+			mediaProtoVarint(1, uint64(info.Width/2)),
+			mediaProtoVarint(2, uint64(info.Height/2)),
+		}, nil)),
+	}, nil)
+	return mediaProtoBytes(11, snapItem)
+}
+
 func mediaProtoString(field protowire.Number, value string) []byte {
 	return mediaProtoBytes(field, []byte(value))
 }

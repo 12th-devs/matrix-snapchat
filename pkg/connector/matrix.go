@@ -563,10 +563,18 @@ func (sa *SnapchatAPI) matrixMediaToSend(ctx context.Context, msg *bridgev2.Matr
 	if caption == fileName {
 		caption = ""
 	}
+	// Captioning an image "Snap" sends it as a real disappearing Snapchat
+	// snap (ContentType_SNAP, view-session) instead of saved chat media.
+	// Snaps carry no caption text; the caption is the routing trigger.
+	sendAsSnap := msg.Content.MsgType == event.MsgImage && strings.EqualFold(caption, "snap")
+	if sendAsSnap {
+		caption = ""
+	}
 	return sidecar.MediaAttachment{
 		ID:       stableTextID(fileName + ":" + fmt.Sprint(len(data))),
 		FileName: sanitizeOutgoingFileName(fileName),
 		MimeType: mimeType,
 		Data:     data,
+		Snap:     sendAsSnap,
 	}, caption, true, nil
 }

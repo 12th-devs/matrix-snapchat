@@ -75,6 +75,10 @@ type MediaAttachment struct {
 	FileName string `json:"fileName,omitempty"`
 	MimeType string `json:"mimeType,omitempty"`
 	Data     []byte `json:"-"`
+	// Snap marks an image that must be sent as a real disappearing snap
+	// (ContentType_SNAP) instead of saved chat media. Set when the Matrix
+	// image is captioned "Snap".
+	Snap bool `json:"snap,omitempty"`
 }
 
 type SendMessageRequest struct {

@@ -256,6 +256,116 @@ func (c *Client) SendMedia(ctx context.Context, chatID string, media MediaAttach
 	return fmt.Sprintf("%d", resp.GetClientResolutionId()), nil
 }
 
+// SendSnap sends an image as a real disappearing Snapchat snap
+// (ContentType_SNAP with SavePolicy VIEW_SESSION), mirroring the wire
+// structure of a live outgoing snap's contents (see encodeSnapContents).
+// The image/caption distinction happens upstream: a Matrix image captioned
+// "Snap" routes here, everything else stays ordinary chat media.
+func (c *Client) SendSnap(ctx context.Context, chatID string, media MediaAttachment) (string, error) {
+	if len(media.Data) == 0 {
+		return "", fmt.Errorf("missing media data")
+	}
+	if len(media.Data) > maxOutgoingMediaSize {
+		return "", fmt.Errorf("media is too large for Snapchat send (max %d bytes)", maxOutgoingMediaSize)
+	}
+	mimeType := strings.ToLower(strings.TrimSpace(strings.Split(media.MimeType, ";")[0]))
+	if mimeType != "image/jpeg" && mimeType != "image/png" && mimeType != "image/webp" {
+		return "", fmt.Errorf("snaps support only images (got %s); video snaps are not supported yet", mimeType)
+	}
+	info, err := classifyOutgoingMedia(media.Data, mimeType)
+	if err != nil {
+		return "", err
+	}
+	if err := c.ensureAuthenticated(ctx); err != nil {
+		return "", err
+	}
+	encrypted, err := EncryptOutgoingMedia(media.Data)
+	if err != nil {
+		return "", fmt.Errorf("encrypt outgoing snap: %w", err)
+	}
+	contents := encodeSnapContents(mediaUploadClock(), info, encrypted.Key, encrypted.IV, random32Bytes())
+	location, err := c.GetUploadLocations(ctx)
+	if err != nil {
+		return "", err
+	}
+	zerolog.Ctx(ctx).Info().
+		Str("diag", "outgoing_snap").
+		Str("chat_id", chatID).
+		Str("mime", info.MIME).
+		Int("media_bytes", len(media.Data)).
+		Int("cipher_bytes", len(encrypted.Ciphertext)).
+		Str("upload_host", uploadHostOf(location.PutURL)).
+		Msg("outgoing-snap: encrypted payload ready for PUT")
+	descriptor, err := c.UploadEncryptedMedia(ctx, location, encrypted)
+	if err != nil {
+		return "", err
+	}
+	convID, err := encodeUUIDString(chatID)
+	if err != nil {
+		return "", err
+	}
+	attemptID, _ := snapcrypto.EncodeUUID(uuid.NewString())
+	envelope := &protos.ContentEnvelope{
+		ContentType: protos.ContentType_SNAP,
+		Contents:    contents,
+		MediaReferenceLists: []*protos.ContentEnvelope_MediaReferenceList{{
+			Reference: []*protos.MediaReference{{
+				ContentObject: descriptor,
+				MediaType:     protos.MediaType_MEDIA_TYPE_IMAGE,
+			}},
+		}},
+		DisplayInfo: &protos.ContentEnvelope_DisplayInfo{},
+		// Snaps are view-session media: they never save to the conversation.
+		SavePolicy: protos.ContentEnvelope_SavePolicy_VIEW_SESSION,
+	}
+	req := &protos.CreateContentMessageRequest{
+		SenderId:           c.selfUUID(),
+		ClientResolutionId: randomUint64(),
+		Destinations: []*protos.DeliveryDestination{{
+			Destination: &protos.DeliveryDestination_ConversationDestination{
+				ConversationDestination: &protos.ConversationDestination{
+					ConversationId: convID,
+					CurrentVersion: 111,
+				},
+			},
+		}},
+		Content: envelope,
+		CreateContentMessageBlizzardData: &protos.CreateContentMessageBlizzardData{
+			SendMessageAttemptId: &protos.UUID{EncodedId: attemptID},
+		},
+	}
+	var resp protos.CreateContentMessageResponse
+	if err = c.doGRPC(ctx, createContentMessageURL, req, &resp); err != nil {
+		return "", err
+	}
+	for _, result := range resp.GetResult() {
+		if !result.GetSuccess() {
+			return "", fmt.Errorf("snapchat api snap send failed: %v", result.GetFailureReason())
+		}
+	}
+	createdID := createdMessageIDFromResponse(&resp)
+	if createdID != "" {
+		zerolog.Ctx(ctx).Info().
+			Str("diag", "outgoing_snap").
+			Str("chat_id", chatID).
+			Str("created_message_id", createdID).
+			Msg("outgoing-snap: CreateContentMessage accepted")
+		return createdID, nil
+	}
+	return fmt.Sprintf("%d", resp.GetClientResolutionId()), nil
+}
+
+func random32Bytes() []byte {
+	b := make([]byte, 32)
+	for i := 0; i < len(b); i += 8 {
+		value := randomUint64()
+		for j := 0; j < 8 && i+j < len(b); j++ {
+			b[i+j] = byte(value >> (uint(j) * 8))
+		}
+	}
+	return b
+}
+
 func uploadHostOf(raw string) string {
 	host := ""
 	if parsed, err := url.Parse(raw); err == nil {

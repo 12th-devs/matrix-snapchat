@@ -785,12 +785,22 @@ func (sa *SnapchatAPI) sendMediaAPI(ctx context.Context, chatID string, media si
 	if err != nil {
 		return "", err
 	}
-	messageID, err := client.SendMedia(ctx, chatID, snapapi.MediaAttachment{
-		ID:       media.ID,
-		FileName: media.FileName,
-		MimeType: media.MimeType,
-		Data:     media.Data,
-	}, caption)
+	var messageID string
+	if media.Snap {
+		messageID, err = client.SendSnap(ctx, chatID, snapapi.MediaAttachment{
+			ID:       media.ID,
+			FileName: media.FileName,
+			MimeType: media.MimeType,
+			Data:     media.Data,
+		})
+	} else {
+		messageID, err = client.SendMedia(ctx, chatID, snapapi.MediaAttachment{
+			ID:       media.ID,
+			FileName: media.FileName,
+			MimeType: media.MimeType,
+			Data:     media.Data,
+		}, caption)
+	}
 	if err != nil {
 		sa.invalidateSnapClient()
 	} else if seconds := int64(client.RetentionDuration(chatID) / time.Second); seconds > 0 {

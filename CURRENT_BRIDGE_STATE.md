@@ -148,6 +148,14 @@ The full-stack runner writes connector stdout/stderr to `logs/connector.out.log`
 - Fix: synthesized sidebar messages now carry ContentType STATUS so the m.notice gate applies; sidebar previews containing screenshot / screen record / missed call map to friendly system text via systemEventPreviewText; "new message" added to the isGeneratedSnapchatNotice body list.
 - Bridge restarted pid 35632. Still open: streak start / web-session lines have no wire sample yet; unhandled content types log preview bytes for pinning.
 
+## Outgoing Snaps 2026-09-07 (implementation deployed, user verification pending)
+
+- Trigger: an image in Beeper captioned "Snap" (case-insensitive) sends as a real disappearing Snapchat snap (ContentType_SNAP, SavePolicy VIEW_SESSION) instead of saved chat media. Snaps carry no caption text; the caption is the routing trigger. Video snaps are rejected with a clear error (wire template is image-only).
+- `snapapi.SendSnap` mirrors the proven EXTERNAL_MEDIA pipeline (getUploadLocations → AES-256-CBC → PUT → CreateContentMessage) with `encodeSnapContents` building the snap item field-for-field from a live outgoing snap's decrypted contents captured the same day (media list with AES key/IV in both base64 4.1/4.2 and raw 19.1/19.2 forms, dimensions, random 32-byte delivery identifier at 13.4.1.2.13, capture timestamp 17.6, image type 22.4=5).
+- Unknowns: outgoing snaps on the wire normally carry EEL-encrypted contents; this sender posts cleartext contents (EnvelopeEncryption_None implicit, same as proven TEXT/EXTERNAL_MEDIA sends). Whether Snapchat accepts and delivers it as a snap is pending the user's first live send. If the recipient sees it as a snap, done; if the server rejects, the failure reason lands in the bridge log (`snapchat api snap send failed`).
+- Routing: `matrixMediaToSend` sets `MediaAttachment.Snap` when the image body equals "snap"; `sendMediaAPI` routes to `SendSnap`.
+- Bridge pid 54498 (full restart after Chrome session death).
+
 ## Incoming Snaps Working 2026-09-07 (LIVE VERIFIED)
 
 - Root cause of the last blocker: a protoGetField offset bug (never advanced past the length varint) made every nested-content parse garbage; timestampProbe parsed=0 exposed it. Fixed → `parsed: 13`, page coverage confirmed (snap contents 15:00–15:53).
