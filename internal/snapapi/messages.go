@@ -1,6 +1,7 @@
 package snapapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"fmt"
@@ -118,11 +119,27 @@ func (c *Client) messageFromProto(ctx context.Context, chatID string, msg *proto
 		// decrypted layout is 11.5.1.1.4.1 = key, 11.5.1.1.4.2 = IV). The
 		// connector decrypts the contents via the web app's session; once the
 		// bytes are available, attach the keys so the media can be downloaded
-		// and decrypted like ordinary chat media.
-		decoded := c.envelopeContentsForDecode(ctx, chatID, id, envelope, timestampMs)
+		// and decrypted like ordinary chat media. Ambiguous burst matching
+		// can return several candidate contents: every candidate's key is
+		// attached and the decrypt path tries them until one validates.
+		decoded, candidates := c.envelopeContentsWithCandidates(ctx, chatID, id, envelope, timestampMs)
 		if key, iv := snapMediaEncryptionKeys(decoded); len(key) > 0 {
 			for index := range media {
 				media[index].Key, media[index].IV = key, iv
+				for _, cand := range candidates {
+					if altKey, altIV := snapMediaEncryptionKeys(cand); len(altKey) > 0 && !bytes.Equal(altKey, key) {
+						duplicate := false
+						for _, existing := range media[index].AltKeys {
+							if bytes.Equal(existing.Key, altKey) {
+								duplicate = true
+								break
+							}
+						}
+						if !duplicate {
+							media[index].AltKeys = append(media[index].AltKeys, MediaKeyIV{Key: altKey, IV: altIV})
+						}
+					}
+				}
 			}
 		}
 	}
@@ -443,23 +460,26 @@ func (c *Client) envelopeContentsForDecode(ctx context.Context, chatID, messageI
 			// the throttle so a failed retry for one message cannot starve
 			// other messages, but the total attempt rate is capped at 3 per
 			// 20s window. Retries (alreadyFailed) always respect the 20s
-			// spacing. Throttled messages stay retryable on later polls.
+			// spacing. Operator resyncs bypass the rate cap entirely.
+			// Throttled messages stay retryable on later polls.
 			c.mu.Lock()
-			now := time.Now()
-			if c.eelWindowStart.IsZero() || now.Sub(c.eelWindowStart) >= 20*time.Second {
-				c.eelWindowStart = now
-				c.eelWindowAttempts = 0
+			if !eelThrottleBypass(ctx) {
+				now := time.Now()
+				if c.eelWindowStart.IsZero() || now.Sub(c.eelWindowStart) >= 20*time.Second {
+					c.eelWindowStart = now
+					c.eelWindowAttempts = 0
+				}
+				if alreadyFailed && now.Sub(c.lastEELAttempt) < 20*time.Second {
+					c.mu.Unlock()
+					return nil
+				}
+				if c.eelWindowAttempts >= 3 {
+					c.mu.Unlock()
+					return nil
+				}
+				c.eelWindowAttempts++
+				c.lastEELAttempt = now
 			}
-			if alreadyFailed && now.Sub(c.lastEELAttempt) < 20*time.Second {
-				c.mu.Unlock()
-				return nil
-			}
-			if c.eelWindowAttempts >= 3 {
-				c.mu.Unlock()
-				return nil
-			}
-			c.eelWindowAttempts++
-			c.lastEELAttempt = now
 			// Single in-flight attempt per conversation+message: concurrent
 			// pollers/resync/read-hydrate paths must not enqueue duplicate
 			// connector decrypt tasks for the same target. A waiter skips and
@@ -485,7 +505,7 @@ func (c *Client) envelopeContentsForDecode(ctx context.Context, chatID, messageI
 				c.mu.Unlock()
 				close(done)
 			}()
-			decrypted, err := c.eelDecrypter.DecryptEEL(ctx, EELDecryptRequest{
+			decrypted, candidates, err := c.decryptEELWithCandidates(ctx, EELDecryptRequest{
 				ConversationID:  chatID,
 				MessageID:       messageID,
 				Content:         raw,
@@ -512,7 +532,11 @@ func (c *Client) envelopeContentsForDecode(ctx context.Context, chatID, messageI
 			if c.eelPlaintext == nil {
 				c.eelPlaintext = make(map[string][]byte)
 			}
+			if c.eelCandidates == nil {
+				c.eelCandidates = make(map[string][][]byte)
+			}
 			c.eelPlaintext[cacheKey] = append([]byte(nil), decrypted...)
+			c.eelCandidates[cacheKey] = candidates
 			delete(c.failedEEL, cacheKey)
 			c.mu.Unlock()
 			return decrypted
@@ -522,6 +546,38 @@ func (c *Client) envelopeContentsForDecode(ctx context.Context, chatID, messageI
 		return nil
 	}
 	return raw
+}
+
+// envelopeContentsWithCandidates decodes the envelope contents and returns
+// any additional candidate contents recovered from ambiguous snap timestamp
+// matching (the decrypter caches them alongside the plaintext).
+func (c *Client) envelopeContentsWithCandidates(ctx context.Context, chatID, messageID string, envelope *protos.ContentEnvelope, timestampMs int64) ([]byte, [][]byte) {
+	decoded := c.envelopeContentsForDecode(ctx, chatID, messageID, envelope, timestampMs)
+	c.mu.Lock()
+	candidates := c.eelCandidates[chatID+"|"+messageID]
+	c.mu.Unlock()
+	return decoded, candidates
+}
+
+// decryptEELWithCandidates calls the configured decrypter, preferring the
+// richer candidate interface when the implementation supports it.
+func (c *Client) decryptEELWithCandidates(ctx context.Context, req EELDecryptRequest) ([]byte, [][]byte, error) {
+	if candidateDecrypter, ok := c.eelDecrypter.(EELCandidateDecrypter); ok {
+		return candidateDecrypter.DecryptEELWithCandidates(ctx, req)
+	}
+	decrypted, err := c.eelDecrypter.DecryptEEL(ctx, req)
+	return decrypted, nil, err
+}
+
+// eelThrottleBypassKey marks operator-initiated syncs (resync) that may
+// exceed the background EEL attempt rate: the connector's task lock and
+// per-attempt budgets still bound the cost.
+type eelThrottleBypassKey struct{}
+
+// WithEELThrottleBypass returns a context that lifts the background EEL
+// attempt-rate cap for the wrapped sync.
+func WithEELThrottleBypass(ctx context.Context) context.Context {
+	return context.WithValue(ctx, eelThrottleBypassKey{}, true)
 }
 
 // protoFieldsRaw parses one level of a protobuf message. Malformed input
@@ -655,6 +711,14 @@ func snapMediaEncryptionKeys(decoded []byte) ([]byte, []byte) {
 		}
 	}
 	return key, iv
+}
+
+func eelThrottleBypass(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	bypass, _ := ctx.Value(eelThrottleBypassKey{}).(bool)
+	return bypass
 }
 
 // eelMediaContentIDs extracts the media content-object IDs declared by the

@@ -3422,7 +3422,9 @@ export async function decryptEELMessage(input = {}) {
             const targetTimestampMs = Number(payload.timestampMs || 0);
             if (!lookup.exactMatch && targetTimestampMs > 0) {
               let best = null;
+              const candidates = [];
               let parsed = 0;
+              let lastParsed = [];
               let minTs = Infinity;
               let maxTs = 0;
               for (const message of fetchedMessages) {
@@ -3439,28 +3441,40 @@ export async function decryptEELMessage(input = {}) {
                 parsed += 1;
                 if (ts < minTs) minTs = ts;
                 if (ts > maxTs) maxTs = ts;
-                // The snap's capture timestamp must precede the server
-                // receive time by a small margin (normal delivery skew, 0-
-                // 10s). Snaps in bursts are ~10s apart, so this window pins
-                // the exact message; a wider window matches neighbors whose
-                // keys fail media decryption.
+                lastParsed.push(ts);
+                // Candidate window: capture time may trail server receive by
+                // up to ~30s (upload delay; observed skews 0-11s) and lead it
+                // by up to 10s (clock skew). Bursts make timestamps
+                // ambiguous, so return ALL candidates ordered by closeness
+                // and let the bridge try each key against the downloaded
+                // media - only the right key decrypts, which makes this
+                // misattribution-safe end to end.
                 const delta = targetTimestampMs - ts;
-                if (delta >= 0 && delta <= 10000 && (!best || delta < best.delta)) {
-                  best = { delta, message, candidate };
+                if (delta >= -10000 && delta <= 30000) {
+                  candidates.push({ delta, candidate });
                 }
+              }
+              candidates.sort((left, right) => Math.abs(left.delta) - Math.abs(right.delta));
+              if (candidates.length > 4) {
+                candidates.length = 4;
+              }
+              if (lastParsed.length > 8) {
+                lastParsed = lastParsed.slice(-8);
               }
               lookupDiagnostics.timestampProbe = {
                 parsed,
                 minTs: Number.isFinite(minTs) ? minTs : 0,
                 maxTs,
+                lastParsed,
                 targetTs: targetTimestampMs,
-                bestDelta: best ? best.delta : -1,
+                bestDelta: candidates.length > 0 ? candidates[0].delta : -1,
               };
-              if (best) {
+              if (candidates.length > 0) {
                 return {
-                  content: best.candidate,
-                  webMessageId: String(best.message?.descriptor?.messageId ?? best.message?.messageId ?? payload.messageId),
-                  analyticsMessageId: String(best.message?.messageAnalytics?.analyticsMessageId || ""),
+                  content: candidates[0].candidate,
+                  candidates: candidates.map((entry) => entry.candidate),
+                  webMessageId: String(best?.message?.descriptor?.messageId ?? best?.message?.messageId ?? payload.messageId),
+                  analyticsMessageId: String(best?.message?.messageAnalytics?.analyticsMessageId || ""),
                   contentSource: "timestamp_match",
                   messageCount: fetchedMessages.length,
                 };
@@ -3638,6 +3652,7 @@ export async function decryptEELMessage(input = {}) {
           return {
             ok: true,
             decryptedContentBase64: toBase64(messagingContent.content),
+            decryptedCandidatesBase64: (Array.isArray(messagingContent.candidates) ? messagingContent.candidates : []).map((value) => toBase64(value)),
             method: "messaging_fetch",
             webMessageId: messagingContent.webMessageId,
             analyticsMessageId: messagingContent.analyticsMessageId,

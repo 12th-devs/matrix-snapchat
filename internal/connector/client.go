@@ -162,8 +162,12 @@ type EELDecryptRequest struct {
 type EELDecryptResponse struct {
 	OK                     bool   `json:"ok"`
 	DecryptedContentBase64 string `json:"decryptedContentBase64,omitempty"`
-	Error                  string `json:"error,omitempty"`
-	Retryable              bool   `json:"retryable,omitempty"`
+	// DecryptedCandidatesBase64 carries additional candidate contents from
+	// ambiguous timestamp matching (snap bursts); the bridge tries each
+	// candidate's media key until one decrypts.
+	DecryptedCandidatesBase64 []string `json:"decryptedCandidatesBase64,omitempty"`
+	Error                     string   `json:"error,omitempty"`
+	Retryable                 bool     `json:"retryable,omitempty"`
 	// Decrypt-attribution diagnostics (never contain payload material).
 	Method              string `json:"method,omitempty"`
 	RequestedMessageID  string `json:"requestedMessageId,omitempty"`

@@ -50,6 +50,13 @@ type EELDecrypter interface {
 	DecryptEEL(ctx context.Context, req EELDecryptRequest) ([]byte, error)
 }
 
+// EELCandidateDecrypter is an optional richer decrypter interface: ambiguous
+// timestamp matching can return several candidate contents whose media keys
+// are tried against the downloaded media until one decrypts.
+type EELCandidateDecrypter interface {
+	DecryptEELWithCandidates(ctx context.Context, req EELDecryptRequest) (primary []byte, candidates [][]byte, err error)
+}
+
 type State struct {
 	SyncToken            []byte
 	ConversationVersions map[string]int64
@@ -86,6 +93,12 @@ const (
 	MediaKindAudio MediaKind = "audio"
 )
 
+// MediaKeyIV pairs a candidate media AES key with its IV.
+type MediaKeyIV struct {
+	Key []byte
+	IV  []byte
+}
+
 type MediaAttachment struct {
 	ID       string
 	URL      string
@@ -95,6 +108,10 @@ type MediaAttachment struct {
 	Data     []byte
 	Key      []byte
 	IV       []byte
+	// AltKeys holds candidate key/IV pairs from ambiguous snap timestamp
+	// matching; the decrypt path tries them in order when the primary key
+	// fails (only the correct key produces valid decrypted media).
+	AltKeys []MediaKeyIV
 }
 
 type Message struct {
@@ -155,6 +172,9 @@ type Client struct {
 	// the same conversation+message: one connector task per target, waiters
 	// simply skip and the message stays retryable on a later poll.
 	eelInflight map[string]chan struct{}
+	// eelCandidates caches candidate contents from ambiguous snap timestamp
+	// matching alongside the decrypted plaintext.
+	eelCandidates map[string][][]byte
 	// lastEELAttempt globally throttles EEL connector work: a poll cycle with
 	// many undecoded messages must not occupy the connector task queue for
 	// minutes (each attempt costs ~22s). At most one attempt per interval;

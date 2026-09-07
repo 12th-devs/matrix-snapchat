@@ -269,7 +269,7 @@ func (sa *SnapchatAPI) resyncOneChat(ctx context.Context, chat sidecar.Chat, sta
 		return fmt.Errorf("repair memberships: %w", err)
 	}
 	sa.queueChatResync(ctx, chat.ID, chat.Name)
-	err = sa.syncChatMessagesAPI(ctx, chat, 0, "resync-all", true, false, stats)
+	err = sa.syncChatMessagesAPI(snapapi.WithEELThrottleBypass(ctx), chat, 0, "resync-all", true, false, stats)
 	if err != nil {
 		return fmt.Errorf("message resync: %w", err)
 	}

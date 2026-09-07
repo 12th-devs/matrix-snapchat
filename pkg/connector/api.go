@@ -95,10 +95,17 @@ type connectorEELDecrypter struct {
 }
 
 func (d connectorEELDecrypter) DecryptEEL(ctx context.Context, req snapapi.EELDecryptRequest) ([]byte, error) {
+	decrypted, _, err := d.DecryptEELWithCandidates(ctx, req)
+	return decrypted, err
+}
+
+// DecryptEELWithCandidates carries ambiguous snap timestamp-match candidates
+// through the connector so the bridge can try every candidate media key.
+func (d connectorEELDecrypter) DecryptEELWithCandidates(ctx context.Context, req snapapi.EELDecryptRequest) ([]byte, [][]byte, error) {
 	if d.client == nil {
-		return nil, fmt.Errorf("connector client is not initialized")
+		return nil, nil, fmt.Errorf("connector client is not initialized")
 	}
-	decrypted, err := d.client.DecryptEEL(ctx, sidecar.EELDecryptRequest{
+	decrypted, response, err := d.client.DecryptEELDetailed(ctx, sidecar.EELDecryptRequest{
 		ConversationID:        req.ConversationID,
 		MessageID:             req.MessageID,
 		ContentBase64:         base64.StdEncoding.EncodeToString(req.Content),
@@ -107,8 +114,19 @@ func (d connectorEELDecrypter) DecryptEEL(ctx context.Context, req snapapi.EELDe
 		NonceBase64:           base64.StdEncoding.EncodeToString(req.Nonce),
 		SenderPublicKeyBase64: base64.StdEncoding.EncodeToString(req.SenderPublicKey),
 		SenderVersion:         req.SenderVersion,
+		MediaIDs:              req.MediaIDs,
+		TimestampMs:           req.TimestampMs,
 	})
-	return decrypted, err
+	if err != nil {
+		return nil, nil, err
+	}
+	var candidates [][]byte
+	for _, encoded := range response.DecryptedCandidatesBase64 {
+		if value, decodeErr := base64.StdEncoding.DecodeString(encoded); decodeErr == nil && len(value) > 0 {
+			candidates = append(candidates, value)
+		}
+	}
+	return decrypted, candidates, nil
 }
 
 var _ bridgev2.NetworkAPI = (*SnapchatAPI)(nil)
