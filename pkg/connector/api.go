@@ -247,6 +247,11 @@ func sidebarUpdateText(chat sidecar.Chat) (string, bool) {
 	if text, ok := systemEventPreviewText(lower); ok {
 		return text, true
 	}
+	// Client-rendered system lines reach the sidebar as their exact rendered
+	// text; pass them through instead of the generic "New message".
+	if text, ok := clientRenderedSystemLine(lower, detail); ok {
+		return text, true
+	}
 	if chat.Unread || looksLikeSnapOrMediaStatus(lower) {
 		return "New Snap", true
 	}
@@ -254,6 +259,22 @@ func sidebarUpdateText(chat sidecar.Chat) (string, bool) {
 		return "", false
 	}
 	return "New message", true
+}
+
+// clientRenderedSystemLine recognizes the sidebar previews of client-rendered
+// system lines whose exact texts are confirmed in the web bundle:
+// "YOU ARE USING SNAPCHAT FOR WEB", "{sender} IS USING SNAPCHAT FOR WEB",
+// "YOU AND {name} STARTED A SNAPSTREAK 🔥" and "YOUR {n}-DAY SNAPSTREAK
+// ENDED". The preview already is the exact client-rendered line, so it is
+// passed through verbatim.
+func clientRenderedSystemLine(lower, detail string) (string, bool) {
+	switch {
+	case strings.Contains(lower, "using snapchat for web"),
+		strings.Contains(lower, "snapstreak"),
+		strings.Contains(lower, "-day snapstreak ended"):
+		return detail, true
+	}
+	return "", false
 }
 
 // systemEventPreviewText maps recognizable Snapchat sidebar previews of

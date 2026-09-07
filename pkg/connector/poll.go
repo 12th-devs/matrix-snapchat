@@ -414,6 +414,11 @@ func (sa *SnapchatAPI) queueSidebarUpdate(chat sidecar.Chat, fingerprint string)
 	if !ok {
 		return
 	}
+	if body == "New message" || body == "New Snap" {
+		// Unrecognized preview: log it so the next client-rendered system
+		// line pattern can be pinned from real wire evidence.
+		log.Printf("bridgev2 sidebar: generic notice synthesized chat_id=%s unread=%t preview=%q", chat.ID, chat.Unread, chat.Preview)
+	}
 	hash := sha1.Sum([]byte(chat.ID + "|" + fingerprint + "|" + body))
 	message := sidecar.Message{
 		ID:        "sidebar-" + chat.ID + "-" + hex.EncodeToString(hash[:8]),
