@@ -20,3 +20,5 @@ tmp/
 *.yml.local
 build/pi-release/*.tar.gz
 *.tmp
+
+snapchat-inspect
