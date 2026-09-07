@@ -260,8 +260,9 @@ func (c *Client) MarkRead(ctx context.Context, chatID string, messageID int64, v
 	// uses UpdateConversation with the UpdateConversationRead action (read up
 	// to lastMessageId), which is what maintains the participant
 	// ReadHighWatermark. UpdateContentMessage with UpdateAction_Read is
-	// rejected by the server with UPDATE_NOT_APPLICABLE (verified live), so
-	// this must stay a conversation update.
+	// rejected by the server with UPDATE_NOT_APPLICABLE (verified live
+	// 2026-09-06 on a fresh unread chat text), so this must stay a
+	// conversation update.
 	currentVersion := conv.GetVersion()
 	if currentVersion <= 0 {
 		currentVersion = version

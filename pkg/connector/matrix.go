@@ -133,7 +133,12 @@ func (sa *SnapchatAPI) HandleMatrixReadReceipt(ctx context.Context, receipt *bri
 	}
 	diagBase().Bool("allowed_sync", allowedSync).Msg("receipt-diag: handler entry")
 
-	if receipt.Implicit || !sa.readReceiptsEnabled() {
+	// Implicit receipts (generated on outgoing sends when
+	// ImplicitReadReceipts is advertised) are the only read signal for
+	// messages read in an already-open room, so they flow through the same
+	// pipeline below: sync throttle, snap/media guard, forward-only
+	// watermark dedupe inside MarkRead.
+	if !sa.readReceiptsEnabled() {
 		log.Printf("bridgev2 event_class: kind=read_receipt source=matrix chat_id=%s enabled=%t implicit=%t action=skip", chatID, sa.readReceiptsEnabled(), receipt.Implicit)
 		diagBase().Str("stop", "implicit_or_disabled").Msg("receipt-diag: skipped")
 		return nil

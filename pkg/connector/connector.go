@@ -129,6 +129,13 @@ func (sc *SnapchatConnector) GetCapabilities() *bridgev2.NetworkGeneralCapabilit
 	return &bridgev2.NetworkGeneralCapabilities{
 		DisappearingMessages: true,
 		AggressiveUpdateInfo: false,
+		// Beeper clients do not send explicit m.read receipts when a portal is
+		// already open and the user merely replies. With this flag bridgev2
+		// emits an implicit read receipt on each outgoing send, which
+		// HandleMatrixReadReceipt converts into the existing forward-only
+		// UpdateConversation(read) watermark update (same snap/media guard,
+		// same watermark dedupe, same sync throttle).
+		ImplicitReadReceipts: sc != nil && sc.Config.ReadReceiptsEnabled,
 		Provisioning: bridgev2.ProvisioningCapabilities{
 			ResolveIdentifier: bridgev2.ResolveIdentifierCapabilities{
 				CreateDM:    true,
