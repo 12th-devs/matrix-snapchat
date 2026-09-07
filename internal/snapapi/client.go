@@ -147,6 +147,11 @@ type Client struct {
 	// the same conversation+message: one connector task per target, waiters
 	// simply skip and the message stays retryable on a later poll.
 	eelInflight map[string]chan struct{}
+	// lastEELAttempt globally throttles EEL connector work: a poll cycle with
+	// many undecoded messages must not occupy the connector task queue for
+	// minutes (each attempt costs ~22s). At most one attempt per interval;
+	// skipped messages remain retryable on later polls.
+	lastEELAttempt time.Time
 
 	mediaMappingMu sync.Mutex
 	mediaMapping   *boltNetworkMapping

@@ -3176,82 +3176,13 @@ export async function decryptEELMessage(input = {}) {
         if (!messagingClient || !conversationRef?.id || !messaging?.uk) {
           return undefined;
         }
-        // Fast path: the manager's fetchMessage resolves ONE message by ID
-        // (server message identifier) and returns its decrypted content.
-        // Try the two most plausible identifier shapes; misses are recorded.
-        // Keep this cheap: the bridge retries undecoded messages on a backoff,
-        // and heavy attempts wedge the connector task queue.
-        if (messaging.A_) {
-          const shapes = [
-            ["number", Number(targetMessageId)],
-            ["string", String(targetMessageId)],
-          ];
-          if (!Array.isArray(lookupDiagnostics.fetchMessageAttempts)) {
-            lookupDiagnostics.fetchMessageAttempts = [];
-          }
-          for (const [shapeLabel, shape] of shapes) {
-            if (remainingMs() <= 0) {
-              lookupDiagnostics.budgetExhausted = true;
-              break;
-            }
-            try {
-              const fetched = await Promise.race([
-                messaging.A_(messagingClient, shape),
-                new Promise((_, reject) => setTimeout(() => reject(new Error("fetch_message_timeout")), 6000)),
-              ]);
-              const content = resultBytes(fetched?.content)
-                || resultBytes(fetched?.messageContent?.content)
-                || resultBytes(fetched?.messageContent);
-              lookupDiagnostics.fetchMessageAttempts.push({
-                shape: shapeLabel,
-                resolved: fetched !== undefined,
-                hasContent: Boolean(content),
-                contentType: fetched ? typeof fetched.content : "",
-              });
-              if (content) {
-                return {
-                  content,
-                  webMessageId: String(fetched?.descriptor?.messageId ?? fetched?.messageId ?? targetMessageId),
-                  analyticsMessageId: String(fetched?.messageAnalytics?.analyticsMessageId || ""),
-                  contentSource: "fetch_message",
-                  messageCount: 1,
-                };
-              }
-            } catch (error) {
-              lookupDiagnostics.fetchMessageAttempts.push({
-                shape: shapeLabel,
-                error: String(error?.message || error || "unknown").slice(0, 120),
-              });
-            }
-          }
-        }
-        // Force a server sync of THIS conversation so the cached pages include
-        // the newest messages (the idle page lags behind by dozens of
-        // messages). conversationType/minVersion are passed as best-effort
-        // guesses; a failure is recorded and the page fetches run anyway.
-        let synced = false;
-        let syncError = "";
-        if (messaging.Kz && remainingMs() > 0) {
-          try {
-            await Promise.race([
-              messaging.Kz(messagingClient, targetConversationId, 0, 0, undefined, undefined),
-              new Promise((_, reject) => setTimeout(() => reject(new Error("sync_conversation_timeout")), Math.min(10000, Math.max(1000, remainingMs())))),
-            ]);
-            synced = true;
-            syncError = "";
-          } catch (error) {
-            synced = false;
-            syncError = String(error?.message || error || "unknown").slice(0, 120);
-          }
-          if (lookupDiagnostics) {
-            lookupDiagnostics.syncedConversation = synced;
-            lookupDiagnostics.syncError = syncError;
-          }
-        }
-        if (remainingMs() <= 0) {
-          lookupDiagnostics.budgetExhausted = true;
-          return undefined;
-        }
+        // PARKED strategies: the manager's fetchMessage (export A_) and
+        // syncServerConversation (export Kz) look promising for fetching one
+        // message with decrypted content, but their identifier/option shapes
+        // are not pinned yet - both phases only ever hit their timeouts,
+        // consuming the whole lookup budget before the page fetches that
+        // actually succeed. Do not re-enable until their shapes are
+        // reverse-engineered (see CURRENT_BRIDGE_STATE.md).
         const attempts = [
           ["uk", () => messaging.uk(messagingClient, conversationRef)],
         ];
