@@ -36,6 +36,14 @@ type EELDecryptRequest struct {
 	Nonce           []byte
 	SenderPublicKey []byte
 	SenderVersion   int32
+	// MediaIDs are the envelope's media content-object IDs. The connector
+	// matches fetched decrypted content against them because snap messages
+	// use a different analytics identifier shape in the web app.
+	MediaIDs []string
+	// TimestampMs is the message's server-created timestamp. Snap messages
+	// embed their capture timestamp in the decrypted contents, so the
+	// connector matches on it (snap ids are absent from the app state).
+	TimestampMs int64
 }
 
 type EELDecrypter interface {

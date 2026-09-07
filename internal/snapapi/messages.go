@@ -2,6 +2,7 @@ package snapapi
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"log"
 	"sort"
@@ -83,9 +84,10 @@ func (c *Client) messageFromProto(ctx context.Context, chatID string, msg *proto
 	envelope := msg.GetContents()
 	contentType := envelope.GetContentType()
 	body, isSnap := c.messageBody(ctx, chatID, msg)
+	timestampMs := msg.GetMetaData().GetServerCreatedAt()
 	media := mediaAttachmentsFromEnvelope(envelope, id)
 	if contentType == protos.ContentType_EXTERNAL_MEDIA && len(media) == 1 {
-		decoded := c.envelopeContentsForDecode(ctx, chatID, id, envelope)
+		decoded := c.envelopeContentsForDecode(ctx, chatID, id, envelope, timestampMs)
 		key, iv, err := ExternalMediaEncryptionKeys(decoded)
 		if err != nil {
 			log.Printf("snapapi media: external encryption metadata unavailable message_id=%s: %v", id, err)
@@ -97,7 +99,7 @@ func (c *Client) messageFromProto(ctx context.Context, chatID string, msg *proto
 		// Voice notes carry the AES key/IV (base64) inside the note metadata
 		// and reference the audio content object with an unassigned media
 		// type; present them as audio so the bridge renders m.audio.
-		decoded := c.envelopeContentsForDecode(ctx, chatID, id, envelope)
+		decoded := c.envelopeContentsForDecode(ctx, chatID, id, envelope, timestampMs)
 		key, iv, _, err := NoteAudioEncryptionKeys(decoded)
 		if err != nil {
 			log.Printf("snapapi media: note encryption metadata unavailable message_id=%s: %v", id, err)
@@ -108,6 +110,19 @@ func (c *Client) messageFromProto(ctx context.Context, chatID string, msg *proto
 			media[0].Kind = MediaKindAudio
 			if media[0].MimeType == "" || media[0].MimeType == "application/octet-stream" {
 				media[0].MimeType = "audio/mp4"
+			}
+		}
+	}
+	if isSnap && len(media) > 0 && len(media[0].Key) == 0 {
+		// Snap media keys live inside the EEL-encrypted snap contents (the
+		// decrypted layout is 11.5.1.1.4.1 = key, 11.5.1.1.4.2 = IV). The
+		// connector decrypts the contents via the web app's session; once the
+		// bytes are available, attach the keys so the media can be downloaded
+		// and decrypted like ordinary chat media.
+		decoded := c.envelopeContentsForDecode(ctx, chatID, id, envelope, timestampMs)
+		if key, iv := snapMediaEncryptionKeys(decoded); len(key) > 0 {
+			for index := range media {
+				media[index].Key, media[index].IV = key, iv
 			}
 		}
 	}
@@ -226,7 +241,8 @@ func (c *Client) messageBody(ctx context.Context, chatID string, msg *protos.Con
 	contentType := envelope.GetContentType()
 	contentLen := len(envelope.GetContents())
 	var contents protos.Contents
-	if encodedContents := c.envelopeContentsForDecode(ctx, chatID, messageID, envelope); len(encodedContents) > 0 {
+	timestampMs := msg.GetMetaData().GetServerCreatedAt()
+	if encodedContents := c.envelopeContentsForDecode(ctx, chatID, messageID, envelope, timestampMs); len(encodedContents) > 0 {
 		if text := decodedChatBody(encodedContents); contentType == protos.ContentType_CHAT && text != "" {
 			return text, false
 		}
@@ -385,7 +401,7 @@ func readProtoVarint(raw []byte, offset int) (uint64, int, bool) {
 	return 0, offset, false
 }
 
-func (c *Client) envelopeContentsForDecode(ctx context.Context, chatID, messageID string, envelope *protos.ContentEnvelope) []byte {
+func (c *Client) envelopeContentsForDecode(ctx context.Context, chatID, messageID string, envelope *protos.ContentEnvelope, timestampMs int64) []byte {
 	if envelope == nil {
 		return nil
 	}
@@ -467,6 +483,8 @@ func (c *Client) envelopeContentsForDecode(ctx context.Context, chatID, messageI
 				Nonce:           eel.GetNonce(),
 				SenderPublicKey: eel.GetSenderPublicKey(),
 				SenderVersion:   eel.GetSenderVersion(),
+				MediaIDs:        eelMediaContentIDs(envelope),
+				TimestampMs:     timestampMs,
 			})
 			if err != nil {
 				log.Printf("snapapi decode: EEL helper failed message_id=%s conversation_id=%s content=%d cek=%d cek_iv=%d nonce=%d sender_pub=%d sender_version=%d failure=%T",
@@ -493,6 +511,156 @@ func (c *Client) envelopeContentsForDecode(ctx context.Context, chatID, messageI
 		return nil
 	}
 	return raw
+}
+
+// protoFieldsRaw parses one level of a protobuf message. Malformed input
+// returns what was parsed so far; callers treat short reads as absent fields.
+type protoFieldRaw struct {
+	number   int
+	wireType int
+	value    []byte
+}
+
+func parseProtoFieldsRaw(raw []byte) []protoFieldRaw {
+	fields := make([]protoFieldRaw, 0, 8)
+	offset := 0
+	for offset < len(raw) {
+		tag, next, ok := readProtoVarint(raw, offset)
+		if !ok {
+			return fields
+		}
+		offset = next
+		number := int(tag >> 3)
+		wireType := int(tag & 0x7)
+		switch wireType {
+		case 0:
+			value, end, ok := readProtoVarint(raw, offset)
+			if !ok {
+				return fields
+			}
+			fields = append(fields, protoFieldRaw{number, wireType, nil})
+			_ = value
+			offset = end
+		case 2:
+			length, end, ok := readProtoVarint(raw, offset)
+			if !ok || end+int(length) > len(raw) {
+				return fields
+			}
+			fields = append(fields, protoFieldRaw{number, wireType, raw[end : end+int(length)]})
+			offset = end + int(length)
+		case 5:
+			if offset+4 > len(raw) {
+				return fields
+			}
+			offset += 4
+		case 1:
+			if offset+8 > len(raw) {
+				return fields
+			}
+			offset += 8
+		default:
+			return fields
+		}
+	}
+	return fields
+}
+
+// snapMediaEncryptionKeys extracts the media AES key and IV from decrypted
+// snap contents. Confirmed live layout: field 11 (snap item) → 5 (media) →
+// 1 → 1 → 4 (encryption), where 1 is the base64 32-byte key and 2 the base64
+// 16-byte IV; the raw bytes are duplicated at 19.1/19.2.
+func snapMediaEncryptionKeys(decoded []byte) ([]byte, []byte) {
+	if len(decoded) == 0 {
+		return nil, nil
+	}
+	var snapItem []byte
+	for _, f := range parseProtoFieldsRaw(decoded) {
+		if f.number == 11 && f.wireType == 2 {
+			snapItem = f.value
+		}
+	}
+	if snapItem == nil {
+		return nil, nil
+	}
+	var mediaSection []byte
+	for _, f := range parseProtoFieldsRaw(snapItem) {
+		if f.number == 5 && f.wireType == 2 {
+			mediaSection = f.value
+		}
+	}
+	if mediaSection == nil {
+		return nil, nil
+	}
+	var list []byte
+	for _, f := range parseProtoFieldsRaw(mediaSection) {
+		if f.number == 1 && f.wireType == 2 {
+			list = f.value
+		}
+	}
+	if list == nil {
+		return nil, nil
+	}
+	var item []byte
+	for _, f := range parseProtoFieldsRaw(list) {
+		if f.number == 1 && f.wireType == 2 {
+			item = f.value
+		}
+	}
+	if item == nil {
+		return nil, nil
+	}
+	var key, iv []byte
+	for _, f := range parseProtoFieldsRaw(item) {
+		if f.number != 4 || f.wireType != 2 {
+			continue
+		}
+		for _, e := range parseProtoFieldsRaw(f.value) {
+			switch {
+			case e.number == 1 && e.wireType == 2:
+				if k, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(e.value))); err == nil && len(k) == 32 {
+					key = k
+				}
+			case e.number == 2 && e.wireType == 2:
+				if v, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(e.value))); err == nil && len(v) == 16 {
+					iv = v
+				}
+			}
+		}
+	}
+	if key != nil && iv != nil {
+		return key, iv
+	}
+	for _, f := range parseProtoFieldsRaw(item) {
+		if f.number != 19 || f.wireType != 2 {
+			continue
+		}
+		for _, r := range parseProtoFieldsRaw(f.value) {
+			if r.number == 1 && r.wireType == 2 && len(r.value) == 32 {
+				key = r.value
+			}
+			if r.number == 2 && r.wireType == 2 && len(r.value) == 16 {
+				iv = r.value
+			}
+		}
+	}
+	return key, iv
+}
+
+// eelMediaContentIDs extracts the media content-object IDs declared by the
+// envelope. The connector uses them to attribute fetched decrypted content to
+// this exact message: snap messages carry a different analytics identifier
+// shape in the web app, so the numeric message ID alone cannot find them.
+func eelMediaContentIDs(envelope *protos.ContentEnvelope) []string {
+	if envelope == nil {
+		return nil
+	}
+	ids := make([]string, 0, 2)
+	for _, att := range mediaAttachmentsFromEnvelope(envelope, "") {
+		if id := MediaDescriptorID(att.Data); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 func createdMessageIDFromResponse(resp *protos.CreateContentMessageResponse) string {

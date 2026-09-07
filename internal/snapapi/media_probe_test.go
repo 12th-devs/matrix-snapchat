@@ -129,7 +129,7 @@ func TestMediaEnvelopeProbe(t *testing.T) {
 			enc.GetClearTextEelKeyEncryption(), enc.GetEelEncryption())
 		contents := envelope.GetContents()
 		t.Logf("  contents: len=%d", len(contents))
-		decoded := client.envelopeContentsForDecode(ctx, chatID, id, envelope)
+		decoded := client.envelopeContentsForDecode(ctx, chatID, id, envelope, 0)
 		t.Logf("  decoded contents: len=%d", len(decoded))
 		walkProtoFields(t, "  decoded", decoded, 0, 6)
 		if envelope.GetContentType() == protos.ContentType_EXTERNAL_MEDIA {

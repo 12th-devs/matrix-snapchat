@@ -26,22 +26,25 @@ func TestDecideMediaHydrationRecoveryRule(t *testing.T) {
 	fresh := &store.MessageState{PortalKey: "chat-1", RemoteID: "4115", Kind: "media", HasMedia: true}
 
 	cases := []struct {
-		name      string
-		existing  *store.MessageState
-		confirmed bool
-		isSnap    bool
-		want      mediaHydrationDecision
+		name          string
+		existing      *store.MessageState
+		confirmed     bool
+		isSnap        bool
+		snapKeysReady bool
+		want          mediaHydrationDecision
 	}{
-		{"stale hydration without delivery proof recovers", stale, false, false, mediaHydrationRecover},
-		{"stale hydration with delivery proof skips", stale, true, false, mediaHydrationSkip},
-		{"no hydration with media renders normally", fresh, false, false, mediaHydrationRender},
-		{"unknown message with media renders normally", nil, false, false, mediaHydrationRender},
-		{"hydrated snap stays skipped", stale, false, true, mediaHydrationSkip},
-		{"unhydrated snap stays skipped", fresh, false, true, mediaHydrationSkip},
-		{"delivered media skips without redownload", stale, true, false, mediaHydrationSkip},
+		{"stale hydration without delivery proof recovers", stale, false, false, false, mediaHydrationRecover},
+		{"stale hydration with delivery proof skips", stale, true, false, false, mediaHydrationSkip},
+		{"no hydration with media renders normally", fresh, false, false, false, mediaHydrationRender},
+		{"unknown message with media renders normally", nil, false, false, false, mediaHydrationRender},
+		{"hydrated snap without keys stays skipped", stale, false, true, false, mediaHydrationSkip},
+		{"unhydrated snap without keys stays skipped", fresh, false, true, false, mediaHydrationSkip},
+		{"delivered media skips without redownload", stale, true, false, false, mediaHydrationSkip},
+		{"snap with recovered keys renders", nil, false, true, true, mediaHydrationRender},
+		{"delivered snap with keys skips", stale, true, true, true, mediaHydrationSkip},
 	}
 	for _, tc := range cases {
-		if got := decideMediaHydration(tc.existing, tc.confirmed, tc.isSnap); got != tc.want {
+		if got := decideMediaHydration(tc.existing, tc.confirmed, tc.isSnap, tc.snapKeysReady); got != tc.want {
 			t.Fatalf("%s: decision = %d, want %d", tc.name, got, tc.want)
 		}
 	}

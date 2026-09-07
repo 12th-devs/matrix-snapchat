@@ -102,6 +102,9 @@ type MessageInspectReport struct {
 	EELNonceB64      string `json:"eelNonceB64,omitempty"`
 	EELSenderPubB64  string `json:"eelSenderPublicKeyB64,omitempty"`
 	EELSenderVersion int32  `json:"eelSenderVersion,omitempty"`
+	// TimestampMs is the message's server-created time (ms); snap contents
+	// matching in the connector uses it.
+	TimestampMs         int64                  `json:"timestampMs,omitempty"`
 	ContentsTree        []*InspectNode         `json:"contentsTree,omitempty"`
 	TextFields          []string               `json:"textFields,omitempty"`
 	SearchTerm          string                 `json:"searchTerm,omitempty"`
@@ -182,7 +185,7 @@ func (c *Client) buildInspectReport(ctx context.Context, chatID, messageID strin
 			report.MediaReferenceLists = append(report.MediaReferenceLists, inspectMediaReference(listIndex, refIndex, ref))
 		}
 	}
-	contents := c.envelopeContentsForDecode(ctx, chatID, messageID, envelope)
+	contents := c.envelopeContentsForDecode(ctx, chatID, messageID, envelope, msg.GetMetaData().GetServerCreatedAt())
 	report.ContentsLen = len(contents)
 	report.ContentsSource = c.contentsSourceName(envelope, contents)
 	if eel := envelope.GetEnvelopeEncryption().GetEelEncryption(); eel != nil {
@@ -197,6 +200,7 @@ func (c *Client) buildInspectReport(ctx context.Context, chatID, messageID strin
 		report.EELSenderPubB64 = base64.StdEncoding.EncodeToString(eel.GetSenderPublicKey())
 		report.EELSenderVersion = eel.GetSenderVersion()
 	}
+	report.TimestampMs = msg.GetMetaData().GetServerCreatedAt()
 	if len(contents) > 0 {
 		hash := sha256.Sum256(contents)
 		report.ContentsSha256 = hex.EncodeToString(hash[:])

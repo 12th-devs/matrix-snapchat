@@ -186,6 +186,7 @@ func (sa *SnapchatAPI) syncChatMessagesAPI(ctx context.Context, chat sidecar.Cha
 				existing,
 				confirmed,
 				isSnapRow(apiMessage),
+				snapMediaKeysReady(apiMessage),
 			)
 			switch decision {
 			case mediaHydrationSkip:

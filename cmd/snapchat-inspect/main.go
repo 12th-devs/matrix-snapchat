@@ -216,6 +216,8 @@ func (d *sidecarEELDecrypter) DecryptEEL(ctx context.Context, req snapapi.EELDec
 		NonceBase64:           base64Encode(req.Nonce),
 		SenderPublicKeyBase64: base64Encode(req.SenderPublicKey),
 		SenderVersion:         req.SenderVersion,
+		MediaIDs:              req.MediaIDs,
+		TimestampMs:           req.TimestampMs,
 	})
 	d.last = response
 	return decrypted, err

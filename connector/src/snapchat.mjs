@@ -2867,7 +2867,7 @@ export async function decryptEELMessage(input = {}) {
     if (!currentPage || currentPage.isClosed()) {
       return { ok: false, error: "no_active_page", retryable: true };
     }
-    const result = await currentPage.evaluate(async (payload) => {
+    const runEelLookup = () => currentPage.evaluate(async (payload) => {
       function fromBase64(value) {
         if (!value) {
           return new Uint8Array();
@@ -3087,6 +3087,121 @@ export async function decryptEELMessage(input = {}) {
         return undefined;
       }
 
+      function bytesToLatin1(bytes) {
+        let out = "";
+        const chunkSize = 0x8000;
+        for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+          out += String.fromCharCode.apply(null, bytes.subarray(offset, offset + chunkSize));
+        }
+        return out;
+      }
+
+      function contentIncludesAny(bytes, ids) {
+        let text = "";
+        try {
+          text = bytesToLatin1(bytes);
+        } catch {
+          return false;
+        }
+        for (const id of ids) {
+          if (id && text.includes(id)) {
+            return true;
+          }
+        }
+        // The contents may store the media id as raw bytes instead of the
+        // base64url string; search the decoded form too.
+        for (const id of ids) {
+          if (!id || id.length < 8) {
+            continue;
+          }
+          let b64 = id.replace(/-/g, "+").replace(/_/g, "/");
+          while (b64.length % 4) {
+            b64 += "=";
+          }
+          try {
+            if (text.includes(atob(b64))) {
+              return true;
+            }
+          } catch {
+          }
+        }
+        return false;
+      }
+
+      function readVarintFrom(bytes, offset) {
+        let value = 0;
+        let shift = 0;
+        while (offset < bytes.length && shift < 64) {
+          const byte = bytes[offset++];
+          value += (byte & 0x7f) * Math.pow(2, shift);
+          if (!(byte & 0x80)) {
+            return [value, offset];
+          }
+          shift += 7;
+        }
+        return [NaN, offset];
+      }
+
+      // Minimal top-level protobuf field reader for the decrypted snap
+      // contents layout (11 = snap item, 11.17 = timestamps, 11.17.5 =
+      // capture timestamp ms).
+      function protoGetField(bytes, fieldNum) {
+        const out = [];
+        let offset = 0;
+        while (offset < bytes.length) {
+          const [tag, next] = readVarintFrom(bytes, offset);
+          if (Number.isNaN(tag) || tag <= 0) {
+            return out;
+          }
+          const field = Math.floor(tag / 8);
+          const wireType = tag % 8;
+          offset = next;
+          if (wireType === 0) {
+            const [value, end] = readVarintFrom(bytes, offset);
+            if (Number.isNaN(value)) {
+              return out;
+            }
+            offset = end;
+            if (field === fieldNum) {
+              out.push([wireType, value]);
+            }
+          } else if (wireType === 2) {
+            const [len, end] = readVarintFrom(bytes, offset);
+            if (Number.isNaN(len) || offset + len > bytes.length) {
+              return out;
+            }
+            const value = bytes.subarray(offset, offset + len);
+            offset = end;
+            if (field === fieldNum) {
+              out.push([wireType, value]);
+            }
+          } else if (wireType === 5) {
+            offset += 4;
+          } else if (wireType === 1) {
+            offset += 8;
+          } else {
+            return out;
+          }
+        }
+        return out;
+      }
+
+      function snapTimestampMs(content) {
+        const f11 = protoGetField(content, 11).find(([wireType]) => wireType === 2);
+        if (!f11) {
+          return NaN;
+        }
+        const f17 = protoGetField(f11[1], 17).find(([wireType]) => wireType === 2);
+        if (!f17) {
+          return NaN;
+        }
+        const f5 = protoGetField(f17[1], 5).find(([wireType]) => wireType === 0);
+        if (!f5) {
+          return NaN;
+        }
+        return Number(f5[1]);
+      }
+
       function serverHexFromMessageId(messageId) {
         const numeric = Number(messageId || 0);
         if (!Number.isFinite(numeric) || numeric <= 0) {
@@ -3273,6 +3388,171 @@ export async function decryptEELMessage(input = {}) {
                 messageCount: lookup.messageCount,
               };
             }
+            // Media-ID attribution: snap messages carry a different analytics
+            // identifier shape in the app, so the numeric ID match above can
+            // miss them. The target's media content-object IDs (declared in
+            // its envelope) appear in exactly one message's decrypted
+            // contents, making this a strict, misattribution-safe match.
+            const mediaIds = Array.isArray(payload.mediaIds) ? payload.mediaIds : [];
+            // Timestamp attribution: snap messages use a different analytics
+            // identifier shape in the app and their contents carry no media
+            // id, but each snap's decrypted content embeds its capture
+            // timestamp (field 11.17.5, ms). Match the target message's
+            // server timestamp to the closest candidate within a bounded
+            // window; a wrong neighbor fails media decryption later and stays
+            // retryable, so this is misattribution-safe end to end.
+            const targetTimestampMs = Number(payload.timestampMs || 0);
+            if (!lookup.exactMatch && targetTimestampMs > 0) {
+              let best = null;
+              for (const message of fetchedMessages) {
+                const candidate = resultBytes(message?.content)
+                  || resultBytes(message?.messageContent?.content)
+                  || resultBytes(message?.messageContent);
+                if (!candidate || !candidate.byteLength) {
+                  continue;
+                }
+                const ts = snapTimestampMs(candidate);
+                if (!Number.isFinite(ts)) {
+                  continue;
+                }
+                const delta = Math.abs(ts - targetTimestampMs);
+                if (delta <= 120000 && (!best || delta < best.delta)) {
+                  best = { delta, message, candidate };
+                }
+              }
+              if (best) {
+                return {
+                  content: best.candidate,
+                  webMessageId: String(best.message?.descriptor?.messageId ?? best.message?.messageId ?? payload.messageId),
+                  analyticsMessageId: String(best.message?.messageAnalytics?.analyticsMessageId || ""),
+                  contentSource: "timestamp_match",
+                  messageCount: fetchedMessages.length,
+                };
+              }
+            }
+            if (!lookupDiagnostics.contentProbe) {
+              lookupDiagnostics.contentProbe = fetchedMessages.slice(-4).map((message) => {
+                const candidate = resultBytes(message?.content)
+                  || resultBytes(message?.messageContent?.content)
+                  || resultBytes(message?.messageContent);
+                let preview = "";
+                if (candidate && candidate.byteLength) {
+                  try {
+                    preview = toBase64(candidate);
+                  } catch {
+                    preview = "?";
+                  }
+                }
+                return [
+                  String(message?.descriptor?.messageId ?? message?.messageId ?? "?"),
+                  candidate ? candidate.byteLength : 0,
+                  preview.slice(0, 400),
+                ];
+              });
+            }
+            if (mediaIds.length > 0) {
+              for (const message of fetchedMessages) {
+                const candidate = resultBytes(message?.content)
+                  || resultBytes(message?.messageContent?.content)
+                  || resultBytes(message?.messageContent);
+                if (!candidate || !candidate.byteLength) {
+                  continue;
+                }
+                if (!contentIncludesAny(candidate, mediaIds)) {
+                  continue;
+                }
+                return {
+                  content: candidate,
+                  webMessageId: String(message?.descriptor?.messageId ?? message?.messageId ?? payload.messageId),
+                  analyticsMessageId: String(message?.messageAnalytics?.analyticsMessageId || ""),
+                  contentSource: "media_id_match",
+                  messageCount: fetchedMessages.length,
+                };
+              }
+            }
+          }
+          // App-state pass: the UI's rendered conversation messages can
+          // include newer items than the manager's fetch page. Harvest every
+          // plausible message array from the app state and run the same
+          // timestamp matching over it. Every access is defensive: the app
+          // state can be a reactive proxy that throws on probing.
+          const targetTimestampMs = Number(payload.timestampMs || 0);
+          if (targetTimestampMs > 0) {
+            const feedItem = appState?.messaging?.feed?.[targetConversationId];
+            const harvested = [];
+            const messagingKeys = [];
+            const feedItemKeys = [];
+            try {
+              messagingKeys.push(...Object.keys(appState?.messaging || {}).slice(0, 15));
+            } catch {
+            }
+            try {
+              feedItemKeys.push(...Object.keys(feedItem || {}).slice(0, 15));
+            } catch {
+            }
+            for (const arr of [
+              feedItem?.conversation?.messages,
+              feedItem?.messages,
+              appState?.messaging?.conversations?.[targetConversationId]?.messages,
+              appState?.messaging?.conversations?.[targetConversationId]?.messageList,
+            ]) {
+              try {
+                if (Array.isArray(arr)) {
+                  harvested.push(...arr);
+                }
+              } catch {
+              }
+            }
+            // The conversation manager keeps the loaded conversation (with
+            // its message cache) outside app state; ask it directly.
+            try {
+              if (messaging.QL && messagingClient) {
+                const conv = await Promise.race([
+                  messaging.QL(messagingClient, conversationRef),
+                  new Promise((_, reject) => setTimeout(() => reject(new Error("get_conversation_timeout")), 5000)),
+                ]);
+                const convObj = conv?.conversation || conv;
+                lookupDiagnostics.getConversationKeys = Object.keys(convObj || {}).slice(0, 25);
+                if (Array.isArray(convObj?.messages)) {
+                  harvested.push(...convObj.messages);
+                }
+              }
+            } catch (getError) {
+              lookupDiagnostics.getConversationError = String(getError?.message || getError || "unknown").slice(0, 120);
+            }
+            lookupDiagnostics.appStateProbe = {
+              messagingKeys,
+              feedItemKeys,
+              harvestedCount: harvested.length,
+            };
+            if (harvested.length > 0) {
+              let best = null;
+              for (const message of harvested) {
+                const candidate = resultBytes(message?.content)
+                  || resultBytes(message?.messageContent?.content)
+                  || resultBytes(message?.messageContent);
+                if (!candidate || !candidate.byteLength) {
+                  continue;
+                }
+                const ts = snapTimestampMs(candidate);
+                if (!Number.isFinite(ts)) {
+                  continue;
+                }
+                const delta = Math.abs(ts - targetTimestampMs);
+                if (delta <= 120000 && (!best || delta < best.delta)) {
+                  best = { delta, message, candidate };
+                }
+              }
+              if (best) {
+                return {
+                  content: best.candidate,
+                  webMessageId: String(best.message?.descriptor?.messageId ?? best.message?.messageId ?? payload.messageId),
+                  analyticsMessageId: String(best.message?.messageAnalytics?.analyticsMessageId || ""),
+                  contentSource: "app_state_timestamp_match",
+                  messageCount: harvested.length,
+                };
+              }
+            }
           }
         } catch {
           // Bounded lookup: any unexpected failure falls through to the
@@ -3347,7 +3627,7 @@ export async function decryptEELMessage(input = {}) {
         };
       }
       if (!keyManager) {
-        return { ok: false, error: "eel_key_manager_unavailable", retryable: true, syncedConversation: messagingLookup.syncedConversation === true, syncError: String(messagingLookup.syncError || ""), fetchMessageAttempts: Array.isArray(messagingLookup.fetchMessageAttempts) ? messagingLookup.fetchMessageAttempts.slice(0, 6) : [], fetchPages: Array.isArray(messagingLookup.fetchPages) ? messagingLookup.fetchPages.slice(0, 4) : [], idProbe: messagingLookup.idProbe || null };
+        return { ok: false, error: "eel_key_manager_unavailable", retryable: true, syncedConversation: messagingLookup.syncedConversation === true, syncError: String(messagingLookup.syncError || ""), fetchMessageAttempts: Array.isArray(messagingLookup.fetchMessageAttempts) ? messagingLookup.fetchMessageAttempts.slice(0, 6) : [], fetchPages: Array.isArray(messagingLookup.fetchPages) ? messagingLookup.fetchPages.slice(0, 4) : [], contentProbe: Array.isArray(messagingLookup.contentProbe) ? messagingLookup.contentProbe : [], appStateProbe: messagingLookup.appStateProbe || null, idProbe: messagingLookup.idProbe || null };
       }
 
       const attempts = [];
@@ -3395,11 +3675,13 @@ export async function decryptEELMessage(input = {}) {
           }
         }
       }
-      return { ok: false, error: "eel_decrypt_unavailable", retryable: true, failureClass: budgetExhausted ? "lookup_budget_exhausted" : (attempts.length > 0 ? "attempts_exhausted" : "no_candidate_methods"), budgetExhausted, requestedMessageId: payload.messageId, matchedWebMessageId: "", messageCount: messagingLookup.messageCount, exactMatch: false, exactMatchMiss: messagingLookup.missReason || "", syncedConversation: messagingLookup.syncedConversation === true, syncError: String(messagingLookup.syncError || ""), fetchMessageAttempts: Array.isArray(messagingLookup.fetchMessageAttempts) ? messagingLookup.fetchMessageAttempts.slice(0, 6) : [], fetchPages: Array.isArray(messagingLookup.fetchPages) ? messagingLookup.fetchPages.slice(0, 4) : [], idProbe: null };
+      return { ok: false, error: "eel_decrypt_unavailable", retryable: true, failureClass: budgetExhausted ? "lookup_budget_exhausted" : (attempts.length > 0 ? "attempts_exhausted" : "no_candidate_methods"), budgetExhausted, requestedMessageId: payload.messageId, matchedWebMessageId: "", messageCount: messagingLookup.messageCount, exactMatch: false, exactMatchMiss: messagingLookup.missReason || "", syncedConversation: messagingLookup.syncedConversation === true, syncError: String(messagingLookup.syncError || ""), fetchMessageAttempts: Array.isArray(messagingLookup.fetchMessageAttempts) ? messagingLookup.fetchMessageAttempts.slice(0, 6) : [], fetchPages: Array.isArray(messagingLookup.fetchPages) ? messagingLookup.fetchPages.slice(0, 4) : [], contentProbe: Array.isArray(messagingLookup.contentProbe) ? messagingLookup.contentProbe : [], appStateProbe: messagingLookup.appStateProbe || null, idProbe: null };
     }, {
       messageId,
       conversationId,
       contentBase64,
+      mediaIds: Array.isArray(input.mediaIds) ? input.mediaIds.map((value) => String(value || "")).filter(Boolean) : [],
+      timestampMs: Number(input.timestampMs || 0),
       cekBase64: String(input.cekBase64 || ""),
       cekIvBase64: String(input.cekIvBase64 || ""),
       nonceBase64: String(input.nonceBase64 || ""),
@@ -3411,6 +3693,27 @@ export async function decryptEELMessage(input = {}) {
       retryable: true,
       failureClass: String(error?.message || error || "unknown").replace(/\s+/g, " ").slice(0, 160),
     }));
+    let result = await runEelLookup();
+    // The app's conversation manager serves a cached page that lags the
+    // newest messages until the conversation is entered. When the in-place
+    // lookup misses, open the conversation in the real UI so the app itself
+    // syncs the newest messages and establishes the E2EE session, then retry
+    // the lookup once. This is navigation only: it never clicks or opens a
+    // snap (safeNoOpen stays honored), and it leaves the conversation view
+    // afterwards.
+    if (!result.ok && conversationId) {
+      try {
+        await openChat("", conversationId, "", { searchFallback: false });
+        await currentPage.waitForTimeout(7000);
+        result = await runEelLookup();
+      } catch (openError) {
+        console.error(`eel-decrypt: conversation open failed conversationId=${conversationId} error=${String(openError).slice(0, 160)}`);
+      }
+      try {
+        await returnToChatList(currentPage);
+      } catch {
+      }
+    }
     if (!result.ok) {
       console.error(`eel-decrypt: failed messageId=${messageId} conversationId=${conversationId} error=${result.error || "unknown"} failureClass=${result.failureClass || ""} requestedMessageId=${messageId} matchedWebMessageId=${String(result.matchedWebMessageId || "")} messageCount=${Number(result.messageCount || 0)} exactMatch=${result.exactMatch === true ? "true" : "false"}`);
     } else {

@@ -147,14 +147,16 @@ type APIAuth struct {
 }
 
 type EELDecryptRequest struct {
-	ConversationID        string `json:"conversationId,omitempty"`
-	MessageID             string `json:"messageId,omitempty"`
-	ContentBase64         string `json:"contentBase64"`
-	CEKBase64             string `json:"cekBase64,omitempty"`
-	CEKIVBase64           string `json:"cekIvBase64,omitempty"`
-	NonceBase64           string `json:"nonceBase64,omitempty"`
-	SenderPublicKeyBase64 string `json:"senderPublicKeyBase64,omitempty"`
-	SenderVersion         int32  `json:"senderVersion,omitempty"`
+	ConversationID        string   `json:"conversationId,omitempty"`
+	MessageID             string   `json:"messageId,omitempty"`
+	ContentBase64         string   `json:"contentBase64"`
+	CEKBase64             string   `json:"cekBase64,omitempty"`
+	CEKIVBase64           string   `json:"cekIvBase64,omitempty"`
+	NonceBase64           string   `json:"nonceBase64,omitempty"`
+	SenderPublicKeyBase64 string   `json:"senderPublicKeyBase64,omitempty"`
+	SenderVersion         int32    `json:"senderVersion,omitempty"`
+	MediaIDs              []string `json:"mediaIds,omitempty"`
+	TimestampMs           int64    `json:"timestampMs,omitempty"`
 }
 
 type EELDecryptResponse struct {

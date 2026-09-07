@@ -8,6 +8,7 @@ import (
 	"time"
 
 	sidecar "github.com/colej/mautrix-snapchat/internal/connector"
+	"github.com/colej/mautrix-snapchat/internal/snapapi"
 	"github.com/colej/mautrix-snapchat/internal/store"
 	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/bridgev2"
@@ -272,14 +273,26 @@ const (
 
 // decideMediaHydration encodes the authoritative hydration rule: HydratedAt
 // alone never proves delivery; successful MediaDelivered evidence does.
-func decideMediaHydration(existing *store.MessageState, deliveryConfirmed, isSnap bool) mediaHydrationDecision {
-	if deliveryConfirmed || isSnap {
+// Snaps stay on the placeholder path unless their media keys were recovered
+// from the decrypted contents (the keys are required to download and decrypt
+// the media; snaps without keys are never auto-opened).
+func decideMediaHydration(existing *store.MessageState, deliveryConfirmed, isSnap, snapKeysReady bool) mediaHydrationDecision {
+	if deliveryConfirmed {
+		return mediaHydrationSkip
+	}
+	if isSnap && !snapKeysReady {
 		return mediaHydrationSkip
 	}
 	if existing != nil && existing.HydratedAt != nil {
 		return mediaHydrationRecover
 	}
 	return mediaHydrationRender
+}
+
+// snapMediaKeysReady reports whether the snap's media key was recovered from
+// its decrypted contents, making the media downloadable and decryptable.
+func snapMediaKeysReady(message snapapi.Message) bool {
+	return len(message.Media) > 0 && len(message.Media[0].Key) > 0
 }
 
 func (sa *SnapchatAPI) mediaDeliveryPostHandle(chat sidecar.Chat, mappingID string, message sidecar.Message) func(context.Context, *bridgev2.Portal) {
