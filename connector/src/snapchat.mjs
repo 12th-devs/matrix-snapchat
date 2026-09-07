@@ -234,6 +234,10 @@ function getTaskStats() {
 }
 
 let taskID = 0;
+// Track the conversation last opened for an EEL lookup so consecutive misses
+// in the same conversation reuse the sync instead of re-navigating.
+let lastOpenedConversationId = "";
+let lastOpenedConversationAt = 0;
 function withLock(fn, { priority = 1, timeoutMs, label = "", resetOnTimeout } = {}) {
   return new Promise((resolve, reject) => {
     pendingTasks.push({
@@ -3128,6 +3132,19 @@ export async function decryptEELMessage(input = {}) {
         return false;
       }
 
+      function toUint8(value) {
+        if (value instanceof Uint8Array) {
+          return value;
+        }
+        if (ArrayBuffer.isView(value)) {
+          return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+        }
+        if (value instanceof ArrayBuffer) {
+          return new Uint8Array(value);
+        }
+        return Uint8Array.from(value);
+      }
+
       function readVarintFrom(bytes, offset) {
         let value = 0;
         let shift = 0;
@@ -3166,12 +3183,12 @@ export async function decryptEELMessage(input = {}) {
               out.push([wireType, value]);
             }
           } else if (wireType === 2) {
-            const [len, end] = readVarintFrom(bytes, offset);
-            if (Number.isNaN(len) || offset + len > bytes.length) {
+            const [len, payloadStart] = readVarintFrom(bytes, offset);
+            if (Number.isNaN(len) || payloadStart + len > bytes.length) {
               return out;
             }
-            const value = bytes.subarray(offset, offset + len);
-            offset = end;
+            const value = bytes.subarray(payloadStart, payloadStart + len);
+            offset = payloadStart + len;
             if (field === fieldNum) {
               out.push([wireType, value]);
             }
@@ -3187,15 +3204,16 @@ export async function decryptEELMessage(input = {}) {
       }
 
       function snapTimestampMs(content) {
-        const f11 = protoGetField(content, 11).find(([wireType]) => wireType === 2);
+        const u8 = toUint8(content);
+        const f11 = protoGetField(u8, 11).find(([wireType]) => wireType === 2);
         if (!f11) {
           return NaN;
         }
-        const f17 = protoGetField(f11[1], 17).find(([wireType]) => wireType === 2);
+        const f17 = protoGetField(toUint8(f11[1]), 17).find(([wireType]) => wireType === 2);
         if (!f17) {
           return NaN;
         }
-        const f5 = protoGetField(f17[1], 5).find(([wireType]) => wireType === 0);
+        const f5 = protoGetField(toUint8(f17[1]), 5).find(([wireType]) => wireType === 0);
         if (!f5) {
           return NaN;
         }
@@ -3404,6 +3422,9 @@ export async function decryptEELMessage(input = {}) {
             const targetTimestampMs = Number(payload.timestampMs || 0);
             if (!lookup.exactMatch && targetTimestampMs > 0) {
               let best = null;
+              let parsed = 0;
+              let minTs = Infinity;
+              let maxTs = 0;
               for (const message of fetchedMessages) {
                 const candidate = resultBytes(message?.content)
                   || resultBytes(message?.messageContent?.content)
@@ -3415,11 +3436,26 @@ export async function decryptEELMessage(input = {}) {
                 if (!Number.isFinite(ts)) {
                   continue;
                 }
-                const delta = Math.abs(ts - targetTimestampMs);
-                if (delta <= 120000 && (!best || delta < best.delta)) {
+                parsed += 1;
+                if (ts < minTs) minTs = ts;
+                if (ts > maxTs) maxTs = ts;
+                // The snap's capture timestamp must precede the server
+                // receive time by a small margin (normal delivery skew, 0-
+                // 10s). Snaps in bursts are ~10s apart, so this window pins
+                // the exact message; a wider window matches neighbors whose
+                // keys fail media decryption.
+                const delta = targetTimestampMs - ts;
+                if (delta >= 0 && delta <= 10000 && (!best || delta < best.delta)) {
                   best = { delta, message, candidate };
                 }
               }
+              lookupDiagnostics.timestampProbe = {
+                parsed,
+                minTs: Number.isFinite(minTs) ? minTs : 0,
+                maxTs,
+                targetTs: targetTimestampMs,
+                bestDelta: best ? best.delta : -1,
+              };
               if (best) {
                 return {
                   content: best.candidate,
@@ -3512,7 +3548,12 @@ export async function decryptEELMessage(input = {}) {
                   new Promise((_, reject) => setTimeout(() => reject(new Error("get_conversation_timeout")), 5000)),
                 ]);
                 const convObj = conv?.conversation || conv;
-                lookupDiagnostics.getConversationKeys = Object.keys(convObj || {}).slice(0, 25);
+                lookupDiagnostics.getConversationKeys = Object.keys(convObj || {}).slice(0, 60);
+                try {
+                  lookupDiagnostics.pendingDecryptionCount = convObj?.pendingDecryptionCount;
+                  lookupDiagnostics.getMessagesType = typeof convObj?.getMessages;
+                } catch {
+                }
                 if (Array.isArray(convObj?.messages)) {
                   harvested.push(...convObj.messages);
                 }
@@ -3538,8 +3579,8 @@ export async function decryptEELMessage(input = {}) {
                 if (!Number.isFinite(ts)) {
                   continue;
                 }
-                const delta = Math.abs(ts - targetTimestampMs);
-                if (delta <= 120000 && (!best || delta < best.delta)) {
+                const delta = targetTimestampMs - ts;
+                if (delta >= 0 && delta <= 10000 && (!best || delta < best.delta)) {
                   best = { delta, message, candidate };
                 }
               }
@@ -3627,7 +3668,7 @@ export async function decryptEELMessage(input = {}) {
         };
       }
       if (!keyManager) {
-        return { ok: false, error: "eel_key_manager_unavailable", retryable: true, syncedConversation: messagingLookup.syncedConversation === true, syncError: String(messagingLookup.syncError || ""), fetchMessageAttempts: Array.isArray(messagingLookup.fetchMessageAttempts) ? messagingLookup.fetchMessageAttempts.slice(0, 6) : [], fetchPages: Array.isArray(messagingLookup.fetchPages) ? messagingLookup.fetchPages.slice(0, 4) : [], contentProbe: Array.isArray(messagingLookup.contentProbe) ? messagingLookup.contentProbe : [], appStateProbe: messagingLookup.appStateProbe || null, idProbe: messagingLookup.idProbe || null };
+        return { ok: false, error: "eel_key_manager_unavailable", retryable: true, syncedConversation: messagingLookup.syncedConversation === true, syncError: String(messagingLookup.syncError || ""), fetchMessageAttempts: Array.isArray(messagingLookup.fetchMessageAttempts) ? messagingLookup.fetchMessageAttempts.slice(0, 6) : [], fetchPages: Array.isArray(messagingLookup.fetchPages) ? messagingLookup.fetchPages.slice(0, 4) : [], contentProbe: Array.isArray(messagingLookup.contentProbe) ? messagingLookup.contentProbe : [], timestampProbe: messagingLookup.timestampProbe || null, appStateProbe: messagingLookup.appStateProbe || null, getConversationKeys: messagingLookup.getConversationKeys || null, getConversationError: String(messagingLookup.getConversationError || ""), idProbe: messagingLookup.idProbe || null };
       }
 
       const attempts = [];
@@ -3675,7 +3716,7 @@ export async function decryptEELMessage(input = {}) {
           }
         }
       }
-      return { ok: false, error: "eel_decrypt_unavailable", retryable: true, failureClass: budgetExhausted ? "lookup_budget_exhausted" : (attempts.length > 0 ? "attempts_exhausted" : "no_candidate_methods"), budgetExhausted, requestedMessageId: payload.messageId, matchedWebMessageId: "", messageCount: messagingLookup.messageCount, exactMatch: false, exactMatchMiss: messagingLookup.missReason || "", syncedConversation: messagingLookup.syncedConversation === true, syncError: String(messagingLookup.syncError || ""), fetchMessageAttempts: Array.isArray(messagingLookup.fetchMessageAttempts) ? messagingLookup.fetchMessageAttempts.slice(0, 6) : [], fetchPages: Array.isArray(messagingLookup.fetchPages) ? messagingLookup.fetchPages.slice(0, 4) : [], contentProbe: Array.isArray(messagingLookup.contentProbe) ? messagingLookup.contentProbe : [], appStateProbe: messagingLookup.appStateProbe || null, idProbe: null };
+      return { ok: false, error: "eel_decrypt_unavailable", retryable: true, failureClass: budgetExhausted ? "lookup_budget_exhausted" : (attempts.length > 0 ? "attempts_exhausted" : "no_candidate_methods"), budgetExhausted, requestedMessageId: payload.messageId, matchedWebMessageId: "", messageCount: messagingLookup.messageCount, exactMatch: false, exactMatchMiss: messagingLookup.missReason || "", syncedConversation: messagingLookup.syncedConversation === true, syncError: String(messagingLookup.syncError || ""), fetchMessageAttempts: Array.isArray(messagingLookup.fetchMessageAttempts) ? messagingLookup.fetchMessageAttempts.slice(0, 6) : [], fetchPages: Array.isArray(messagingLookup.fetchPages) ? messagingLookup.fetchPages.slice(0, 4) : [], contentProbe: Array.isArray(messagingLookup.contentProbe) ? messagingLookup.contentProbe : [], timestampProbe: messagingLookup.timestampProbe || null, appStateProbe: messagingLookup.appStateProbe || null, getConversationKeys: messagingLookup.getConversationKeys || null, getConversationError: String(messagingLookup.getConversationError || ""), idProbe: null };
     }, {
       messageId,
       conversationId,
@@ -3702,9 +3743,16 @@ export async function decryptEELMessage(input = {}) {
     // snap (safeNoOpen stays honored), and it leaves the conversation view
     // afterwards.
     if (!result.ok && conversationId) {
+      // Reuse a conversation opened for a recent lookup: re-navigating for
+      // every miss would multiply the connector cost of a failing backlog.
+      const canReuse = lastOpenedConversationId === conversationId && Date.now() - lastOpenedConversationAt < 90000;
       try {
-        await openChat("", conversationId, "", { searchFallback: false });
-        await currentPage.waitForTimeout(7000);
+        if (!canReuse) {
+          await openChat("", conversationId, "", { searchFallback: false });
+          lastOpenedConversationId = conversationId;
+          lastOpenedConversationAt = Date.now();
+          await currentPage.waitForTimeout(7000);
+        }
         result = await runEelLookup();
       } catch (openError) {
         console.error(`eel-decrypt: conversation open failed conversationId=${conversationId} error=${String(openError).slice(0, 160)}`);

@@ -439,16 +439,27 @@ func (c *Client) envelopeContentsForDecode(ctx context.Context, chatID, messageI
 			if alreadyFailed && time.Since(lastFailure) < 2*time.Minute {
 				return nil
 			}
-			// Global throttle: at most one connector EEL attempt per interval.
-			// A poll window with several undecoded messages would otherwise
-			// serialize 20s+ decrypt attempts and clog the connector task
-			// queue; throttled messages stay retryable on later polls.
+			// Global EEL accounting: fresh messages (never attempted) bypass
+			// the throttle so a failed retry for one message cannot starve
+			// other messages, but the total attempt rate is capped at 3 per
+			// 20s window. Retries (alreadyFailed) always respect the 20s
+			// spacing. Throttled messages stay retryable on later polls.
 			c.mu.Lock()
-			if !c.lastEELAttempt.IsZero() && time.Since(c.lastEELAttempt) < 20*time.Second {
+			now := time.Now()
+			if c.eelWindowStart.IsZero() || now.Sub(c.eelWindowStart) >= 20*time.Second {
+				c.eelWindowStart = now
+				c.eelWindowAttempts = 0
+			}
+			if alreadyFailed && now.Sub(c.lastEELAttempt) < 20*time.Second {
 				c.mu.Unlock()
 				return nil
 			}
-			c.lastEELAttempt = time.Now()
+			if c.eelWindowAttempts >= 3 {
+				c.mu.Unlock()
+				return nil
+			}
+			c.eelWindowAttempts++
+			c.lastEELAttempt = now
 			// Single in-flight attempt per conversation+message: concurrent
 			// pollers/resync/read-hydrate paths must not enqueue duplicate
 			// connector decrypt tasks for the same target. A waiter skips and

@@ -160,6 +160,10 @@ type Client struct {
 	// minutes (each attempt costs ~22s). At most one attempt per interval;
 	// skipped messages remain retryable on later polls.
 	lastEELAttempt time.Time
+	// eelWindowStart/eelWindowAttempts bound total EEL attempts to 3 per 20s
+	// window while letting fresh messages bypass the retry throttle.
+	eelWindowStart    time.Time
+	eelWindowAttempts int
 
 	mediaMappingMu sync.Mutex
 	mediaMapping   *boltNetworkMapping

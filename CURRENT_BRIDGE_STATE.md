@@ -148,6 +148,15 @@ The full-stack runner writes connector stdout/stderr to `logs/connector.out.log`
 - Fix: synthesized sidebar messages now carry ContentType STATUS so the m.notice gate applies; sidebar previews containing screenshot / screen record / missed call map to friendly system text via systemEventPreviewText; "new message" added to the isGeneratedSnapchatNotice body list.
 - Bridge restarted pid 35632. Still open: streak start / web-session lines have no wire sample yet; unhandled content types log preview bytes for pinning.
 
+## Incoming Snaps Working 2026-09-07 (LIVE VERIFIED)
+
+- Root cause of the last blocker: a protoGetField offset bug (never advanced past the length varint) made every nested-content parse garbage; timestampProbe parsed=0 exposed it. Fixed → `parsed: 13`, page coverage confirmed (snap contents 15:00–15:53).
+- Matching rule (misattribution-safe): snap capture timestamp (contents field 11.17.5) must precede the message's ServerCreatedAt by 0–10s; closest wins. Bursts ~10s apart pin the exact snap; a wrong neighbor would fail media decryption and stay retryable.
+- EEL fairness fix: fresh messages (never attempted) bypass the 20s retry throttle, bounded by 3 attempts per 20s window; retries keep the 20s spacing + 2-min per-message backoff. Undecodable texts can no longer starve snaps. Conversation-open retry reuses a conversation opened <90s ago instead of re-navigating per miss.
+- `message_fetch_limit` 20 → 70 in the Beeper config so older unhydrated snaps stay inside the poll window long enough to recover keys.
+- LIVE VERIFIED (chat rachel ea3d8e62, messages 222/223): EEL contents decrypt → key/IV recovered (32B/16B) → descriptor-mapped-cdn download → cbc-clear-media-key decrypt (111,790-byte JPEG) → m.image upload → placeholder edited into media event. Beeper Desktop API decoded event 222: type IMAGE, caption "📷 Snap", attachment snap-222-1.jpg (image/jpeg, MXC present). Verified for the user's own snap; incoming snaps use the identical recovery path (same contents layout confirmed on incoming 211-byte payloads).
+- Bridge pid 49918. message_fetch_limit stays at 70; monitor connector duty cycle — the conversation-open retry + throttle bound worst-case EEL work.
+
 ## Incoming Snap Media Pipeline 2026-09-07 (pipeline complete, page-sync blocker pinned)
 
 - Ground truth established: decrypted snap contents layout is 11 (snap item) → 5 → 1 → 1 → 4 (encryption) with 4.1 = base64 32-byte AES key, 4.2 = base64 16-byte IV (raw duplicates at 19.1/19.2), and 11.17.5 = capture timestamp ms. Snaps carry no media id inside contents and use a different analytics identifier shape in the web app, so numeric-ID matching cannot find them.
