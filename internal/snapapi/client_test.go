@@ -404,6 +404,39 @@ func TestMessageFromProtoExternalMediaIsNotSnap(t *testing.T) {
 	}
 }
 
+func TestMessageFromProtoSnapPlaceholderReflectsMediaKind(t *testing.T) {
+	cases := []struct {
+		name      string
+		mediaType protos.ContentEnvelope_RemoteMediaInfo_MediaType
+		want      string
+	}{
+		{"image snap", protos.ContentEnvelope_RemoteMediaInfo_MediaType_IMAGE, "📷 New Snap"},
+		{"video snap", protos.ContentEnvelope_RemoteMediaInfo_MediaType_VIDEO, "🎥 New Snap"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := (&Client{}).messageFromProto(context.Background(), "chat-1", &protos.ContentMessage{
+				MessageId: 911,
+				Contents: &protos.ContentEnvelope{
+					ContentType: protos.ContentType_SNAP,
+					RemoteMediaInfos: []*protos.ContentEnvelope_RemoteMediaInfo{{
+						MediaType: int32(tc.mediaType),
+						MediaInfo: &protos.ContentEnvelope_RemoteMediaInfo_ContentObject{
+							ContentObject: []byte("stub"),
+						},
+					}},
+				},
+			})
+			if !msg.IsSnap {
+				t.Fatal("snap message lost its IsSnap flag")
+			}
+			if msg.Text != tc.want {
+				t.Fatalf("snap placeholder = %q, want %q", msg.Text, tc.want)
+			}
+		})
+	}
+}
+
 func TestDetectMediaMimeUsesSnapchatMagicBytes(t *testing.T) {
 	tests := []struct {
 		name string

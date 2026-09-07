@@ -24,6 +24,8 @@ func main() {
 	messageID := flag.String("message", "", "Snapchat message ID (required)")
 	fetchLimit := flag.Int("limit", 10, "message window size for locating the target")
 	search := flag.String("search", "", "string to search for inside decoded contents")
+	download := flag.Bool("download", false, "after inspection, fetch the message's media through the production download pipeline (read-only CDN/HTTP GET; it never sends an open or read action)")
+	out := flag.String("out", "", "optional file path to write the first downloaded attachment's bytes for visual verification")
 	envFile := flag.String("env", "data/runtime/local-stack.env", "runtime env file with connector URL/secret")
 	connectorURL := flag.String("connector-url", "", "connector base URL (overrides env file)")
 	secret := flag.String("secret", "", "connector shared secret (overrides env file)")
@@ -105,6 +107,68 @@ func main() {
 		os.Exit(1)
 	}
 	printJSON(report)
+
+	if *download {
+		printJSON(downloadMessageMedia(ctx, client, *chatID, *messageID, *fetchLimit, *out))
+	}
+}
+
+// downloadMessageMedia locates the message in the query window and runs its
+// attachments through the ordinary production download pipeline. It performs
+// read-only HTTP GETs against Snapchat's CDN and never sends open/read state.
+func downloadMessageMedia(ctx context.Context, client *snapapi.Client, chatID, messageID string, fetchLimit int, outPath string) map[string]any {
+	messages, err := client.QueryMessages(ctx, chatID, 0, fetchLimit)
+	if err != nil {
+		return map[string]any{"ok": false, "error": fmt.Sprintf("query messages: %v", err)}
+	}
+	var target *snapapi.Message
+	for i := range messages {
+		if messages[i].ID == strings.TrimSpace(messageID) {
+			target = &messages[i]
+			break
+		}
+	}
+	if target == nil {
+		return map[string]any{"ok": false, "error": fmt.Sprintf("message %s not found in the %d-message query window", messageID, fetchLimit)}
+	}
+	attachments := make([]map[string]any, 0, len(target.Media))
+	for _, media := range target.Media {
+		att := map[string]any{
+			"id":       media.ID,
+			"kind":     string(media.Kind),
+			"mimeHint": media.MimeType,
+		}
+		data, mime, info, err := client.DownloadMediaWithInfo(ctx, media)
+		if err != nil {
+			att["ok"] = false
+			att["error"] = err.Error()
+			att["source"] = info.Source
+			att["descriptorShape"] = info.DescriptorShape
+			att["cdnFallbackReason"] = info.CDNFallbackReason
+			attachments = append(attachments, att)
+			continue
+		}
+		att["ok"] = true
+		att["bytes"] = len(data)
+		att["mime"] = mime
+		att["source"] = info.Source
+		att["decryptPath"] = info.DecryptPath
+		if outPath != "" && data != nil {
+			if writeErr := os.WriteFile(outPath, data, 0o600); writeErr != nil {
+				att["writeError"] = writeErr.Error()
+			} else {
+				att["wroteFile"] = outPath
+			}
+		}
+		attachments = append(attachments, att)
+	}
+	return map[string]any{
+		"ok":          true,
+		"messageId":   target.ID,
+		"contentType": target.ContentType,
+		"isSnap":      target.IsSnap,
+		"attachments": attachments,
+	}
 }
 
 func loadRuntimeEnv(path string) (baseURL, secret string, err error) {

@@ -131,7 +131,26 @@ func (c *Client) SendMedia(ctx context.Context, chatID string, media MediaAttach
 		return "", fmt.Errorf("media is too large for Snapchat send (max %d bytes)", maxOutgoingMediaSize)
 	}
 	mimeType := strings.ToLower(strings.TrimSpace(strings.Split(media.MimeType, ";")[0]))
-	info, err := classifyOutgoingMedia(media.Data, mimeType)
+	data := media.Data
+	if transcodableAudioMIME(mimeType) {
+		converted, err := transcodeVoiceNoteToMP4(ctx, data, mimeType)
+		if err != nil {
+			return "", err
+		}
+		if len(converted) > maxOutgoingMediaSize {
+			return "", fmt.Errorf("transcoded voice note is too large for Snapchat send (max %d bytes)", maxOutgoingMediaSize)
+		}
+		zerolog.Ctx(ctx).Info().
+			Str("diag", "outgoing_media").
+			Str("chat_id", chatID).
+			Str("source_mime", mimeType).
+			Int("source_bytes", len(data)).
+			Int("transcoded_bytes", len(converted)).
+			Msg("outgoing-media: voice note transcoded to audio/mp4")
+		data = converted
+		mimeType = "audio/mp4"
+	}
+	info, err := classifyOutgoingMedia(data, mimeType)
 	if err != nil {
 		return "", err
 	}
@@ -142,7 +161,7 @@ func (c *Client) SendMedia(ctx context.Context, chatID string, media MediaAttach
 	if err := c.ensureAuthenticated(ctx); err != nil {
 		return "", err
 	}
-	encrypted, err := EncryptOutgoingMedia(media.Data)
+	encrypted, err := EncryptOutgoingMedia(data)
 	if err != nil {
 		return "", fmt.Errorf("encrypt outgoing media: %w", err)
 	}
@@ -163,7 +182,7 @@ func (c *Client) SendMedia(ctx context.Context, chatID string, media MediaAttach
 		Str("diag", "outgoing_media").
 		Str("chat_id", chatID).
 		Str("mime", info.MIME).
-		Int("media_bytes", len(media.Data)).
+		Int("media_bytes", len(data)).
 		Int("cipher_bytes", len(encrypted.Ciphertext)).
 		Int("width", width).
 		Int("height", height).

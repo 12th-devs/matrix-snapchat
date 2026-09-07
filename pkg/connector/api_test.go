@@ -158,6 +158,12 @@ func TestNewChatPlaceholderIsNotGenerated(t *testing.T) {
 	if !isGeneratedSnapchatNotice("New Snap") {
 		t.Fatal("New Snap should remain a notice placeholder")
 	}
+	if !isGeneratedSnapchatNotice("📷 New Snap") || !isGeneratedSnapchatNotice("🎥 New Snap") {
+		t.Fatal("kind-aware snap placeholders should remain notice bodies")
+	}
+	if !isGeneratedSnapchatNotice("📷 Snap") || !isGeneratedSnapchatNotice("🎥 Snap") {
+		t.Fatal("hydrated snap captions should remain notice bodies")
+	}
 }
 
 func TestConnectorMessageFromAPIKeepsExternalMediaVisible(t *testing.T) {

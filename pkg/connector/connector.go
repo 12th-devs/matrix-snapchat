@@ -321,7 +321,7 @@ func (sc *SnapchatConnector) resetSyncState() error {
 
 func (sc *SnapchatConnector) chatCapabilities() *event.RoomFeatures {
 	features := &event.RoomFeatures{
-		ID:            "fi.mau.snapchat.capabilities.2026_09_06_3",
+		ID:            "fi.mau.snapchat.capabilities.2026_09_07_2",
 		MaxTextLength: 5000,
 		// Replies are real Snapchat protocol operations: outbound replies attach
 		// FeatureAttachment.ReplyMessageInfo (QuotedMessageId) on
@@ -363,16 +363,15 @@ func (sc *SnapchatConnector) chatCapabilities() *event.RoomFeatures {
 			event.MsgFile:       mediaFeatures,
 			event.CapMsgSticker: mediaFeatures,
 		}
-		// Voice notes (MSC3245): the note wire shape is confirmed, but the
-		// accepted audio/mp4 container is an experimental first format
-		// (Snapchat Web's own recorder could not be inspected). ogg/webm are
-		// advertised as partial because the container question is still open;
-		// they are rejected cleanly without transcoding until proven.
+		// Voice notes (MSC3245): Snapchat's canonical container is MP4, so
+		// the connector transcodes OGG/Opus and WebM recordings (what Beeper
+		// clients produce) to audio-only MP4/AAC with ffmpeg. audio/mp4
+		// passes through untouched. audio/mpeg stays unadvertised.
 		features.File[event.CapMsgVoice] = &event.FileFeatures{
 			MimeTypes: map[string]event.CapabilitySupportLevel{
 				"audio/mp4":  event.CapLevelFullySupported,
-				"audio/ogg":  event.CapLevelPartialSupport,
-				"audio/webm": event.CapLevelPartialSupport,
+				"audio/ogg":  event.CapLevelFullySupported,
+				"audio/webm": event.CapLevelFullySupported,
 			},
 			Caption:          event.CapLevelDropped,
 			MaxCaptionLength: 5000,

@@ -118,6 +118,11 @@ func (c *Client) messageFromProto(ctx context.Context, chatID string, msg *proto
 			body = "Media"
 		}
 	}
+	if isSnap && body == "New Snap" && len(media) > 0 {
+		// The envelope declares the media kind before download, so the
+		// placeholder can already say whether the Snap is a photo or a video.
+		body = snapPlaceholderForKind(media[0].Kind)
+	}
 	if body == "" {
 		return Message{}
 	}
@@ -155,6 +160,21 @@ func (c *Client) messageFromProto(ctx context.Context, chatID string, msg *proto
 	}
 }
 
+// snapPlaceholderForKind refines the generic snap placeholder with the media
+// kind declared by the envelope so image Snaps and video Snaps are
+// distinguishable in Matrix before hydration. Unknown kinds keep the generic
+// placeholder.
+func snapPlaceholderForKind(kind MediaKind) string {
+	switch kind {
+	case MediaKindVideo:
+		return "🎥 New Snap"
+	case MediaKindImage, MediaKindGIF:
+		return "📷 New Snap"
+	default:
+		return "New Snap"
+	}
+}
+
 func messageIsSaved(msg *protos.ContentMessage) bool {
 	if msg == nil {
 		return false
@@ -163,6 +183,35 @@ func messageIsSaved(msg *protos.ContentMessage) bool {
 		return true
 	}
 	return msg.GetContents().GetSavePolicy() == protos.ContentEnvelope_SavePolicy_LIFETIME
+}
+
+// statusEventText maps known Snapchat status/share content types to the
+// human text Snapchat clients render for them (confirmed against the web
+// bundle's system-message strings: streak start, screenshots, missed calls,
+// saves). The boolean is the IsSnap flag; status lines are never snaps.
+// Unknown content types return false so callers keep the snap fallback.
+func statusEventText(contentType protos.ContentType) (string, bool, bool) {
+	switch contentType {
+	case protos.ContentType_STATUS_SAVE_TO_CAMERA_ROLL:
+		return "Saved to camera roll", false, true
+	case protos.ContentType_STATUS_CONVERSATION_CAPTURE_SCREENSHOT:
+		return "Screenshot captured", false, true
+	case protos.ContentType_STATUS_CONVERSATION_CAPTURE_RECORD:
+		return "Screen recorded", false, true
+	case protos.ContentType_STATUS_CALL_MISSED_VIDEO:
+		return "Missed video call", false, true
+	case protos.ContentType_STATUS_CALL_MISSED_AUDIO:
+		return "Missed audio call", false, true
+	case protos.ContentType_STATUS_INVITE_LINK_CHANGE:
+		return "Invite link changed", false, true
+	case protos.ContentType_SHARE:
+		// Shared items (stories, profiles) are conversation events, not snaps.
+		return "Shared content", false, true
+	case protos.ContentType_STICKER:
+		// Stickers ride the ordinary media path; the image is in message.Media.
+		return "", false, true
+	}
+	return "", false, false
 }
 
 func (c *Client) messageBody(ctx context.Context, chatID string, msg *protos.ContentMessage) (string, bool) {
@@ -203,15 +252,37 @@ func (c *Client) messageBody(ctx context.Context, chatID string, msg *protos.Con
 	case protos.ContentType_NOTE:
 		// Voice notes are ordinary persistent media, not snaps.
 		return "", false
-	case protos.ContentType_STATUS, protos.ContentType_STATUS_SAVE_TO_CAMERA_ROLL,
-		protos.ContentType_STATUS_CONVERSATION_CAPTURE_SCREENSHOT,
-		protos.ContentType_STATUS_CONVERSATION_CAPTURE_RECORD,
-		protos.ContentType_STATUS_CALL_MISSED_VIDEO,
-		protos.ContentType_STATUS_CALL_MISSED_AUDIO:
-		return fmt.Sprintf("[Snapchat status] %s", envelope.GetContentType().String()), false
+	case protos.ContentType_STATUS:
+		// Generic status envelopes (view/open state) stay gray notices until
+		// their payload semantics are pinned by a live sample.
+		return "[Snapchat status] STATUS", false
 	default:
+		if text, isSnap, known := statusEventText(contentType); known {
+			return text, isSnap
+		}
+		log.Printf("snapapi decode: unhandled content type %s message_id=%s chat_id=%s content_len=%d first_bytes=%q",
+			contentType, messageID, chatID, contentLen, previewEnvelopeBytes(envelope.GetContents()))
 		return "New Snap", true
 	}
+}
+
+// previewEnvelopeBytes returns a short printable prefix of the raw envelope
+// contents so unhandled content types can be identified from logs without
+// dumping full payloads.
+func previewEnvelopeBytes(raw []byte) string {
+	const max = 64
+	if len(raw) > max {
+		raw = raw[:max]
+	}
+	var sb strings.Builder
+	for _, b := range raw {
+		if b >= 0x20 && b < 0x7f {
+			sb.WriteByte(b)
+		} else {
+			sb.WriteByte('.')
+		}
+	}
+	return sb.String()
 }
 
 func plaintextChatBody(raw []byte) string {
@@ -352,6 +423,32 @@ func (c *Client) envelopeContentsForDecode(ctx context.Context, chatID, messageI
 			if alreadyFailed && time.Since(lastFailure) < 2*time.Minute {
 				return nil
 			}
+			// Single in-flight attempt per conversation+message: concurrent
+			// pollers/resync/read-hydrate paths must not enqueue duplicate
+			// connector decrypt tasks for the same target. A waiter skips and
+			// leaves the message retryable; a timed-out caller cannot start a
+			// second copy while the connector is still processing the first.
+			c.mu.Lock()
+			if c.eelInflight == nil {
+				c.eelInflight = make(map[string]chan struct{})
+			}
+			if done, inFlight := c.eelInflight[cacheKey]; inFlight {
+				c.mu.Unlock()
+				select {
+				case <-done:
+				case <-time.After(65 * time.Second):
+				}
+				return nil
+			}
+			done := make(chan struct{})
+			c.eelInflight[cacheKey] = done
+			c.mu.Unlock()
+			defer func() {
+				c.mu.Lock()
+				delete(c.eelInflight, cacheKey)
+				c.mu.Unlock()
+				close(done)
+			}()
 			decrypted, err := c.eelDecrypter.DecryptEEL(ctx, EELDecryptRequest{
 				ConversationID:  chatID,
 				MessageID:       messageID,

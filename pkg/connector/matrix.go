@@ -483,6 +483,19 @@ func (sa *SnapchatAPI) HandleMatrixMessageRemove(ctx context.Context, msg *bridg
 	return nil
 }
 
+// outboundMediaMIMEAllowed gates outbound media MIME types. Voice-note
+// containers the Snapchat send path transcodes to audio/mp4 (OGG/Opus and
+// WebM, as recorded by Beeper clients) are allowed only for m.audio.
+func outboundMediaMIMEAllowed(msgType event.MessageType, mimeType string) bool {
+	switch mimeType {
+	case "image/jpeg", "image/png", "image/webp", "video/mp4", "audio/mp4":
+		return true
+	case "audio/ogg", "application/ogg", "audio/opus", "audio/webm":
+		return msgType == event.MsgAudio
+	}
+	return false
+}
+
 func (sa *SnapchatAPI) matrixMediaToSend(ctx context.Context, msg *bridgev2.MatrixMessage) (sidecar.MediaAttachment, string, bool, error) {
 	if msg == nil || msg.Content == nil {
 		return sidecar.MediaAttachment{}, "", false, nil
@@ -537,8 +550,9 @@ func (sa *SnapchatAPI) matrixMediaToSend(ctx context.Context, msg *bridgev2.Matr
 			mimeType = "audio/mp4"
 		}
 	}
-	if mimeType != "image/jpeg" && mimeType != "image/png" && mimeType != "image/webp" && mimeType != "video/mp4" && mimeType != "audio/mp4" {
-		return sidecar.MediaAttachment{}, "", true, fmt.Errorf("outbound Snapchat media supports only image/jpeg, image/png, image/webp, video/mp4, and audio/mp4 voice notes (got %q)", mimeType)
+	allowed := outboundMediaMIMEAllowed(msg.Content.MsgType, mimeType)
+	if !allowed {
+		return sidecar.MediaAttachment{}, "", true, fmt.Errorf("outbound Snapchat media supports only image/jpeg, image/png, image/webp, video/mp4, and voice notes (audio/mp4 or OGG/WebM transcoded via ffmpeg) (got %q)", mimeType)
 	}
 	fileName := strings.TrimSpace(msg.Content.FileName)
 	if fileName == "" {

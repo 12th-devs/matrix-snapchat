@@ -36,6 +36,11 @@ func TestChatCapabilitiesMediaFlag(t *testing.T) {
 	if voice == nil || voice.MimeTypes["audio/mp4"] != event.CapLevelFullySupported {
 		t.Fatalf("SendMediaEnabled=true must advertise MSC3245 voice with audio/mp4, got %#v", voice)
 	}
+	// OGG/Opus and WebM recordings from Beeper clients are transcoded to
+	// audio/mp4 by the connector, so they are advertised fully supported.
+	if voice.MimeTypes["audio/ogg"] != event.CapLevelFullySupported || voice.MimeTypes["audio/webm"] != event.CapLevelFullySupported {
+		t.Fatalf("voice capability must fully support audio/ogg and audio/webm (ffmpeg-transcoded), got %#v", voice.MimeTypes)
+	}
 
 	disabled := (&SnapchatConnector{Config: ConnectorConfig{SendMediaEnabled: false}}).chatCapabilities()
 	if len(disabled.File) != 0 {

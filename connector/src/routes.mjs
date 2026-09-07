@@ -19,6 +19,9 @@ export function createApp({
   if (!bridge) {
     throw new Error("bridge implementation is required");
   }
+  const taskStats = typeof bridge.getTaskStats === "function"
+    ? bridge.getTaskStats
+    : () => ({ taskRunning: false, currentTask: "", taskAgeMs: 0, queueDepth: 0, lastCompletedAt: 0, secondsSinceLastTask: null, lastTaskError: "" });
 
   const app = express();
   const acceptedSecrets = new Set([sharedSecret].filter(Boolean));
@@ -47,7 +50,11 @@ export function createApp({
 
   app.get("/healthz", asyncRoute(async (_req, res) => {
     // Keep Docker healthchecks cheap so they don't contend with chat polling or sends.
-    res.json({ ok: true });
+    // Task stats are read synchronously WITHOUT acquiring the session task
+    // lock, so this stays responsive even while a session task is stuck. It
+    // reports process liveness plus queue state: a stuck current task with a
+    // growing age while healthz says ok is the starvation signature.
+    res.json({ ok: true, tasks: taskStats() });
   }));
 
   app.post("/session/start", asyncRoute(async (_req, res) => {

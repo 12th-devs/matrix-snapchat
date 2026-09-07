@@ -3,6 +3,7 @@ package snapapi
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"sort"
@@ -93,6 +94,14 @@ type MessageInspectReport struct {
 	ContentsSource      string                 `json:"contentsSource"`
 	ContentsSha256      string                 `json:"contentsSha256,omitempty"`
 	EEL                 *EELDecryptDiagnostics `json:"eel,omitempty"`
+	// EEL wire fields (base64) let operator tools replay /session/eel-decrypt
+	// directly when the production decode path failed. Read-only diagnostics.
+	EELContentB64    string `json:"eelContentB64,omitempty"`
+	EELCEKB64        string `json:"eelCekB64,omitempty"`
+	EELCEKIVB64      string `json:"eelCekIvB64,omitempty"`
+	EELNonceB64      string `json:"eelNonceB64,omitempty"`
+	EELSenderPubB64  string `json:"eelSenderPublicKeyB64,omitempty"`
+	EELSenderVersion int32  `json:"eelSenderVersion,omitempty"`
 	ContentsTree        []*InspectNode         `json:"contentsTree,omitempty"`
 	TextFields          []string               `json:"textFields,omitempty"`
 	SearchTerm          string                 `json:"searchTerm,omitempty"`
@@ -176,6 +185,18 @@ func (c *Client) buildInspectReport(ctx context.Context, chatID, messageID strin
 	contents := c.envelopeContentsForDecode(ctx, chatID, messageID, envelope)
 	report.ContentsLen = len(contents)
 	report.ContentsSource = c.contentsSourceName(envelope, contents)
+	if eel := envelope.GetEnvelopeEncryption().GetEelEncryption(); eel != nil {
+		// Always populated from the wire so a failed production decode can be
+		// replayed manually with the connector's decrypt endpoint.
+		if raw := envelope.GetContents(); len(raw) > 0 {
+			report.EELContentB64 = base64.StdEncoding.EncodeToString(raw)
+		}
+		report.EELCEKB64 = base64.StdEncoding.EncodeToString(eel.GetCek())
+		report.EELCEKIVB64 = base64.StdEncoding.EncodeToString(eel.GetCekIv())
+		report.EELNonceB64 = base64.StdEncoding.EncodeToString(eel.GetNonce())
+		report.EELSenderPubB64 = base64.StdEncoding.EncodeToString(eel.GetSenderPublicKey())
+		report.EELSenderVersion = eel.GetSenderVersion()
+	}
 	if len(contents) > 0 {
 		hash := sha256.Sum256(contents)
 		report.ContentsSha256 = hex.EncodeToString(hash[:])

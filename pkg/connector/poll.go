@@ -421,6 +421,10 @@ func (sa *SnapchatAPI) queueSidebarUpdate(chat sidecar.Chat, fingerprint string)
 		Text:      body,
 		Timestamp: time.Now().Format(time.RFC3339),
 		Outgoing:  false,
+		// Synthesized sidebar placeholders are conversation events, not chat
+		// text: mark them STATUS so convertMessage renders them as gray
+		// m.notice lines instead of chatty messages.
+		ContentType: "STATUS",
 	}
 	sa.queueRemoteMessage(chat, message)
 }

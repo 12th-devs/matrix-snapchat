@@ -348,6 +348,20 @@ func isSnapRow(message snapapi.Message) bool {
 	return false
 }
 
+// isSnapSidecarMessage mirrors isSnapRow for sidecar messages that reach
+// convertMessage: disappearing Snaps must stay distinguishable from saved chat
+// media in the Matrix representation.
+func isSnapSidecarMessage(message sidecar.Message) bool {
+	if message.IsSnap {
+		return true
+	}
+	switch strings.ToUpper(strings.TrimSpace(message.ContentType)) {
+	case "SNAP", "SNAP_NOT_VIEWABLE":
+		return true
+	}
+	return false
+}
+
 func logMediaEvidence(ctx context.Context, decision, chatID string, apiMessage snapapi.Message) {
 	var media snapapi.MediaAttachment
 	if len(apiMessage.Media) > 0 {
@@ -691,9 +705,15 @@ func (sa *SnapchatAPI) convertMessage(ctx context.Context, portal *bridgev2.Port
 				Int("size", len(media.Data)).
 				Msg("media: uploaded Snapchat media")
 			partBody := body
-			if partBody == "" || partBody == "Media" || isGeneratedSnapchatNotice(partBody) {
+			snapMessage := isSnapSidecarMessage(message)
+			if snapMessage && (partBody == "" || isGeneratedSnapchatNotice(partBody)) {
+				// Disappearing Snaps get a visible emoji caption so they read
+				// differently from saved chat media in every client; ordinary
+				// chat media keeps the filename body.
+				partBody = snapMediaCaption(msgType)
+			} else if partBody == "" || partBody == "Media" || isGeneratedSnapchatNotice(partBody) {
 				// Some Matrix clients use body as the displayed/downloaded filename
-				// for encrypted media, so don't use "New Snap" as the body here.
+				// for encrypted media, so don't use generated placeholders as the body here.
 				partBody = fileName
 			}
 			part := &bridgev2.ConvertedMessagePart{
@@ -712,12 +732,14 @@ func (sa *SnapchatAPI) convertMessage(ctx context.Context, portal *bridgev2.Port
 					},
 				},
 			}
+			extra := map[string]any{
+				"net.colej.snapchat.type": snapTypeMarker(snapMessage, msgType),
+			}
 			if msgType == event.MsgAudio {
 				// MSC3245 voice marker so clients render the voice-note UI.
-				part.Extra = map[string]any{
-					"org.matrix.msc3245.voice": map[string]any{},
-				}
+				extra["org.matrix.msc3245.voice"] = map[string]any{}
 			}
+			part.Extra = extra
 			parts = append(parts, part)
 		}
 		if len(parts) > 0 {
@@ -732,7 +754,7 @@ func (sa *SnapchatAPI) convertMessage(ctx context.Context, portal *bridgev2.Port
 		}
 	}
 	msgType := event.MsgText
-	if strings.HasPrefix(body, "[Unsupported Snapchat") || strings.HasPrefix(body, "[Snapchat") || isGeneratedSnapchatNotice(body) {
+	if isSystemEventContentType(message.ContentType) || strings.HasPrefix(body, "[Unsupported Snapchat") || strings.HasPrefix(body, "[Snapchat") || isGeneratedSnapchatNotice(body) {
 		msgType = event.MsgNotice
 	}
 	return &bridgev2.ConvertedMessage{

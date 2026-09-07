@@ -2,8 +2,12 @@ package snapapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"fmt"
+	"os"
+	"os/exec"
+	"strings"
 
 	"github.com/0xzer/snapper/protos"
 )
@@ -17,12 +21,11 @@ import (
 //  2. A real incoming voice note (NOTE content type, LIFETIME save policy)
 //     whose decoded contents match this structure field-for-field.
 //
-// The audio CONTAINER is not yet proven: Snapchat Web's voice-note recorder
-// was not reachable for inspection. The web bundle contains an in-house MP4
-// muxer that writes AAC audio tracks, so audio/mp4 is implemented as the
-// experimental first format; it is NOT confirmed as Snapchat's canonical
-// voice-note container. Other containers (audio/ogg, audio/webm, audio/mpeg)
-// are rejected cleanly rather than transcoded.
+// The audio CONTAINER is proven by construction: Snapchat's own voice notes
+// are MP4 (the real incoming note is audio/mp4), so outbound OGG/Opus and
+// WebM voice notes (what Beeper clients record) are transcoded to audio-only
+// MP4/AAC with ffmpeg before classification. audio/mp4 passes through as-is;
+// other containers (audio/mpeg) are still rejected cleanly.
 //
 // Content structure (Contents.proto):
 //
@@ -77,9 +80,87 @@ func mp4AudioDurationMs(data []byte) (durationMs int64, hasVideo bool, err error
 	return durationMs, hasVideo, nil
 }
 
+// transcodableAudioMIME reports whether an outbound voice-note MIME is a
+// container the Snapchat send path cannot use directly and must be transcoded
+// to audio/mp4 first. application/ogg is what Beeper Android declares for its
+// OGG/Opus recordings; Go's sniffer reports the same for OGG bytes.
+func transcodableAudioMIME(mime string) bool {
+	switch mime {
+	case "audio/ogg", "application/ogg", "audio/opus", "audio/webm":
+		return true
+	}
+	return false
+}
+
+// ffmpegPath resolves the ffmpeg binary: SNAPCHAT_FFMPEG_PATH override first,
+// then PATH.
+func ffmpegPath() (string, error) {
+	if p := strings.TrimSpace(os.Getenv("SNAPCHAT_FFMPEG_PATH")); p != "" {
+		if _, err := os.Stat(p); err != nil {
+			return "", fmt.Errorf("SNAPCHAT_FFMPEG_PATH=%q not found", p)
+		}
+		return p, nil
+	}
+	return exec.LookPath("ffmpeg")
+}
+
+// transcodeVoiceNoteToMP4 converts an OGG/Opus or WebM voice note to an
+// audio-only MP4 (AAC, faststart) using ffmpeg, matching the container
+// Snapchat's own voice notes use. Temp files are used instead of pipes so
+// -movflags +faststart can rewrite the moov atom.
+func transcodeVoiceNoteToMP4(ctx context.Context, data []byte, declaredMIME string) ([]byte, error) {
+	bin, err := ffmpegPath()
+	if err != nil {
+		return nil, fmt.Errorf("voice note %q requires ffmpeg transcoding: %w (install with: sudo apt install ffmpeg, or set SNAPCHAT_FFMPEG_PATH)", declaredMIME, err)
+	}
+	in, err := os.CreateTemp("", "snap-voice-in-*.bin")
+	if err != nil {
+		return nil, err
+	}
+	inPath := in.Name()
+	defer os.Remove(inPath)
+	if _, err := in.Write(data); err != nil {
+		in.Close()
+		return nil, err
+	}
+	if err := in.Close(); err != nil {
+		return nil, err
+	}
+	out, err := os.CreateTemp("", "snap-voice-out-*.m4a")
+	if err != nil {
+		return nil, err
+	}
+	outPath := out.Name()
+	if err := out.Close(); err != nil {
+		os.Remove(outPath)
+		return nil, err
+	}
+	defer os.Remove(outPath)
+	cmd := exec.CommandContext(ctx, bin,
+		"-v", "error", "-y",
+		"-i", inPath,
+		"-vn", "-c:a", "aac", "-b:a", "64k",
+		"-movflags", "+faststart", "-f", "mp4", outPath,
+	)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("ffmpeg voice-note transcode: %w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	converted, err := os.ReadFile(outPath)
+	if err != nil {
+		return nil, err
+	}
+	if len(converted) == 0 {
+		return nil, fmt.Errorf("ffmpeg voice-note transcode produced no data: %s", strings.TrimSpace(stderr.String()))
+	}
+	return converted, nil
+}
+
 // classifyOutgoingAudio classifies an outbound voice note. Only audio/mp4
-// (the experimental first format) is accepted; every other container or an
-// MP4 carrying a video track is rejected cleanly without transcoding.
+// (the canonical Snapchat container) is accepted here; OGG/WebM input is
+// transcoded to MP4 by the caller before classification, and an MP4 carrying
+// a video track is rejected cleanly.
 func classifyOutgoingAudio(data []byte, declaredMIME string) (*OutgoingMediaInfo, error) {
 	if !isMP4Data(data) {
 		return nil, fmt.Errorf("outgoing voice notes support only audio/mp4 (experimental); declared %q is not supported", declaredMIME)

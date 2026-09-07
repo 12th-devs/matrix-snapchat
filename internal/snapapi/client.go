@@ -143,6 +143,10 @@ type Client struct {
 	profileCheckedAt  map[string]time.Time
 	eelPlaintext      map[string][]byte
 	failedEEL         map[string]time.Time
+	// eelInflight suppresses duplicate concurrent EEL decrypt attempts for
+	// the same conversation+message: one connector task per target, waiters
+	// simply skip and the message stays retryable on a later poll.
+	eelInflight map[string]chan struct{}
 
 	mediaMappingMu sync.Mutex
 	mediaMapping   *boltNetworkMapping
@@ -193,6 +197,7 @@ func New(cfg Config) (*Client, error) {
 		profileCheckedAt:  make(map[string]time.Time),
 		eelPlaintext:      make(map[string][]byte),
 		failedEEL:         make(map[string]time.Time),
+		eelInflight:       make(map[string]chan struct{}),
 	}
 	if selfUserID := strings.TrimSpace(cfg.SelfUserID); selfUserID != "" {
 		encoded, err := encodeUUIDString(selfUserID)

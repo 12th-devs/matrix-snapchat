@@ -226,6 +226,9 @@ func sidebarUpdateText(chat sidecar.Chat) (string, bool) {
 	if isPassiveSidebarStatus(lower) {
 		return "", false
 	}
+	if text, ok := systemEventPreviewText(lower); ok {
+		return text, true
+	}
 	if chat.Unread || looksLikeSnapOrMediaStatus(lower) {
 		return "New Snap", true
 	}
@@ -233,6 +236,27 @@ func sidebarUpdateText(chat sidecar.Chat) (string, bool) {
 		return "", false
 	}
 	return "New message", true
+}
+
+// systemEventPreviewText maps recognizable Snapchat sidebar previews of
+// client-rendered system lines (screenshots, screen recordings, missed
+// calls) to the friendly text used by the message path, so these events
+// become gray m.notice room events instead of generic "New message"
+// placeholders. Snapchat renders these lines client-side; only the sidebar
+// preview reaches the bridge.
+func systemEventPreviewText(lower string) (string, bool) {
+	switch {
+	case strings.Contains(lower, "screenshot"):
+		return "Screenshot captured", true
+	case strings.Contains(lower, "screen record"), strings.Contains(lower, "screenrecord"):
+		return "Screen recorded", true
+	case strings.Contains(lower, "missed"):
+		if strings.Contains(lower, "video") {
+			return "Missed video call", true
+		}
+		return "Missed audio call", true
+	}
+	return "", false
 }
 
 func isPassiveSidebarStatus(lower string) bool {
@@ -480,6 +504,14 @@ func isBridgeGeneratedSnapchatMarker(body string) bool {
 	return strings.HasPrefix(trimmed, "[Snapchat") || strings.HasPrefix(trimmed, "[Unsupported Snapchat")
 }
 
+// isSystemEventContentType reports whether a Snapchat content type is a
+// conversation event (status lines like screenshots, missed calls, saves, and
+// shared items) that must render as a gray m.notice system line instead of a
+// chatty m.text that triggers "New Message" notifications.
+func isSystemEventContentType(contentType string) bool {
+	return strings.HasPrefix(contentType, "STATUS") || contentType == "SHARE"
+}
+
 func isGeneratedSnapchatNotice(body string) bool {
 	trimmed := strings.TrimSpace(body)
 	lower := strings.ToLower(trimmed)
@@ -490,7 +522,8 @@ func isGeneratedSnapchatNotice(body string) bool {
 		return true
 	}
 	switch lower {
-	case "received", "read", "seen", "opened", "delivered", "sent", "new snap", "snap unavailable":
+	case "received", "read", "seen", "opened", "delivered", "sent", "new snap", "new message", "snap unavailable",
+		"📷 new snap", "🎥 new snap", "📷 snap", "🎥 snap":
 		return true
 	default:
 		return false
@@ -508,6 +541,40 @@ func matrixMsgTypeForMedia(mimeType string) event.MessageType {
 		return event.MsgAudio
 	default:
 		return event.MsgFile
+	}
+}
+
+// snapTypeMarker classifies an incoming media message for the Matrix
+// representation so clients and tooling can immediately distinguish a
+// disappearing image Snap, a disappearing video Snap, and ordinary saved chat
+// media. It rides the event's unsigned extra data as
+// "net.colej.snapchat.type".
+func snapTypeMarker(isSnap bool, msgType event.MessageType) string {
+	if !isSnap {
+		return "chat_media"
+	}
+	switch msgType {
+	case event.MsgImage:
+		return "snap_image"
+	case event.MsgVideo:
+		return "snap_video"
+	default:
+		return "snap"
+	}
+}
+
+// snapMediaCaption is the visible caption for hydrated disappearing Snaps.
+// Ordinary chat media keeps its filename body; Snaps carry the emoji caption
+// so the distinction survives in every client, including ones that ignore
+// extra data.
+func snapMediaCaption(msgType event.MessageType) string {
+	switch msgType {
+	case event.MsgImage:
+		return "📷 Snap"
+	case event.MsgVideo:
+		return "🎥 Snap"
+	default:
+		return "Snap"
 	}
 }
 

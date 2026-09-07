@@ -143,6 +143,9 @@ function runNextTask() {
   pendingTasks.sort((a, b) => a.priority - b.priority || a.id - b.id);
   const next = pendingTasks.shift();
   const taskTimeoutMs = Math.max(3000, Number(next.timeoutMs || DEFAULT_TIMEOUT_MS + 5000));
+  sessionTaskStats.currentLabel = next.label || `task-${next.id}`;
+  sessionTaskStats.currentSince = Date.now();
+  sessionTaskStats.queueDepth = pendingTasks.length;
   let taskSettled = false;
   let timeoutFired = false;
   let watchdog;
@@ -151,17 +154,24 @@ function runNextTask() {
     .finally(() => {
       taskSettled = true;
       clearTimeout(watchdog);
+      sessionTaskStats.currentLabel = "";
+      sessionTaskStats.currentSince = 0;
+      sessionTaskStats.lastCompletedAt = Date.now();
+      sessionTaskStats.queueDepth = pendingTasks.length;
     });
   const responsePromise = withTimeout(taskPromise, taskTimeoutMs, `connector task ${next.label || next.id}`)
     .then(next.resolve, async (error) => {
       timeoutFired = true;
+      sessionTaskStats.lastError = String(error).slice(0, 200);
       try {
         console.error(`connector task ${next.label || next.id} failed: ${String(error)}`);
       } catch {
       }
-      try {
-        await resetSession();
-      } catch {
+      if (next.resetOnTimeout !== false) {
+        try {
+          await resetSession();
+        } catch {
+        }
       }
       next.reject(error);
     });
@@ -171,7 +181,13 @@ function runNextTask() {
     }
     try {
       console.error(`connector task ${next.label || next.id} still running after timeout; forcing queue recovery`);
-      await resetSession();
+      // Queue recovery releases the lock so normal work can proceed. A full
+      // browser session reset is only forced for tasks that have not opted
+      // out (resetOnTimeout=false): e.g. an EEL decrypt that overran its
+      // budget is a failed lookup, not evidence of a dead browser session.
+      if (next.resetOnTimeout !== false) {
+        await resetSession();
+      }
     } catch {
     }
     if (!taskSettled && inflight === promise) {
@@ -194,14 +210,38 @@ function runNextTask() {
   inflight = promise;
 }
 
+// Lightweight, always-safe diagnostics about the serialized task queue. Read
+// synchronously without acquiring the lock so /healthz stays responsive even
+// while a session task is stuck.
+const sessionTaskStats = {
+  currentLabel: "",
+  currentSince: 0,
+  lastCompletedAt: 0,
+  queueDepth: 0,
+  lastError: "",
+};
+
+function getTaskStats() {
+  return {
+    taskRunning: sessionTaskStats.currentLabel !== "",
+    currentTask: sessionTaskStats.currentLabel,
+    taskAgeMs: sessionTaskStats.currentSince > 0 ? Date.now() - sessionTaskStats.currentSince : 0,
+    queueDepth: sessionTaskStats.queueDepth,
+    lastCompletedAt: sessionTaskStats.lastCompletedAt,
+    secondsSinceLastTask: sessionTaskStats.lastCompletedAt > 0 ? Math.round((Date.now() - sessionTaskStats.lastCompletedAt) / 1000) : null,
+    lastTaskError: sessionTaskStats.lastError,
+  };
+}
+
 let taskID = 0;
-function withLock(fn, { priority = 1, timeoutMs, label = "" } = {}) {
+function withLock(fn, { priority = 1, timeoutMs, label = "", resetOnTimeout } = {}) {
   return new Promise((resolve, reject) => {
     pendingTasks.push({
       fn,
       priority,
       timeoutMs,
       label,
+      resetOnTimeout,
       resolve,
       reject,
       id: taskID++,
@@ -3004,24 +3044,29 @@ export async function decryptEELMessage(input = {}) {
 
       async function resolveE2EEWasmModule(webpackRequire, appState) {
         const wasmExports = safeRequire(webpackRequire, 54897);
-        try {
-          const existing = wasmExports?.gZ?.(appState);
-          if (existing?.e2ee_E2EEKeyManager) {
-            return { wasmModule: existing, method: "state_ref" };
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            const existing = wasmExports?.gZ?.(appState);
+            if (existing?.e2ee_E2EEKeyManager) {
+              return { wasmModule: existing, method: "state_ref" };
+            }
+          } catch {
           }
-        } catch {
-        }
-        try {
-          const wasmFactory = safeRequire(webpackRequire, 51867);
-          const params = wasmExports?.U7?.(appState);
-          const created = await wasmFactory?.W?.(params);
-          if (created?.e2ee_E2EEKeyManager) {
-            return { wasmModule: created, method: "factory" };
+          try {
+            const wasmFactory = safeRequire(webpackRequire, 51867);
+            const params = wasmExports?.U7?.(appState);
+            const created = await wasmFactory?.W?.(params);
+            if (created?.e2ee_E2EEKeyManager) {
+              return { wasmModule: created, method: "factory" };
+            }
+          } catch (error) {
+            return {
+              error: String(error?.message || error || "factory_error").replace(/\s+/g, " ").slice(0, 160),
+            };
           }
-        } catch (error) {
-          return {
-            error: String(error?.message || error || "factory_error").replace(/\s+/g, " ").slice(0, 160),
-          };
+          if (attempt < 2) {
+            await new Promise((resolve) => setTimeout(resolve, 1500));
+          }
         }
         return {};
       }
@@ -3119,10 +3164,11 @@ export async function decryptEELMessage(input = {}) {
         return { requestedMessageId, messageCount: messages.length, matchedWebMessageId: webMessageId, analyticsMessageId, exactMatch: false, missReason: "matched_message_has_no_content" };
       }
 
-      async function resolveDecryptedContentViaMessaging(webpackRequire, targetConversationId, targetMessageId, lookupDiagnostics) {
+      async function resolveDecryptedContentViaMessaging(webpackRequire, targetConversationId, targetMessageId, lookupDiagnostics, deadline) {
         if (!targetConversationId || !targetMessageId) {
           return undefined;
         }
+        const remainingMs = () => deadline - Date.now();
         const messaging = safeRequire(webpackRequire, 56639);
         const { appState, messagingClient } = await resolveMessagingClient(webpackRequire);
         const feedItem = appState?.messaging?.feed?.[targetConversationId];
@@ -3130,34 +3176,176 @@ export async function decryptEELMessage(input = {}) {
         if (!messagingClient || !conversationRef?.id || !messaging?.uk) {
           return undefined;
         }
+        // Fast path: the manager's fetchMessage resolves ONE message by ID
+        // (server message identifier) and returns its decrypted content.
+        // Try the two most plausible identifier shapes; misses are recorded.
+        // Keep this cheap: the bridge retries undecoded messages on a backoff,
+        // and heavy attempts wedge the connector task queue.
+        if (messaging.A_) {
+          const shapes = [
+            ["number", Number(targetMessageId)],
+            ["string", String(targetMessageId)],
+          ];
+          if (!Array.isArray(lookupDiagnostics.fetchMessageAttempts)) {
+            lookupDiagnostics.fetchMessageAttempts = [];
+          }
+          for (const [shapeLabel, shape] of shapes) {
+            if (remainingMs() <= 0) {
+              lookupDiagnostics.budgetExhausted = true;
+              break;
+            }
+            try {
+              const fetched = await Promise.race([
+                messaging.A_(messagingClient, shape),
+                new Promise((_, reject) => setTimeout(() => reject(new Error("fetch_message_timeout")), 6000)),
+              ]);
+              const content = resultBytes(fetched?.content)
+                || resultBytes(fetched?.messageContent?.content)
+                || resultBytes(fetched?.messageContent);
+              lookupDiagnostics.fetchMessageAttempts.push({
+                shape: shapeLabel,
+                resolved: fetched !== undefined,
+                hasContent: Boolean(content),
+                contentType: fetched ? typeof fetched.content : "",
+              });
+              if (content) {
+                return {
+                  content,
+                  webMessageId: String(fetched?.descriptor?.messageId ?? fetched?.messageId ?? targetMessageId),
+                  analyticsMessageId: String(fetched?.messageAnalytics?.analyticsMessageId || ""),
+                  contentSource: "fetch_message",
+                  messageCount: 1,
+                };
+              }
+            } catch (error) {
+              lookupDiagnostics.fetchMessageAttempts.push({
+                shape: shapeLabel,
+                error: String(error?.message || error || "unknown").slice(0, 120),
+              });
+            }
+          }
+        }
+        // Force a server sync of THIS conversation so the cached pages include
+        // the newest messages (the idle page lags behind by dozens of
+        // messages). conversationType/minVersion are passed as best-effort
+        // guesses; a failure is recorded and the page fetches run anyway.
+        let synced = false;
+        let syncError = "";
+        if (messaging.Kz && remainingMs() > 0) {
+          try {
+            await Promise.race([
+              messaging.Kz(messagingClient, targetConversationId, 0, 0, undefined, undefined),
+              new Promise((_, reject) => setTimeout(() => reject(new Error("sync_conversation_timeout")), Math.min(10000, Math.max(1000, remainingMs())))),
+            ]);
+            synced = true;
+            syncError = "";
+          } catch (error) {
+            synced = false;
+            syncError = String(error?.message || error || "unknown").slice(0, 120);
+          }
+          if (lookupDiagnostics) {
+            lookupDiagnostics.syncedConversation = synced;
+            lookupDiagnostics.syncError = syncError;
+          }
+        }
+        if (remainingMs() <= 0) {
+          lookupDiagnostics.budgetExhausted = true;
+          return undefined;
+        }
         const attempts = [
-          () => messaging.uk(messagingClient, conversationRef),
+          ["uk", () => messaging.uk(messagingClient, conversationRef)],
         ];
         if (messaging.Gq) {
-          attempts.push(() => messaging.Gq(messagingClient, conversationRef, undefined));
+          attempts.push(["Gq", () => messaging.Gq(messagingClient, conversationRef, undefined)]);
         }
-        for (const fetchPage of attempts) {
-          const result = await Promise.race([
-            fetchPage(),
-            new Promise((_, reject) => setTimeout(() => reject(new Error("messaging_fetch_timeout")), 5000)),
-          ]);
-          const lookup = decryptedContentFromFetchedMessages(result, targetMessageId);
-          if (lookupDiagnostics) {
-            lookupDiagnostics.requestedMessageId = lookup.requestedMessageId;
-            lookupDiagnostics.messageCount = lookup.messageCount;
-            lookupDiagnostics.matchedWebMessageId = lookup.matchedWebMessageId;
-            lookupDiagnostics.exactMatch = lookup.exactMatch === true;
-            lookupDiagnostics.missReason = lookup.missReason || "";
+        try {
+          for (const [methodLabel, fetchPage] of attempts) {
+            if (remainingMs() <= 0) {
+              lookupDiagnostics.budgetExhausted = true;
+              break;
+            }
+            const result = await Promise.race([
+              fetchPage(),
+              new Promise((_, reject) => setTimeout(() => reject(new Error("messaging_fetch_timeout")), Math.min(8000, Math.max(1000, remainingMs())))),
+            ]);
+            const fetchedMessages = Array.isArray(result?.messages) ? result.messages : [];
+            if (lookupDiagnostics) {
+              if (!Array.isArray(lookupDiagnostics.fetchPages)) {
+                lookupDiagnostics.fetchPages = [];
+              }
+              lookupDiagnostics.fetchPages.push({
+                method: methodLabel,
+                count: fetchedMessages.length,
+                sample: fetchedMessages.slice(0, 6).map((message) => String(message?.descriptor?.messageId ?? message?.messageId ?? "?")),
+                analyticsSample: fetchedMessages.slice(0, 3).map((message) => String(message?.messageAnalytics?.analyticsMessageId ?? "").slice(0, 60)),
+                firstAnalytics: String(fetchedMessages[0]?.messageAnalytics?.analyticsMessageId ?? ""),
+                lastAnalytics: String(fetchedMessages[fetchedMessages.length - 1]?.messageAnalytics?.analyticsMessageId ?? ""),
+                lastSequence: String(fetchedMessages[fetchedMessages.length - 1]?.descriptor?.messageId ?? ""),
+              });
+              // One-shot probe: find where the target server message ID
+              // (decimal or hex) appears inside fetched message objects, and
+              // dump the first message's scalar field paths as a shape sample.
+              if (!lookupDiagnostics.idProbe) {
+                const targetDec = String(targetMessageId || "");
+                const targetHex = Number(targetDec).toString(16).toUpperCase();
+                const hits = [];
+                const scan = (value, path, depth) => {
+                  if (depth > 6 || hits.length > 30) return;
+                  if (typeof value === "number") {
+                    if (String(value) === targetDec) hits.push([path, `=${value}`]);
+                    return;
+                  }
+                  if (typeof value === "string") {
+                    if (value === targetDec || value.toUpperCase() === targetHex || value.includes(`-${targetHex}-`)) {
+                      hits.push([path, value.slice(0, 48)]);
+                    }
+                    return;
+                  }
+                  if (Array.isArray(value)) {
+                    if (typeof value[0] === "number") return;
+                    value.forEach((item, index) => scan(item, `${path}[${index}]`, depth + 1));
+                    return;
+                  }
+                  if (typeof value !== "object") return;
+                  for (const key of Object.keys(value)) scan(value[key], `${path}.${key}`, depth + 1);
+                };
+                for (const [index, message] of fetchedMessages.slice(0, 40).entries()) {
+                  scan(message, `msg${index}`, 0);
+                }
+                const shape = [];
+                const walk = (value, path, depth) => {
+                  if (!value || depth > 4 || shape.length > 80) return;
+                  if (typeof value === "number") { shape.push([path, String(value)]); return; }
+                  if (typeof value === "string") { if (value.length <= 40) shape.push([path, value]); return; }
+                  if (Array.isArray(value)) { shape.push([path, `bytes[${value.length}]`]); return; }
+                  if (typeof value !== "object") return;
+                  for (const key of Object.keys(value)) walk(value[key], `${path}.${key}`, depth + 1);
+                };
+                if (fetchedMessages.length > 0) walk(fetchedMessages[fetchedMessages.length - 1], "last", 0);
+                lookupDiagnostics.idProbe = { targetHits: hits, lastMessageShape: shape };
+              }
+            }
+            const lookup = decryptedContentFromFetchedMessages(result, targetMessageId);
+            if (lookupDiagnostics) {
+              lookupDiagnostics.requestedMessageId = lookup.requestedMessageId;
+              lookupDiagnostics.messageCount = lookup.messageCount;
+              lookupDiagnostics.matchedWebMessageId = lookup.matchedWebMessageId;
+              lookupDiagnostics.exactMatch = lookup.exactMatch === true;
+              lookupDiagnostics.missReason = lookup.missReason || "";
+            }
+            if (lookup.exactMatch && lookup.content) {
+              return {
+                content: lookup.content,
+                webMessageId: lookup.matchedWebMessageId,
+                analyticsMessageId: lookup.analyticsMessageId,
+                contentSource: lookup.contentSource,
+                messageCount: lookup.messageCount,
+              };
+            }
           }
-          if (lookup.exactMatch && lookup.content) {
-            return {
-              content: lookup.content,
-              webMessageId: lookup.matchedWebMessageId,
-              analyticsMessageId: lookup.analyticsMessageId,
-              contentSource: lookup.contentSource,
-              messageCount: lookup.messageCount,
-            };
-          }
+        } catch {
+          // Bounded lookup: any unexpected failure falls through to the
+          // structured retryable failure below. Never reset the session here.
         }
         return undefined;
       }
@@ -3180,6 +3368,11 @@ export async function decryptEELMessage(input = {}) {
       }
 
       const webpackRequire = findWebpackRequire();
+      // Overall lookup budget: one EEL attempt may spend at most ~26s on
+      // messaging-side strategies so a failed decrypt can never occupy the
+      // connector task queue for minutes. The remaining time is left as
+      // headroom for the bounded key-manager probing below.
+      const lookupDeadline = Date.now() + 26000;
       const messagingLookup = {
         requestedMessageId: payload.messageId,
         messageCount: 0,
@@ -3188,7 +3381,7 @@ export async function decryptEELMessage(input = {}) {
         missReason: "",
       };
       try {
-        const messagingContent = await resolveDecryptedContentViaMessaging(webpackRequire, payload.conversationId, payload.messageId, messagingLookup);
+        const messagingContent = await resolveDecryptedContentViaMessaging(webpackRequire, payload.conversationId, payload.messageId, messagingLookup, lookupDeadline);
         if (messagingContent?.content) {
           return {
             ok: true,
@@ -3216,15 +3409,24 @@ export async function decryptEELMessage(input = {}) {
           error: "eel_key_manager_unavailable",
           retryable: true,
           failureClass: e2ee.error,
+          syncedConversation: messagingLookup.syncedConversation === true,
+          syncError: String(messagingLookup.syncError || ""),
+          fetchMessageAttempts: Array.isArray(messagingLookup.fetchMessageAttempts) ? messagingLookup.fetchMessageAttempts.slice(0, 6) : [],
+          fetchPages: Array.isArray(messagingLookup.fetchPages) ? messagingLookup.fetchPages.slice(0, 4) : [],
         };
       }
       if (!keyManager) {
-        return { ok: false, error: "eel_key_manager_unavailable", retryable: true };
+        return { ok: false, error: "eel_key_manager_unavailable", retryable: true, syncedConversation: messagingLookup.syncedConversation === true, syncError: String(messagingLookup.syncError || ""), fetchMessageAttempts: Array.isArray(messagingLookup.fetchMessageAttempts) ? messagingLookup.fetchMessageAttempts.slice(0, 6) : [], fetchPages: Array.isArray(messagingLookup.fetchPages) ? messagingLookup.fetchPages.slice(0, 4) : [], idProbe: messagingLookup.idProbe || null };
       }
 
       const attempts = [];
       const methodNames = Object.keys(keyManager).filter((name) => /decrypt|unwrap|shared|secret|cek/i.test(name));
+      let budgetExhausted = messagingLookup.budgetExhausted === true;
       for (const methodName of methodNames) {
+        if (Date.now() >= lookupDeadline) {
+          budgetExhausted = true;
+          break;
+        }
         const method = keyManager[methodName];
         if (typeof method !== "function") {
           continue;
@@ -3262,7 +3464,7 @@ export async function decryptEELMessage(input = {}) {
           }
         }
       }
-      return { ok: false, error: "eel_decrypt_unavailable", retryable: true, failureClass: attempts.length > 0 ? "attempts_exhausted" : "no_candidate_methods", requestedMessageId: payload.messageId, matchedWebMessageId: "", messageCount: messagingLookup.messageCount, exactMatch: false, exactMatchMiss: messagingLookup.missReason || "" };
+      return { ok: false, error: "eel_decrypt_unavailable", retryable: true, failureClass: budgetExhausted ? "lookup_budget_exhausted" : (attempts.length > 0 ? "attempts_exhausted" : "no_candidate_methods"), budgetExhausted, requestedMessageId: payload.messageId, matchedWebMessageId: "", messageCount: messagingLookup.messageCount, exactMatch: false, exactMatchMiss: messagingLookup.missReason || "", syncedConversation: messagingLookup.syncedConversation === true, syncError: String(messagingLookup.syncError || ""), fetchMessageAttempts: Array.isArray(messagingLookup.fetchMessageAttempts) ? messagingLookup.fetchMessageAttempts.slice(0, 6) : [], fetchPages: Array.isArray(messagingLookup.fetchPages) ? messagingLookup.fetchPages.slice(0, 4) : [], idProbe: null };
     }, {
       messageId,
       conversationId,
@@ -3284,7 +3486,7 @@ export async function decryptEELMessage(input = {}) {
       console.error(`eel-decrypt: ok messageId=${messageId} conversationId=${conversationId} method=${result.method || "unknown"} requestedMessageId=${String(result.requestedMessageId || messageId)} matchedWebMessageId=${String(result.matchedWebMessageId || "")} messageCount=${Number(result.messageCount || 0)} exactMatch=${result.exactMatch === true ? "true" : "false"} contentSource=${String(result.contentSource || "")}`);
     }
     return result;
-  }, { priority: 0 });
+  }, { priority: 0, timeoutMs: 90000, label: "eel-decrypt", resetOnTimeout: false });
 }
 
 const debugTools = createDebugTools({ withLock, ensureSession });
@@ -3308,6 +3510,7 @@ export const debugMediaDecrypt = debugTools.debugMediaDecrypt;
 export const getBrowserConversationMessages = debugTools.getBrowserConversationMessages;
 export const getBrowserE2EESummary = debugTools.getBrowserE2EESummary;
 export const deriveBrowserE2EESharedSecret = debugTools.deriveBrowserE2EESharedSecret;
+export { getTaskStats };
 
 export async function getChats() {
   return withLock(async () => {

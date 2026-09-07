@@ -105,6 +105,20 @@ func TestMatrixVoiceNotePassesMsgTypeGate(t *testing.T) {
 	}
 }
 
+func TestOutboundMediaMIMEAllowsTranscodableVoiceMIMEs(t *testing.T) {
+	for _, mime := range []string{"audio/ogg", "application/ogg", "audio/opus", "audio/webm"} {
+		if !outboundMediaMIMEAllowed(event.MsgAudio, mime) {
+			t.Fatalf("voice MIME %q must be allowed for m.audio (transcoded to audio/mp4)", mime)
+		}
+		if outboundMediaMIMEAllowed(event.MsgImage, mime) {
+			t.Fatalf("voice MIME %q must stay rejected for m.image", mime)
+		}
+	}
+	if outboundMediaMIMEAllowed(event.MsgAudio, "audio/mpeg") {
+		t.Fatal("audio/mpeg must stay rejected")
+	}
+}
+
 func TestDefaultMediaFileNameVoiceNote(t *testing.T) {
 	if got := defaultMediaFileName(event.MsgAudio, "audio/mp4"); got != "snap-audio.m4a" {
 		t.Fatalf("defaultMediaFileName(audio/mp4) = %q, want snap-audio.m4a", got)
